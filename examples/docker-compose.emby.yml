@@ -1,0 +1,42 @@
+# Media Maid como sidecar do emby. Um sidecar por media server (single tenant).
+#
+# Downloads e biblioteca ficam no MESMO volume (/data) para que hardlinks
+# funcionem. O emby enxerga só a biblioteca, montada em /media, por isso
+# SERVER_PATH_MAP traduz /media -> /data/media para a detecção de órfãos.
+services:
+  emby:
+    image: emby/embyserver:latest
+    volumes:
+      - emby-config:/config
+      - /data/media:/media
+    ports:
+      - "8096:8096"
+    restart: unless-stopped
+
+  media-maid:
+    build: ..                  # imagem construída a partir deste repositório
+    user: "1000:1000"            # dono dos arquivos em /data
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    volumes:
+      - /data:/data              # downloads + biblioteca (mesmo filesystem)
+    environment:
+      INTEGRATION_MODE: emby
+      MEDIA_SERVER_URL: http://emby:8096
+      MEDIA_SERVER_TOKEN: ${MEDIA_SERVER_TOKEN:?}   # API key em Settings → Advanced → API Keys
+      API_TOKEN: ${MEDIA_MAID_API_TOKEN:?}          # >= 32 caracteres (openssl rand -hex 32)
+      DOWNLOADS_DIR: /data/downloads
+      MOVIES_DIR: /data/media/movies
+      TV_DIR: /data/media/tv
+      SERVER_PATH_MAP: /media=/data/media
+      # TMDB_API_KEY: ${TMDB_API_KEY}
+      # ORPHAN_SCAN_INTERVAL: 24h
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on: [emby]
+    restart: unless-stopped
+
+volumes:
+  emby-config:

@@ -1,0 +1,286 @@
+package orphans
+
+import (
+	"context"
+	"io"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"sort"
+	"sync"
+	"testing"
+
+	"github.com/jfxdev/media-maid/internal/config"
+	"github.com/jfxdev/media-maid/internal/integration"
+	"github.com/jfxdev/media-maid/internal/jobs"
+	"github.com/jfxdev/media-maid/internal/organizer"
+	"github.com/jfxdev/media-maid/internal/safepath"
+)
+
+type fakeServer struct {
+	mu      sync.Mutex
+	items   []integration.ServerItem
+	deleted []string
+}
+
+func (f *fakeServer) ListItems(context.Context) ([]integration.ServerItem, error) {
+	return f.items, nil
+}
+
+func (f *fakeServer) DeleteItem(_ context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.deleted = append(f.deleted, id)
+	return nil
+}
+
+type env struct {
+	det     *Detector
+	server  *fakeServer
+	movies  string
+	tv      string
+	outside string
+}
+
+func write(t *testing.T, p string) {
+	t.Helper()
+	os.MkdirAll(filepath.Dir(p), 0o755)
+	if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func newEnv(t *testing.T, dryRun bool, withServer bool) *env {
+	vol := t.TempDir()
+	e := &env{
+		movies:  filepath.Join(vol, "media", "movies"),
+		tv:      filepath.Join(vol, "media", "tv"),
+		outside: t.TempDir(),
+		server:  &fakeServer{},
+	}
+	os.MkdirAll(e.movies, 0o755)
+	os.MkdirAll(e.tv, 0o755)
+	g, _ := safepath.NewGuard([]string{vol})
+	mr, _ := os.OpenRoot(e.movies)
+	tr, _ := os.OpenRoot(e.tv)
+	t.Cleanup(func() { mr.Close(); tr.Close() })
+	var srv Server
+	if withServer {
+		srv = e.server
+	}
+	e.det = New(Options{
+		Server:  srv,
+		PathMap: &config.PathMap{Server: "/media", Local: filepath.Join(vol, "media")},
+		Libraries: []organizer.Library{
+			{Name: "movies", Path: e.movies, Root: mr},
+			{Name: "tv", Path: e.tv, Root: tr},
+		},
+		Filter:  organizer.Filter{Video: map[string]bool{".mkv": true}},
+		Guard:   g,
+		History: jobs.NewHistory(50),
+		Log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		DryRun:  dryRun,
+	})
+	return e
+}
+
+func byType(r *Report) map[string][]Orphan {
+	m := map[string][]Orphan{}
+	for _, o := range r.Orphans {
+		m[o.Type] = append(m[o.Type], o)
+	}
+	return m
+}
+
+func setupTree(t *testing.T, e *env) {
+	write(t, filepath.Join(e.movies, "Kept (2000)", "Kept (2000).mkv"))
+	write(t, filepath.Join(e.movies, "Kept (2000)", "Kept (2000).en.srt"))
+	write(t, filepath.Join(e.movies, "Gone (2001)", "Gone (2001).pt.srt"))
+	write(t, filepath.Join(e.movies, "Gone (2001)", "movie.nfo"))
+	os.MkdirAll(filepath.Join(e.movies, "Empty (2002)"), 0o755)
+	write(t, filepath.Join(e.tv, "Show", "Season 01", "Show S01E01.mkv"))
+	os.MkdirAll(filepath.Join(e.tv, "Show", "Season 02"), 0o755)
+	write(t, filepath.Join(e.outside, "real.mkv"))
+	os.Symlink(e.outside, filepath.Join(e.movies, "Linked (2003)"))
+
+	e.server.items = []integration.ServerItem{
+		{ID: "1", Title: "Kept", Paths: []string{"/media/movies/Kept (2000)/Kept (2000).mkv"}},
+		{ID: "2", Title: "Gone", Paths: []string{"/media/movies/Gone (2001)/Gone (2001).mkv"}},
+		{ID: "3", Title: "Elsewhere", Paths: []string{"/music/song.mkv"}},
+		{ID: "4", Title: "Linked", Paths: []string{"/media/movies/Linked (2003)/real.mkv"}},
+		{ID: "5", Title: "Ep2", Paths: []string{"/media/tv/Show/Season 01/Show S01E02.mkv"}},
+	}
+}
+
+func TestScan(t *testing.T) {
+	e := newEnv(t, false, true)
+	setupTree(t, e)
+	rep, err := e.det.Scan(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.ServerCheck != "ok" {
+		t.Errorf("server_check = %s", rep.ServerCheck)
+	}
+	got := byType(rep)
+
+	var ids []string
+	for _, o := range got[TypeServerItemMissingFile] {
+		ids = append(ids, o.ServerItemID)
+	}
+	sort.Strings(ids)
+	if len(ids) != 2 || ids[0] != "2" || ids[1] != "5" {
+		t.Errorf("missing-file items = %v, want [2 5]", ids)
+	}
+
+	var dirs []string
+	for _, o := range got[TypeOrphanDirectory] {
+		dirs = append(dirs, o.Path)
+	}
+	sort.Strings(dirs)
+	want := []string{"movies/Empty (2002)", "movies/Gone (2001)", "tv/Show/Season 02"}
+	if len(dirs) != len(want) {
+		t.Fatalf("dirs = %v, want %v", dirs, want)
+	}
+	for i := range want {
+		if dirs[i] != want[i] {
+			t.Errorf("dirs = %v, want %v", dirs, want)
+		}
+	}
+
+	if len(rep.Errors) != 1 || rep.Errors[0].ServerItemID != "4" || rep.Errors[0].Error != "unauthorized_volume" {
+		t.Errorf("errors = %+v", rep.Errors)
+	}
+}
+
+func TestScanWithoutServer(t *testing.T) {
+	e := newEnv(t, false, false)
+	setupTree(t, e)
+	rep, _ := e.det.Scan(context.Background())
+	if rep.ServerCheck != "disabled" || len(byType(rep)[TypeServerItemMissingFile]) != 0 {
+		t.Errorf("report = %+v", rep)
+	}
+}
+
+func idsOf(rep *Report, typ string) map[string]string {
+	m := map[string]string{}
+	for _, o := range rep.Orphans {
+		if o.Type == typ {
+			m[o.Path] = o.ID
+		}
+	}
+	return m
+}
+
+func TestRemove(t *testing.T) {
+	e := newEnv(t, false, true)
+	setupTree(t, e)
+	rep, _ := e.det.Scan(context.Background())
+	dirs := idsOf(rep, TypeOrphanDirectory)
+	var itemID string
+	for _, o := range rep.Orphans {
+		if o.ServerItemID == "2" {
+			itemID = o.ID
+		}
+	}
+
+	// A video reappears between scan and removal → stale, nothing deleted.
+	write(t, filepath.Join(e.movies, "Empty (2002)", "Empty (2002).mkv"))
+
+	res := e.det.Remove(context.Background(), []string{
+		dirs["movies/Gone (2001)"], dirs["movies/Empty (2002)"], itemID, "deadbeef",
+	})
+	want := []string{jobs.StatusRemoved, jobs.StatusStale, jobs.StatusRemoved, jobs.StatusStale}
+	for i, r := range res {
+		if r.Status != want[i] {
+			t.Errorf("result %d = %+v, want %s", i, r, want[i])
+		}
+	}
+	if _, err := os.Stat(filepath.Join(e.movies, "Gone (2001)")); !os.IsNotExist(err) {
+		t.Error("orphan directory not removed")
+	}
+	if _, err := os.Stat(filepath.Join(e.movies, "Empty (2002)", "Empty (2002).mkv")); err != nil {
+		t.Error("revalidation failed: video removed")
+	}
+	if len(e.server.deleted) != 1 || e.server.deleted[0] != "2" {
+		t.Errorf("deleted = %v", e.server.deleted)
+	}
+	if _, err := os.Stat(filepath.Join(e.outside, "real.mkv")); err != nil {
+		t.Error("file outside library touched")
+	}
+	// Removed entries disappear from the report and cannot be removed twice.
+	if r := e.det.Remove(context.Background(), []string{itemID}); r[0].Status != jobs.StatusStale {
+		t.Errorf("second remove = %+v", r[0])
+	}
+}
+
+func TestRemoveRevalidatesServerItem(t *testing.T) {
+	e := newEnv(t, false, true)
+	setupTree(t, e)
+	rep, _ := e.det.Scan(context.Background())
+	var id string
+	for _, o := range rep.Orphans {
+		if o.ServerItemID == "2" {
+			id = o.ID
+		}
+	}
+	write(t, filepath.Join(e.movies, "Gone (2001)", "Gone (2001).mkv")) // file restored
+	if r := e.det.Remove(context.Background(), []string{id}); r[0].Status != jobs.StatusStale {
+		t.Errorf("result = %+v", r[0])
+	}
+	if len(e.server.deleted) != 0 {
+		t.Error("server item deleted although file exists again")
+	}
+}
+
+func TestRemoveSymlinkSwap(t *testing.T) {
+	e := newEnv(t, false, true)
+	setupTree(t, e)
+	rep, _ := e.det.Scan(context.Background())
+	id := idsOf(rep, TypeOrphanDirectory)["movies/Gone (2001)"]
+	// Replace the orphan directory by a symlink to an outside directory.
+	os.RemoveAll(filepath.Join(e.movies, "Gone (2001)"))
+	os.Symlink(e.outside, filepath.Join(e.movies, "Gone (2001)"))
+	if r := e.det.Remove(context.Background(), []string{id}); r[0].Status != jobs.StatusStale {
+		t.Errorf("result = %+v", r[0])
+	}
+	if _, err := os.Stat(filepath.Join(e.outside, "real.mkv")); err != nil {
+		t.Error("followed symlink and deleted outside data")
+	}
+}
+
+func TestRemoveDryRun(t *testing.T) {
+	e := newEnv(t, true, true)
+	setupTree(t, e)
+	rep, _ := e.det.Scan(context.Background())
+	var ids []string
+	for _, o := range rep.Orphans {
+		ids = append(ids, o.ID)
+	}
+	for _, r := range e.det.Remove(context.Background(), ids) {
+		if r.Status != jobs.StatusDryRun {
+			t.Errorf("result = %+v", r)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(e.movies, "Gone (2001)")); err != nil {
+		t.Error("dry run removed a directory")
+	}
+	if len(e.server.deleted) != 0 {
+		t.Error("dry run deleted a server item")
+	}
+}
+
+func TestRemoveRejectsRoot(t *testing.T) {
+	e := newEnv(t, false, true)
+	o := Orphan{ID: "x", Type: TypeOrphanDirectory, library: "movies", rel: "."}
+	if r := e.det.removeOne(context.Background(), o); r.Status != jobs.StatusError {
+		t.Errorf("root removal = %+v", r)
+	}
+	o.rel = "../tv"
+	if r := e.det.removeOne(context.Background(), o); r.Status != jobs.StatusError {
+		t.Errorf("parent removal = %+v", r)
+	}
+	if _, err := os.Stat(e.tv); err != nil {
+		t.Error("tv library removed")
+	}
+}

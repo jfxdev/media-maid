@@ -1,0 +1,42 @@
+# Media Maid como sidecar do plex. Um sidecar por media server (single tenant).
+#
+# Downloads e biblioteca ficam no MESMO volume (/data) para que hardlinks
+# funcionem. O plex enxerga só a biblioteca, montada em /media, por isso
+# SERVER_PATH_MAP traduz /media -> /data/media para a detecção de órfãos.
+services:
+  plex:
+    image: plexinc/pms-docker:latest
+    volumes:
+      - plex-config:/config
+      - /data/media:/media
+    ports:
+      - "32400:32400"
+    restart: unless-stopped
+
+  media-maid:
+    build: ..                  # imagem construída a partir deste repositório
+    user: "1000:1000"            # dono dos arquivos em /data
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    volumes:
+      - /data:/data              # downloads + biblioteca (mesmo filesystem)
+    environment:
+      INTEGRATION_MODE: plex
+      MEDIA_SERVER_URL: http://plex:32400
+      MEDIA_SERVER_TOKEN: ${MEDIA_SERVER_TOKEN:?}   # X-Plex-Token da conta/servidor
+      API_TOKEN: ${MEDIA_MAID_API_TOKEN:?}          # >= 32 caracteres (openssl rand -hex 32)
+      DOWNLOADS_DIR: /data/downloads
+      MOVIES_DIR: /data/media/movies
+      TV_DIR: /data/media/tv
+      SERVER_PATH_MAP: /media=/data/media
+      # TMDB_API_KEY: ${TMDB_API_KEY}
+      # ORPHAN_SCAN_INTERVAL: 24h
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on: [plex]
+    restart: unless-stopped
+
+volumes:
+  plex-config:
