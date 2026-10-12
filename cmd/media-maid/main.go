@@ -125,7 +125,7 @@ func run(log *slog.Logger) error {
 	defer stop()
 
 	w, err := watcher.New(downloads, cfg.StableDuration, func(ctx context.Context, p string) {
-		_, err := org.Organize(ctx, p, false)
+		_, err := org.Organize(ctx, p, organizer.OrganizeOptions{})
 		// Not found and unauthorized links are already recorded by the organizer.
 		if err != nil && !errors.Is(err, organizer.ErrNotFound) && !errors.Is(err, safepath.ErrUnauthorizedVolume) {
 			log.Warn("organize failed", "err", err)

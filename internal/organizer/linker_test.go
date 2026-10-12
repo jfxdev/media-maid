@@ -39,7 +39,56 @@ func TestCopyFallback(t *testing.T) {
 		t.Errorf("second copy = %s, want conflict", st)
 	}
 	// place recognises the earlier copy as already done.
-	if st, err := place(root, "Movie (2000)/Movie (2000).mkv", f, fi); st != jobs.StatusExists || err != nil {
+	if st, err := place(root, "Movie (2000)/Movie (2000).mkv", f, fi, false); st != jobs.StatusExists || err != nil {
 		t.Errorf("place over copy = %s, %v; want exists", st, err)
+	}
+}
+
+func TestPlaceOverwrite(t *testing.T) {
+	dst := t.TempDir()
+	root, _ := os.OpenRoot(dst)
+	defer root.Close()
+	rel := "Movie (2000)/Movie (2000).mkv"
+	old := filepath.Join(dst, "Movie (2000)", "Movie (2000).mkv")
+	os.MkdirAll(filepath.Dir(old), 0o755)
+	os.WriteFile(old, []byte("720p"), 0o644)
+
+	src := filepath.Join(t.TempDir(), "new.mkv")
+	os.WriteFile(src, []byte("1080p"), 0o644)
+	f, _ := os.Open(src)
+	defer f.Close()
+	fi, _ := f.Stat()
+
+	if st, _ := place(root, rel, f, fi, false); st != jobs.StatusConflict {
+		t.Fatalf("without overwrite = %s, want conflict", st)
+	}
+	if st, err := place(root, rel, f, fi, true); st != jobs.StatusReplaced || err != nil {
+		t.Fatalf("overwrite = %s, %v; want replaced", st, err)
+	}
+	got, _ := os.Stat(old)
+	if !os.SameFile(got, fi) {
+		t.Error("destination is not a hardlink of the new source")
+	}
+	entries, _ := os.ReadDir(filepath.Dir(old))
+	if len(entries) != 1 {
+		t.Errorf("temp file left behind: %v", entries)
+	}
+	if st, _ := place(root, rel, f, fi, true); st != jobs.StatusExists {
+		t.Errorf("second overwrite = %s, want exists", st)
+	}
+
+	// Directories and symlinks at the destination are never replaced.
+	os.Remove(old)
+	os.Mkdir(old, 0o755)
+	if st, _ := place(root, rel, f, fi, true); st != jobs.StatusConflict {
+		t.Errorf("overwrite of a directory = %s, want conflict", st)
+	}
+	os.Remove(old)
+	os.Symlink("/etc/passwd", old)
+	if st, _ := place(root, rel, f, fi, true); st != jobs.StatusConflict {
+		t.Errorf("overwrite of a symlink = %s, want conflict", st)
+	}
+	if b, _ := os.ReadFile("/etc/passwd"); string(b) == "1080p" {
+		t.Fatal("overwrite followed a symlink")
 	}
 }

@@ -204,7 +204,7 @@ func TestIDTagPerPlatform(t *testing.T) {
 func TestPreviewAndConflict(t *testing.T) {
 	e := newEnv(t, "jellyfin")
 	write(t, filepath.Join(e.downloads, "Some.Film.1999.mkv"))
-	res, err := e.org.Organize(context.Background(), "Some.Film.1999.mkv", true)
+	res, err := e.org.Organize(context.Background(), "Some.Film.1999.mkv", OrganizeOptions{Preview: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,7 +219,7 @@ func TestPreviewAndConflict(t *testing.T) {
 	}
 
 	write(t, filepath.Join(e.movies, "Some Film (1999)", "Some Film (1999).mkv"))
-	res, _ = e.org.Organize(context.Background(), "Some.Film.1999.mkv", false)
+	res, _ = e.org.Organize(context.Background(), "Some.Film.1999.mkv", OrganizeOptions{})
 	if res[0].Status != jobs.StatusConflict {
 		t.Errorf("status = %s, want conflict", res[0].Status)
 	}
@@ -241,7 +241,7 @@ func TestSymlinks(t *testing.T) {
 	os.Symlink(internal, filepath.Join(e.downloads, "Internal.Movie.2004.mkv"))
 
 	// Direct request for a link to an unauthorized volume → error.
-	if _, err := e.org.Organize(context.Background(), "Secret.Movie.2001.mkv", false); !errors.Is(err, safepath.ErrUnauthorizedVolume) {
+	if _, err := e.org.Organize(context.Background(), "Secret.Movie.2001.mkv", OrganizeOptions{}); !errors.Is(err, safepath.ErrUnauthorizedVolume) {
 		t.Errorf("err = %v, want ErrUnauthorizedVolume", err)
 	}
 
@@ -302,7 +302,7 @@ func TestDestinationEscape(t *testing.T) {
 
 	// Malicious metadata cannot escape either.
 	write(t, filepath.Join(e.downloads, "Evil.2000.mkv"))
-	res, _ = e.org.Organize(context.Background(), "Evil.2000.mkv", false)
+	res, _ = e.org.Organize(context.Background(), "Evil.2000.mkv", OrganizeOptions{})
 	if res[0].Status != jobs.StatusLinked || strings.Contains(res[0].Dest, "..") {
 		t.Errorf("result = %+v", res[0])
 	}
@@ -311,11 +311,11 @@ func TestDestinationEscape(t *testing.T) {
 func TestInvalidInput(t *testing.T) {
 	e := newEnv(t, "jellyfin")
 	for _, p := range []string{"../media/movies", "/etc/passwd", "a\x00b", ""} {
-		if _, err := e.org.Organize(context.Background(), p, false); !errors.Is(err, safepath.ErrInvalidPath) {
+		if _, err := e.org.Organize(context.Background(), p, OrganizeOptions{}); !errors.Is(err, safepath.ErrInvalidPath) {
 			t.Errorf("%q: err = %v", p, err)
 		}
 	}
-	if _, err := e.org.Organize(context.Background(), "missing.mkv", false); !errors.Is(err, ErrNotFound) {
+	if _, err := e.org.Organize(context.Background(), "missing.mkv", OrganizeOptions{}); !errors.Is(err, ErrNotFound) {
 		t.Errorf("err = %v", err)
 	}
 }
@@ -330,5 +330,87 @@ func TestExtensionAllowlist(t *testing.T) {
 	}
 	if len(res) != 0 {
 		t.Errorf("non-allowlisted extensions processed: %+v", res)
+	}
+}
+
+func TestDuplicateReleases(t *testing.T) {
+	e := newEnv(t, "jellyfin")
+	low := filepath.Join(e.downloads, "The.Matrix.1999.720p.BluRay.x264-A", "The.Matrix.1999.720p.BluRay.x264-A.mkv")
+	high := filepath.Join(e.downloads, "The.Matrix.1999.1080p.WEB-DL.x264-B", "The.Matrix.1999.1080p.WEB-DL.x264-B.mkv")
+	write(t, low)
+	write(t, high)
+	write(t, filepath.Join(filepath.Dir(high), "The.Matrix.1999.1080p.WEB-DL.x264-B.en.srt"))
+
+	res, err := e.org.Scan(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := statuses(res)
+	if st[e.org.rel(high)] != jobs.StatusLinked || st[e.org.rel(low)] != jobs.StatusDuplicate {
+		t.Fatalf("statuses = %v", st)
+	}
+	dest := filepath.Join(e.movies, "The Matrix (1999)", "The Matrix (1999).mkv")
+	if !sameInode(t, high, dest) {
+		t.Error("the 1080p release was not the one linked")
+	}
+	if _, err := os.Stat(filepath.Join(e.movies, "The Matrix (1999)", "The Matrix (1999).en.srt")); err != nil {
+		t.Errorf("subtitle of the kept release: %v", err)
+	}
+}
+
+func TestOverwrite(t *testing.T) {
+	e := newEnv(t, "jellyfin")
+	low := filepath.Join(e.downloads, "The.Matrix.1999.720p.mkv")
+	high := filepath.Join(e.downloads, "The.Matrix.1999.1080p.mkv")
+	dest := filepath.Join(e.movies, "The Matrix (1999)", "The Matrix (1999).mkv")
+	write(t, low)
+	if _, err := e.org.Organize(context.Background(), "The.Matrix.1999.720p.mkv", OrganizeOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	write(t, high)
+
+	res, _ := e.org.Organize(context.Background(), "The.Matrix.1999.1080p.mkv", OrganizeOptions{})
+	if res[0].Status != jobs.StatusConflict {
+		t.Fatalf("without overwrite = %+v, want conflict", res[0])
+	}
+	res, _ = e.org.Organize(context.Background(), "The.Matrix.1999.1080p.mkv", OrganizeOptions{Preview: true, Overwrite: true})
+	if res[0].Status != jobs.StatusPlanned || !res[0].Replaces {
+		t.Fatalf("preview overwrite = %+v, want planned + replaces", res[0])
+	}
+	if !sameInode(t, low, dest) {
+		t.Fatal("preview replaced the destination")
+	}
+	n := e.syncer.n.Load()
+	res, _ = e.org.Organize(context.Background(), "The.Matrix.1999.1080p.mkv", OrganizeOptions{Overwrite: true})
+	if res[0].Status != jobs.StatusReplaced {
+		t.Fatalf("overwrite = %+v, want replaced", res[0])
+	}
+	if !sameInode(t, high, dest) {
+		t.Error("destination is not the 1080p release")
+	}
+	if _, err := os.Stat(low); err != nil {
+		t.Errorf("the replaced download must stay in place: %v", err)
+	}
+	if e.syncer.n.Load() == n {
+		t.Error("replace did not request a library sync")
+	}
+}
+
+// Regression: overwrite must stay confined to the library when a folder in
+// the destination path is a symlink to somewhere else.
+func TestOverwriteEscape(t *testing.T) {
+	e := newEnv(t, "jellyfin")
+	victim := filepath.Join(e.outside, "The Matrix (1999).mkv")
+	write(t, victim)
+	if err := os.Symlink(e.outside, filepath.Join(e.movies, "The Matrix (1999)")); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(e.downloads, "The.Matrix.1999.1080p.mkv"))
+	res, _ := e.org.Organize(context.Background(), "The.Matrix.1999.1080p.mkv", OrganizeOptions{Overwrite: true})
+	if res[0].Status != jobs.StatusError || res[0].Error != errUnauthorizedMsg {
+		t.Fatalf("result = %+v, want unauthorized_volume error", res[0])
+	}
+	if b, _ := os.ReadFile(victim); string(b) != victim {
+		t.Error("file outside the library was replaced")
 	}
 }

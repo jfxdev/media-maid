@@ -46,7 +46,8 @@ Go 1.25+ is required (`os.Root`). Dependencies are stdlib plus `fsnotify` and
 9. `internal/api`: stdlib `ServeMux`; `/api/v1/*` behind bearer auth;
    `/healthz`, `/openapi.yaml`, `/docs` are public.
 
-Other packages: `parser` (release name → `Media`), `naming` (paths +
+Other packages: `parser` (release name → `Analysis`: `Media`, `Quality`,
+confidence and signals; `Parse` is the `Media`-only wrapper), `naming` (paths +
 `Sanitize`), `jobs` (ring-buffer history and **all** status/action strings).
 
 ## Platform table
@@ -67,7 +68,11 @@ All platform-specific data lives in `internal/integration/platforms.go`
   on the descriptor); library writes only through `os.Root`
   (`organizer/linker.go`). Never `os.Create`/`os.Remove` on library paths
   directly.
-- **Never overwrite**: an existing different destination is `conflict`.
+- **Never overwrite by default**: an existing different destination is
+  `conflict`. Only an explicit `"overwrite": true` API request replaces it
+  (regular files only, `renameat` inside the `os.Root` directory); the watcher
+  and scans never overwrite. Releases sharing a destination in one run are
+  deduplicated by `parser.Quality` before anything is written (`duplicate`).
 - **Sanitize names**: anything from the parser or TMDB goes through
   `naming.Sanitize` before becoming a path component.
 - **Orphans are report-only**: removal happens only via

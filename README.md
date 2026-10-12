@@ -67,7 +67,7 @@ Every `/api/v1/*` route requires `Authorization: Bearer $API_TOKEN`.
 |---|---|---|
 | `GET` | `/healthz` | liveness |
 | `POST` | `/api/v1/scan` | organize the whole downloads folder |
-| `POST` | `/api/v1/organize` | `{"path": "..."}` organize one file/folder |
+| `POST` | `/api/v1/organize` | `{"path": "...", "overwrite": false}` organize one file/folder |
 | `POST` | `/api/v1/preview` | same as organize, without touching disk |
 | `GET` | `/api/v1/history` | recent actions and last sync |
 | `POST` | `/api/v1/sync` | refresh the media server library now |
@@ -81,6 +81,20 @@ qBittorrent hook (*Run external program on torrent finished*):
 curl -s -X POST -H "Authorization: Bearer $API_TOKEN" \
   -d "{\"path\":\"%N\"}" http://media-maid:8080/api/v1/organize
 ```
+
+## Duplicate releases
+
+Two releases of the same title (say `The.Matrix.1999.720p` and
+`The.Matrix.1999.1080p`) map to the same destination. Before anything is
+written, releases in the same run are compared and only the best one is linked
+(resolution, then source — REMUX > BluRay > WEB-DL > WEBRip > HDTV > DVD —,
+then HDR, then file size); the others are reported as `duplicate`.
+
+A destination that already exists with different content is a `conflict` and
+is left alone. To upgrade it, call organize with `"overwrite": true`: the file
+is replaced atomically (directories and symlinks never are), the old download
+stays untouched, and the result is `replaced`. Preview with `overwrite` reports
+`planned` with `"replaces": true`. The watcher and scans never overwrite.
 
 ## Orphans
 
@@ -98,7 +112,8 @@ returns `stale` if it is no longer an orphan.
 - Only volumes mounted into the container (from `/proc/self/mountinfo`) are
   authorized; links pointing elsewhere fail with `unauthorized_volume`.
 - Source files are opened with `O_NOFOLLOW` and verified with `fstat`; library
-  writes go through `os.Root`; existing files are never overwritten.
+  writes go through `os.Root`; existing files are only replaced on an explicit
+  `"overwrite": true` request, atomically and never through a symlink.
 - Names from parsing and TMDB are sanitized; server item IDs are validated.
 - Non-root distroless image; examples use `read_only`, `cap_drop: [ALL]` and
   `no-new-privileges`.
