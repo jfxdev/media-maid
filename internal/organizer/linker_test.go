@@ -92,3 +92,62 @@ func TestPlaceOverwrite(t *testing.T) {
 		t.Fatal("overwrite followed a symlink")
 	}
 }
+
+// Regression: a file at the old fixed temporary name is neither reused nor
+// removed.
+func TestPlaceKeepsForeignTemp(t *testing.T) {
+	dst := t.TempDir()
+	root, _ := os.OpenRoot(dst)
+	defer root.Close()
+	dir := filepath.Join(dst, "Movie (2000)")
+	os.MkdirAll(dir, 0o755)
+	os.WriteFile(filepath.Join(dir, "Movie (2000).mkv"), []byte("old 720p"), 0o644)
+	foreign := filepath.Join(dir, ".Movie (2000).mkv.mediamaid-tmp")
+	os.WriteFile(foreign, []byte("not ours"), 0o644)
+
+	src := filepath.Join(t.TempDir(), "new.mkv")
+	os.WriteFile(src, []byte("new 1080p"), 0o644)
+	f, _ := os.Open(src)
+	defer f.Close()
+	fi, _ := f.Stat()
+	if st, err := place(root, "Movie (2000)/Movie (2000).mkv", f, fi, true); st != jobs.StatusReplaced || err != nil {
+		t.Fatalf("overwrite = %s, %v", st, err)
+	}
+	if b, _ := os.ReadFile(foreign); string(b) != "not ours" {
+		t.Error("an unrelated temporary file was removed or overwritten")
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 2 {
+		t.Errorf("entries = %v", entries)
+	}
+}
+
+// Regression: if the destination changes after it was checked (here: to a
+// symlink, then to a different file), the swap is undone.
+func TestSwapInRechecksDestination(t *testing.T) {
+	dst := t.TempDir()
+	root, _ := os.OpenRoot(dst)
+	defer root.Close()
+	d, _ := root.Open(".")
+	defer d.Close()
+	dest := filepath.Join(dst, "Movie.mkv")
+	os.WriteFile(dest, []byte("checked"), 0o644)
+	checked, _ := os.Lstat(dest)
+
+	for name, swap := range map[string]func(){
+		"symlink":    func() { os.Remove(dest); os.Symlink("/etc/passwd", dest) },
+		"other file": func() { os.Remove(dest); os.WriteFile(dest, []byte("a newer file"), 0o644) },
+	} {
+		swap()
+		before, _ := os.Lstat(dest)
+		os.WriteFile(filepath.Join(dst, ".staged"), []byte("staged"), 0o644)
+		st, err := swapIn(root, d, ".staged", "Movie.mkv", checked)
+		if st != jobs.StatusConflict || err != nil {
+			t.Errorf("%s: swapIn = %s, %v; want conflict", name, st, err)
+		}
+		after, _ := os.Lstat(dest)
+		if !os.SameFile(before, after) {
+			t.Errorf("%s: destination was replaced", name)
+		}
+		os.Remove(filepath.Join(dst, ".staged"))
+	}
+}

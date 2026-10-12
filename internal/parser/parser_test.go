@@ -118,6 +118,9 @@ func TestQuality(t *testing.T) {
 		{"The.Matrix.1999.4K.WEB-DL.mkv", Quality{Resolution: 2160, Source: "web-dl"}},
 		{"The.Matrix.1999.1080p/movie.mkv", Quality{Resolution: 1080}},
 		{"The.Matrix.1999.mkv", Quality{}},
+		{"The.Matrix.1999.BluRay.mkv", Quality{Source: "bluray"}},
+		{"The.Matrix.1999.1080p/The.Matrix.1999.REMUX.HDR.mkv", Quality{Resolution: 1080, Source: "remux", HDR: true}},
+		{"The.Matrix.1999.1080p.WEB-DL/The.Matrix.1999.BluRay.mkv", Quality{Resolution: 1080, Source: "bluray"}},
 	}
 	for _, tt := range tests {
 		a, _ := Analyze(tt.path)

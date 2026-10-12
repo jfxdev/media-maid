@@ -549,6 +549,13 @@ func TestPreferredLanguage(t *testing.T) {
 		t.Errorf("fallback: %+v", r)
 	}
 
+	// TMDB is on but found nothing: the llm must not invent a localized title.
+	fa.localized, fa.locCalls = "Inventado", nil
+	r = organizeOne(t, e, "Some.Obscure.Film.2003.mkv")
+	if r.TitleSource != TitleOriginal || !strings.Contains(r.Dest, "Some Obscure Film (2003)") || len(fa.locCalls) != 0 {
+		t.Errorf("unconfirmed work: %+v, %d llm calls", r, len(fa.locCalls))
+	}
+
 	// Without the LLM layer, no translation means the original title.
 	e = newEnv(t, "jellyfin", func(o *Options) { o.Language = "pt-BR" })
 	if r := organizeOne(t, e, "Inception.2010.1080p.mkv"); r.TitleSource != TitleOriginal || !strings.Contains(r.Dest, "Inception (2010)") {

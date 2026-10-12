@@ -1,6 +1,7 @@
 package organizer
 
 import (
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
@@ -35,7 +36,6 @@ func place(root *os.Root, rel string, src *os.File, srcInfo os.FileInfo, overwri
 	if err := root.MkdirAll(dir, 0o755); err != nil {
 		return jobs.StatusError, mapRootErr(err)
 	}
-	replace := false
 	if existing, err := root.Lstat(rel); err == nil {
 		if samePlaced(existing, srcInfo) {
 			return jobs.StatusExists, nil
@@ -43,12 +43,9 @@ func place(root *os.Root, rel string, src *os.File, srcInfo os.FileInfo, overwri
 		if !overwrite || !existing.Mode().IsRegular() {
 			return jobs.StatusConflict, nil
 		}
-		replace = true
+		return replaceWith(root, rel, src, srcInfo, existing)
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return jobs.StatusError, mapRootErr(err)
-	}
-	if replace {
-		return replaceWith(root, rel, src, srcInfo)
 	}
 
 	d, err := root.Open(dir)
@@ -73,8 +70,10 @@ func place(root *os.Root, rel string, src *os.File, srcInfo os.FileInfo, overwri
 	}
 }
 
+// tmpName returns a fresh temporary name next to rel. It is unique per
+// placement, so an existing file is never reused or removed.
 func tmpName(rel string) string {
-	return path.Join(path.Dir(rel), "."+path.Base(rel)+".mediamaid-tmp")
+	return path.Join(path.Dir(rel), "."+path.Base(rel)+"."+rand.Text()[:12]+".mediamaid-tmp")
 }
 
 // copyTemp copies src into a new temporary file tmp, keeping the source mtime
@@ -130,16 +129,16 @@ func copyInto(root *os.Root, rel string, src *os.File, srcInfo os.FileInfo) (str
 }
 
 // replaceWith stages src next to rel (hardlink, or copy across filesystems)
-// and renames it over rel, so the destination is swapped atomically. Both
-// steps go through the directory descriptor opened by os.Root.
-func replaceWith(root *os.Root, rel string, src *os.File, srcInfo os.FileInfo) (string, error) {
+// and swaps it with rel. Both steps go through the directory descriptor
+// opened by os.Root. Only the file checked by the caller (checked) is ever
+// replaced: see swapIn.
+func replaceWith(root *os.Root, rel string, src *os.File, srcInfo, checked os.FileInfo) (string, error) {
 	tmp := tmpName(rel)
 	d, err := root.Open(path.Dir(rel))
 	if err != nil {
 		return jobs.StatusError, mapRootErr(err)
 	}
 	defer d.Close()
-	root.Remove(tmp) // a stale temporary from an interrupted run
 	srcProc := "/proc/self/fd/" + strconv.Itoa(int(src.Fd()))
 	err = unix.Linkat(unix.AT_FDCWD, srcProc, int(d.Fd()), path.Base(tmp), unix.AT_SYMLINK_FOLLOW)
 	switch {
@@ -151,11 +150,49 @@ func replaceWith(root *os.Root, rel string, src *os.File, srcInfo os.FileInfo) (
 	default:
 		return jobs.StatusError, fmt.Errorf("hardlink: %w", err)
 	}
-	if err := unix.Renameat(int(d.Fd()), path.Base(tmp), int(d.Fd()), path.Base(rel)); err != nil {
-		root.Remove(tmp)
+	status, err := swapIn(root, d, tmp, rel, checked)
+	root.Remove(tmp) // our staged file, or the replaced destination
+	return status, err
+}
+
+// swapIn atomically exchanges the staged tmp with rel, then checks that what
+// came out is still the regular file the caller inspected. If another writer
+// put a symlink or a different file there in the meantime, the swap is
+// undone and the result is a conflict. Filesystems without RENAME_EXCHANGE
+// fall back to a plain rename, guarded by a last check.
+func swapIn(root *os.Root, d *os.File, tmp, rel string, checked os.FileInfo) (string, error) {
+	dfd, t, n := int(d.Fd()), path.Base(tmp), path.Base(rel)
+	err := unix.Renameat2(dfd, t, dfd, n, unix.RENAME_EXCHANGE)
+	switch {
+	case err == nil:
+		out, err := root.Lstat(tmp)
+		if err == nil && unchanged(out, checked) {
+			return jobs.StatusReplaced, nil
+		}
+		if err := unix.Renameat2(dfd, t, dfd, n, unix.RENAME_EXCHANGE); err != nil {
+			return jobs.StatusError, fmt.Errorf("undo replace: %w", err)
+		}
+		return jobs.StatusConflict, nil
+	case errors.Is(err, unix.EINVAL), errors.Is(err, unix.ENOTSUP), errors.Is(err, unix.ENOSYS):
+		if cur, err := root.Lstat(rel); err != nil || !unchanged(cur, checked) {
+			return jobs.StatusConflict, nil
+		}
+		if err := unix.Renameat(dfd, t, dfd, n); err != nil {
+			return jobs.StatusError, fmt.Errorf("replace: %w", err)
+		}
+		return jobs.StatusReplaced, nil
+	case errors.Is(err, unix.ENOENT):
+		return jobs.StatusConflict, nil // the destination disappeared
+	default:
 		return jobs.StatusError, fmt.Errorf("replace: %w", err)
 	}
-	return jobs.StatusReplaced, nil
+}
+
+// unchanged reports whether cur is still the regular file seen as checked.
+// Size and mtime guard against an inode number reused by a new file.
+func unchanged(cur, checked os.FileInfo) bool {
+	return cur.Mode().IsRegular() && os.SameFile(cur, checked) &&
+		cur.Size() == checked.Size() && cur.ModTime().Equal(checked.ModTime())
 }
 
 // samePlaced reports whether dest already holds src: the same inode for a

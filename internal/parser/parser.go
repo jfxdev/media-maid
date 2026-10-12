@@ -114,7 +114,13 @@ func Analyze(path string) (Analysis, bool) {
 	name := normalize(stem)
 	a := Analysis{Quality: detectQuality(name)}
 	if a.Quality.Resolution == 0 {
-		a.Quality = detectQuality(normalize(parent))
+		// Supplement, never replace, what the file name says.
+		pq := detectQuality(normalize(parent))
+		a.Quality.Resolution = pq.Resolution
+		if a.Quality.Source == "" {
+			a.Quality.Source = pq.Source
+		}
+		a.Quality.HDR = a.Quality.HDR || pq.HDR
 	}
 	if reReleaseTk.MatchString(name) || reReleaseTk.MatchString(normalize(parent)) {
 		a.add(SigReleaseTokens)

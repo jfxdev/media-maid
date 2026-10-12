@@ -146,6 +146,9 @@ func (o *Organizer) localize(ctx context.Context, id *identity) {
 		if len(req.Options) == 0 {
 			return
 		}
+	} else if o.hasMeta {
+		// TMDB is on but did not confirm the work: a free answer is not allowed.
+		return
 	}
 	if o.assist == nil {
 		return
