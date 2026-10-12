@@ -109,6 +109,8 @@ func setupTree(t *testing.T, e *env) {
 		{ID: "3", Title: "Elsewhere", Paths: []string{"/music/song.mkv"}},
 		{ID: "4", Title: "Linked", Paths: []string{"/media/movies/Linked (2003)/real.mkv"}},
 		{ID: "5", Title: "Ep2", Paths: []string{"/media/tv/Show/Season 01/Show S01E02.mkv"}},
+		// Multi-part item with one part outside the managed libraries: never an orphan.
+		{ID: "6", Title: "Mixed", Paths: []string{"/media/movies/Mixed (2004)/part1.mkv", "/elsewhere/part2.mkv"}},
 	}
 }
 

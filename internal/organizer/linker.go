@@ -88,13 +88,21 @@ func copyInto(root *os.Root, rel string, src *os.File, srcInfo os.FileInfo) (str
 		root.Remove(tmp)
 		return jobs.StatusError, err
 	}
-	if _, err := root.Lstat(rel); err == nil {
-		root.Remove(tmp)
-		return jobs.StatusConflict, nil
-	}
-	if err := root.Rename(tmp, rel); err != nil {
+	// Commit with a hardlink instead of rename: link(2) never replaces an
+	// existing destination, so a file created concurrently is not overwritten.
+	d, err := root.Open(path.Dir(rel))
+	if err != nil {
 		root.Remove(tmp)
 		return jobs.StatusError, mapRootErr(err)
+	}
+	defer d.Close()
+	err = unix.Linkat(int(d.Fd()), path.Base(tmp), int(d.Fd()), path.Base(rel), 0)
+	root.Remove(tmp)
+	if errors.Is(err, unix.EEXIST) {
+		return jobs.StatusConflict, nil
+	}
+	if err != nil {
+		return jobs.StatusError, fmt.Errorf("commit copy: %w", err)
 	}
 	return jobs.StatusCopied, nil
 }

@@ -31,7 +31,14 @@ type Watcher struct {
 	log      *slog.Logger
 	fsw      *fsnotify.Watcher
 	pending  map[string]*pending
+	// queued holds releases handed to the worker and not yet finished. It is
+	// owned by the event loop, like pending.
+	queued map[string]bool
+	work   chan string
+	done   chan string
 }
+
+const workQueueSize = 256
 
 // New creates a watcher; call Run to start it.
 func New(root string, stable time.Duration, organize OrganizeFunc, log *slog.Logger) (*Watcher, error) {
@@ -39,7 +46,13 @@ func New(root string, stable time.Duration, organize OrganizeFunc, log *slog.Log
 	if err != nil {
 		return nil, err
 	}
-	w := &Watcher{root: root, stable: stable, organize: organize, log: log, fsw: fsw, pending: map[string]*pending{}}
+	w := &Watcher{
+		root: root, stable: stable, organize: organize, log: log, fsw: fsw,
+		pending: map[string]*pending{},
+		queued:  map[string]bool{},
+		work:    make(chan string, workQueueSize),
+		done:    make(chan string, workQueueSize),
+	}
 	if err := w.addTree(root); err != nil {
 		fsw.Close()
 		return nil, err
@@ -91,15 +104,36 @@ func (w *Watcher) topLevel(p string) string {
 	return filepath.Join(w.root, first)
 }
 
+// worker organizes releases one at a time, off the event loop, so long copies
+// never stop the loop from draining filesystem events.
+func (w *Watcher) worker(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case top := <-w.work:
+			w.organize(ctx, top)
+			select {
+			case w.done <- top:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+}
+
 // Run processes events until ctx is cancelled.
 func (w *Watcher) Run(ctx context.Context) {
 	defer w.fsw.Close()
+	go w.worker(ctx)
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case top := <-w.done:
+			delete(w.queued, top)
 		case ev, ok := <-w.fsw.Events:
 			if !ok {
 				return
@@ -111,7 +145,7 @@ func (w *Watcher) Run(ctx context.Context) {
 			}
 			w.log.Warn("watcher error", "err", err)
 		case <-tick.C:
-			w.flush(ctx)
+			w.flush()
 		}
 	}
 }
@@ -136,7 +170,7 @@ func (w *Watcher) handle(ev fsnotify.Event) {
 
 // flush organizes every release whose pending files have all been stable
 // (same size, no events) for the configured duration.
-func (w *Watcher) flush(ctx context.Context) {
+func (w *Watcher) flush() {
 	now := time.Now()
 	ready := map[string]bool{}
 	for p, e := range w.pending {
@@ -160,14 +194,21 @@ func (w *Watcher) flush(ctx context.Context) {
 		}
 	}
 	for top, ok := range ready {
-		if !ok {
+		// A release still being organized keeps its pending files; it is
+		// dispatched again once the worker reports it done.
+		if !ok || w.queued[top] {
 			continue
 		}
+		select {
+		case w.work <- top:
+		default:
+			continue // queue full: retry on the next tick
+		}
+		w.queued[top] = true
 		for p := range w.pending {
 			if w.topLevel(p) == top {
 				delete(w.pending, p)
 			}
 		}
-		w.organize(ctx, top)
 	}
 }

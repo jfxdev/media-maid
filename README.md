@@ -1,4 +1,8 @@
-# media-maid
+<p align="center">
+  <img src="docs/logo.png" alt="Media Maid" width="200">
+</p>
+
+<h1 align="center">media-maid</h1>
 
 Sidecar que organiza mídias baixadas (filmes e séries) no formato de nomes
 que **Jellyfin**, **Emby** ou **Plex** reconhecem, e depois pede para o media
@@ -107,7 +111,12 @@ Códigos de erro: `400 invalid_path`, `401 unauthorized`,
 ## Órfãos
 
 - `server_item_missing_file`: o item existe no media server, mas o arquivo
-  não está mais no disco. Remover apaga só a entrada no server.
+  não está mais no disco. Só é reportado quando **todos** os paths do item
+  estão dentro das bibliotecas gerenciadas e nenhum existe. Remover chama o
+  `DELETE` da plataforma. Jellyfin, Emby e Plex também apagam a mídia do
+  item, mas como os arquivos já não existem (isso é revalidado antes da
+  chamada), o efeito fica restrito à entrada e à pasta do item dentro da
+  biblioteca gerenciada.
 - `orphan_directory`: pasta da biblioteca sem nenhum vídeo (vazia, ou só com
   legendas/nfo/imagens). Só a pasta mais alta é reportada. Remover apaga a
   pasta.

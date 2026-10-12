@@ -212,19 +212,21 @@ func exists(lib organizer.Library, rel string) (bool, error) {
 	}
 }
 
-// checkItem returns an orphan when none of the item's managed files exist.
-// Items with no file inside a managed library are ignored.
+// checkItem returns an orphan only when every path of the item lies inside a
+// managed library and none of them exist. An item with any path outside the
+// managed libraries is ignored: removing it on the server could also remove
+// media Media Maid does not manage (e.g. a Plex item with several parts).
 func (d *Detector) checkItem(it integration.ServerItem) (*Orphan, *ReportError) {
 	var managed []string
 	var display string
 	for _, p := range it.Paths {
 		local := d.pathMap.Translate(p)
 		if !filepath.IsAbs(local) {
-			continue
+			return nil, nil
 		}
 		lib, rel, ok := d.locate(local)
 		if !ok {
-			continue
+			return nil, nil
 		}
 		ok, err := exists(lib, rel)
 		if err != nil {
