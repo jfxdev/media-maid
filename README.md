@@ -4,15 +4,10 @@
 
 <h1 align="center">media-maid</h1>
 
-Sidecar que organiza mídias baixadas (filmes e séries) no formato de nomes
-que **Jellyfin**, **Emby** ou **Plex** reconhecem, e depois pede para o media
-server sincronizar a biblioteca.
-
-O Media Maid roda ao lado do container do media server, compartilhando volume:
-observa a pasta de downloads, identifica título/ano/temporada/episódio,
-cria **hardlinks** na biblioteca (o torrent continua semeando, sem ocupar
-espaço extra) e dispara o sync. Também detecta órfãos (itens do server sem
-arquivo e pastas sem vídeo) e permite removê-los de forma explícita.
+A sidecar for **Jellyfin**, **Emby** or **Plex** that watches your downloads
+folder, **hardlinks** movies and episodes into a library with names the server
+recognizes, triggers a library refresh and reports orphaned entries. Torrents
+keep seeding and no extra disk space is used.
 
 ```
 downloads/Inception.2010.1080p.BluRay.x264-GRP/Inception.2010.1080p.BluRay.x264-GRP.mkv
@@ -24,131 +19,91 @@ movies/Inception (2010) [tmdbid-27205]/Inception (2010) [tmdbid-27205].pt-BR.srt
 tv/Dark (2017) [tmdbid-70523]/Season 01/Dark S01E01-E02.mkv
 ```
 
-A tag de ID só aparece quando `TMDB_API_KEY` está configurada, e o formato
-segue a plataforma: `[tmdbid-1]` (Jellyfin), `[tmdbid=1]` (Emby), `{tmdb-1}` (Plex).
+The ID tag only appears when `TMDB_API_KEY` is set, in the server's format:
+`[tmdbid-1]` (Jellyfin), `[tmdbid=1]` (Emby), `{tmdb-1}` (Plex).
 
-## Single tenant
+## Quick start
 
-Cada instância fica vinculada a **exatamente um** media server, definido por
-`INTEGRATION_MODE`. Combinações (Jellyfin + Plex, dois Jellyfin…) são
-recusadas no start: valores múltiplos em `INTEGRATION_MODE`,
-`MEDIA_SERVER_URL` ou `MEDIA_SERVER_TOKEN`, ou variáveis `JELLYFIN_*`,
-`EMBY_*` e `PLEX_*` presentes, encerram o processo. Para vários servers, rode
-um sidecar por server.
+Pick a ready-made compose file from [`examples/`](examples/) (one per server),
+set `MEDIA_SERVER_TOKEN` and `MEDIA_MAID_API_TOKEN`, and run
+`docker compose up -d`. Keep downloads and library on the **same filesystem**
+so hardlinks work (otherwise files are copied).
 
-Todo o código específico de plataforma está numa única tabela
-(`internal/integration/platforms.go`). Sync, listagem e remoção de itens são
-genéricos e guiados pelo modo selecionado.
+Each instance is bound to **exactly one** media server (`INTEGRATION_MODE`).
+Multiple values or `JELLYFIN_*` / `EMBY_*` / `PLEX_*` variables abort startup;
+run one sidecar per server.
 
-| Modo | Sync | Listagem (órfãos) | Remoção de item | Header |
-|---|---|---|---|---|
-| `jellyfin` | `POST /Library/Refresh` | `GET /Items` | `DELETE /Items/{id}` | `X-Emby-Token` |
-| `emby` | `POST /emby/Library/Refresh` | `GET /emby/Items` | `DELETE /emby/Items/{id}` | `X-Emby-Token` |
-| `plex` | `GET /library/sections/all/refresh` | `GET /library/sections/{id}/all` | `DELETE /library/metadata/{id}` | `X-Plex-Token` |
+## Configuration
 
-## Configuração
-
-| Variável | Obrigatória | Padrão | Descrição |
+| Variable | Required | Default | Description |
 |---|---|---|---|
-| `INTEGRATION_MODE` | sim | — | `jellyfin`, `emby` ou `plex` (um único valor) |
-| `MEDIA_SERVER_URL` | não¹ | — | ex.: `http://jellyfin:8096` |
-| `MEDIA_SERVER_TOKEN` | não¹ | — | API key (Jellyfin/Emby) ou X-Plex-Token |
-| `API_TOKEN` | sim | — | Bearer token da API (≥ 32 caracteres) |
-| `DOWNLOADS_DIR` | sim | — | pasta de downloads (origem) |
-| `MOVIES_DIR` | sim | — | biblioteca de filmes |
-| `TV_DIR` | sim | — | biblioteca de séries |
-| `VIDEO_EXTENSIONS` | não | `mkv,mp4,avi,m4v,mov,wmv,ts,webm` | allowlist de vídeos |
-| `SUBTITLE_EXTENSIONS` | não | `srt,ass,ssa,sub,idx,vtt` | allowlist de legendas |
-| `TMDB_API_KEY` | não | — | chave v3 ou token v4 do TMDB (título/ano/ID oficiais) |
-| `SERVER_PATH_MAP` | não | — | `prefixo_server=prefixo_local` (um único par) |
-| `ORPHAN_SCAN_INTERVAL` | não | — | scan periódico de órfãos (ex.: `24h`), só relatório |
-| `SYNC_DEBOUNCE` | não | `30s` | agrupa vários links em um único sync |
-| `STABLE_SECONDS` | não | `30` | tempo sem mudanças para considerar o download concluído |
-| `LISTEN_ADDR` | não | `:8080` | endereço HTTP |
-| `DRY_RUN` | não | `false` | não cria links nem remove nada |
+| `INTEGRATION_MODE` | yes | — | `jellyfin`, `emby` or `plex` |
+| `MEDIA_SERVER_URL` | no¹ | — | e.g. `http://jellyfin:8096` |
+| `MEDIA_SERVER_TOKEN` | no¹ | — | API key (Jellyfin/Emby) or X-Plex-Token |
+| `API_TOKEN` | yes | — | bearer token for the API (≥ 32 chars) |
+| `DOWNLOADS_DIR` | yes | — | source folder |
+| `MOVIES_DIR` / `TV_DIR` | yes | — | library folders |
+| `TMDB_API_KEY` | no | — | TMDB v3 key or v4 token for canonical title/year/ID |
+| `SERVER_PATH_MAP` | no | — | `server_prefix=local_prefix` when the server sees other paths |
+| `ORPHAN_SCAN_INTERVAL` | no | — | periodic orphan report (e.g. `24h`) |
+| `VIDEO_EXTENSIONS` | no | `mkv,mp4,avi,m4v,mov,wmv,ts,webm` | video allowlist |
+| `SUBTITLE_EXTENSIONS` | no | `srt,ass,ssa,sub,idx,vtt` | subtitle allowlist |
+| `SYNC_DEBOUNCE` | no | `30s` | coalesce links into one refresh |
+| `STABLE_SECONDS` | no | `30` | quiet time before a download counts as done |
+| `LISTEN_ADDR` | no | `:8080` | HTTP address |
+| `DRY_RUN` | no | `false` | never link or remove anything |
 
-¹ `MEDIA_SERVER_URL` e `MEDIA_SERVER_TOKEN` vêm em par. Com as duas vazias,
-o sync e a checagem de itens do server ficam desativados.
-
-`DOWNLOADS_DIR`, `MOVIES_DIR` e `TV_DIR` precisam ser distintos, não
-aninhados e estar dentro de volumes montados no container. Para que o
-hardlink funcione, downloads e biblioteca devem estar no mesmo filesystem; se
-não estiverem, o Media Maid copia o arquivo.
-
-Exemplos completos: [`examples/`](examples/) (um `docker-compose` por modo).
+¹ Set both or neither; without them, sync and server-side orphan checks are off.
+The three folders must be distinct, non-nested and inside mounted volumes.
 
 ## API
 
-Todas as rotas `/api/v1/*` exigem `Authorization: Bearer $API_TOKEN`.
+Interactive docs are served at **`/docs`** and the OpenAPI spec at
+**`/openapi.yaml`** (both unauthenticated; the spec is embedded in the binary,
+source in [`internal/api/openapi.yaml`](internal/api/openapi.yaml)).
+Every `/api/v1/*` route requires `Authorization: Bearer $API_TOKEN`.
 
-| Método | Rota | Descrição |
+| Method | Route | Description |
 |---|---|---|
-| `GET` | `/healthz` | liveness (sem autenticação) |
-| `POST` | `/api/v1/scan` | organiza todo o `DOWNLOADS_DIR` |
-| `POST` | `/api/v1/organize` | `{"path": "..."}`: organiza um arquivo ou pasta (relativo a `DOWNLOADS_DIR` ou absoluto dentro dele) |
-| `POST` | `/api/v1/preview` | igual a `organize`, mas só mostra o destino planejado |
-| `GET` | `/api/v1/history` | ações recentes e resultado do último sync |
-| `POST` | `/api/v1/sync` | força o sync na plataforma configurada |
-| `POST` | `/api/v1/orphans/scan` | gera o relatório de órfãos |
-| `GET` | `/api/v1/orphans` | último relatório |
-| `POST` | `/api/v1/orphans/remove` | `{"ids": [...]}`: remove órfãos do relatório atual |
+| `GET` | `/healthz` | liveness |
+| `POST` | `/api/v1/scan` | organize the whole downloads folder |
+| `POST` | `/api/v1/organize` | `{"path": "..."}` organize one file/folder |
+| `POST` | `/api/v1/preview` | same as organize, without touching disk |
+| `GET` | `/api/v1/history` | recent actions and last sync |
+| `POST` | `/api/v1/sync` | refresh the media server library now |
+| `POST` | `/api/v1/orphans/scan` | build an orphan report |
+| `GET` | `/api/v1/orphans` | latest report |
+| `POST` | `/api/v1/orphans/remove` | `{"ids": [...]}` remove reported orphans |
 
-Para disparar a organização ao concluir um download no qBittorrent, use
-*Executar programa externo*:
+qBittorrent hook (*Run external program on torrent finished*):
 
 ```sh
 curl -s -X POST -H "Authorization: Bearer $API_TOKEN" \
   -d "{\"path\":\"%N\"}" http://media-maid:8080/api/v1/organize
 ```
 
-Status por arquivo: `linked`, `copied`, `exists`, `conflict` (o destino já
-existe com outro conteúdo e nunca é sobrescrito), `planned` (preview),
-`skipped` e `error`.
+## Orphans
 
-Códigos de erro: `400 invalid_path`, `401 unauthorized`,
-`403 unauthorized_volume`, `404 not_found` e `409 sync_disabled`.
+- `server_item_missing_file`: the server lists an item whose files are all gone
+  (only when every path is inside the managed libraries). Removal calls the
+  server's delete endpoint.
+- `orphan_directory`: a library folder with no video left. Removal deletes it.
 
-## Órfãos
+Nothing is removed automatically. Each ID is revalidated on removal and
+returns `stale` if it is no longer an orphan.
 
-- `server_item_missing_file`: o item existe no media server, mas o arquivo
-  não está mais no disco. Só é reportado quando **todos** os paths do item
-  estão dentro das bibliotecas gerenciadas e nenhum existe. Remover chama o
-  `DELETE` da plataforma. Jellyfin, Emby e Plex também apagam a mídia do
-  item, mas como os arquivos já não existem (isso é revalidado antes da
-  chamada), o efeito fica restrito à entrada e à pasta do item dentro da
-  biblioteca gerenciada.
-- `orphan_directory`: pasta da biblioteca sem nenhum vídeo (vazia, ou só com
-  legendas/nfo/imagens). Só a pasta mais alta é reportada. Remover apaga a
-  pasta.
+## Security
 
-A remoção nunca é automática: só acontece via `/api/v1/orphans/remove`, com
-IDs do relatório atual. Cada item é revalidado na hora; se não for mais órfão
-(arquivo restaurado, vídeo adicionado, pasta trocada por symlink…), retorna
-`stale` e nada é feito.
+- Constant-time bearer token check; tokens never appear in logs or responses.
+- Only volumes mounted into the container (from `/proc/self/mountinfo`) are
+  authorized; links pointing elsewhere fail with `unauthorized_volume`.
+- Source files are opened with `O_NOFOLLOW` and verified with `fstat`; library
+  writes go through `os.Root`; existing files are never overwritten.
+- Names from parsing and TMDB are sanitized; server item IDs are validated.
+- Non-root distroless image; examples use `read_only`, `cap_drop: [ALL]` and
+  `no-new-privileges`.
 
-## Segurança
-
-- `API_TOKEN` é obrigatório e comparado em tempo constante.
-- **Volumes autorizados** são os volumes montados no container, lidos de
-  `/proc/self/mountinfo`. O rootfs do container, `/proc`, `/sys`, `/dev` e
-  arquivos injetados (`/etc/hosts`…) ficam de fora.
-- Paths da API não podem conter `..`, bytes nulos nem apontar para fora de
-  `DOWNLOADS_DIR`.
-- Symlinks na origem podem apontar para **qualquer** volume montado. Se
-  apontarem para fora deles, o resultado é `unauthorized_volume` (403 na API,
-  erro no histórico) e nada é linkado. O arquivo é aberto pelo path resolvido
-  com `O_NOFOLLOW` e checado com `fstat` (arquivo regular em um dispositivo
-  autorizado) antes do link.
-- A escrita na biblioteca passa por `os.Root`. Pastas da biblioteca que sejam
-  symlinks para fora geram `unauthorized_volume`.
-- Nomes vindos do parser e do TMDB são sanitizados (sem separadores, `..` ou
-  caracteres de controle).
-- IDs de itens do server são validados antes de entrar em URLs.
-- Os tokens nunca aparecem em logs ou respostas.
-- A imagem roda como non-root (distroless). Os exemplos usam `read_only`,
-  `cap_drop: [ALL]` e `no-new-privileges`.
-
-## Desenvolvimento
+## Development
 
 ```sh
 go test ./...
@@ -156,4 +111,5 @@ go build ./cmd/media-maid
 docker build -t media-maid .
 ```
 
-Requer Go 1.25+ (`os.Root`).
+Requires Go 1.25+. See [`AGENTS.md`](AGENTS.md) for architecture and
+contribution notes.

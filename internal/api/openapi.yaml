@@ -1,0 +1,354 @@
+openapi: 3.1.0
+info:
+  title: Media Maid API
+  version: 1.0.0
+  summary: Organize downloads into a Jellyfin, Emby or Plex library and clean up orphans.
+  description: |
+    Every `/api/v1/*` route requires `Authorization: Bearer <API_TOKEN>`.
+    Errors are returned as `{"error": "<code>"}` with a stable code.
+  license:
+    name: See LICENSE
+    url: https://github.com/jfxdev/media-maid/blob/main/LICENSE
+externalDocs:
+  url: https://github.com/jfxdev/media-maid
+servers:
+  - url: /
+security:
+  - bearerAuth: []
+tags:
+  - name: organize
+    description: Turn downloads into library entries.
+  - name: sync
+    description: Media server library refresh and history.
+  - name: orphans
+    description: Detect and remove stale library entries.
+  - name: meta
+paths:
+  /healthz:
+    get:
+      tags: [meta]
+      summary: Liveness probe
+      operationId: health
+      security: []
+      responses:
+        "200":
+          description: The process is up.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, const: ok }
+                required: [status]
+  /api/v1/scan:
+    post:
+      tags: [organize]
+      summary: Organize the whole downloads directory
+      operationId: scan
+      responses:
+        "200": { $ref: "#/components/responses/Results" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /api/v1/organize:
+    post:
+      tags: [organize]
+      summary: Organize one file or folder
+      description: |
+        `path` is relative to `DOWNLOADS_DIR` or absolute inside it.
+        Handy as a qBittorrent "run external program" hook.
+      operationId: organize
+      requestBody: { $ref: "#/components/requestBodies/PathRequest" }
+      responses:
+        "200": { $ref: "#/components/responses/Results" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/UnauthorizedVolume" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /api/v1/preview:
+    post:
+      tags: [organize]
+      summary: Show where a file or folder would go, without touching disk
+      operationId: preview
+      requestBody: { $ref: "#/components/requestBodies/PathRequest" }
+      responses:
+        "200": { $ref: "#/components/responses/Results" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/UnauthorizedVolume" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /api/v1/history:
+    get:
+      tags: [sync]
+      summary: Recent actions (newest first) and the last sync outcome
+      operationId: history
+      responses:
+        "200":
+          description: In-memory history.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  entries:
+                    type: array
+                    items: { $ref: "#/components/schemas/HistoryEntry" }
+                  last_sync:
+                    oneOf:
+                      - { $ref: "#/components/schemas/SyncStatus" }
+                      - { type: "null" }
+                required: [entries, last_sync]
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/v1/sync:
+    post:
+      tags: [sync]
+      summary: Trigger a library refresh on the media server now
+      operationId: sync
+      responses:
+        "200":
+          description: The media server accepted the refresh.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, const: ok }
+                required: [status]
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409":
+          description: "`sync_disabled`: no media server configured."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "502":
+          description: "`sync_failed`: the media server rejected or did not answer the refresh."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+  /api/v1/orphans/scan:
+    post:
+      tags: [orphans]
+      summary: Build a fresh orphan report (never removes anything)
+      operationId: scanOrphans
+      responses:
+        "200": { $ref: "#/components/responses/Report" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /api/v1/orphans:
+    get:
+      tags: [orphans]
+      summary: Latest orphan report
+      operationId: getOrphans
+      responses:
+        "200": { $ref: "#/components/responses/Report" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: "`no_report`: no scan has run yet."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+  /api/v1/orphans/remove:
+    post:
+      tags: [orphans]
+      summary: Remove orphans from the current report
+      description: |
+        Each ID is revalidated first. IDs that are unknown or no longer
+        orphans return `stale` and nothing is done for them.
+      operationId: removeOrphans
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                ids:
+                  type: array
+                  minItems: 1
+                  maxItems: 1000
+                  items: { type: string }
+              required: [ids]
+      responses:
+        "200":
+          description: One result per requested ID.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results:
+                    type: array
+                    items: { $ref: "#/components/schemas/RemoveResult" }
+                required: [results]
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: The `API_TOKEN` configured on the sidecar (at least 32 characters).
+  requestBodies:
+    PathRequest:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties: false
+            properties:
+              path:
+                type: string
+                description: Relative to `DOWNLOADS_DIR`, or absolute inside it.
+                examples: ["Inception.2010.1080p.BluRay.x264-GRP"]
+            required: [path]
+  responses:
+    Results:
+      description: One result per source file.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              results:
+                type: array
+                items: { $ref: "#/components/schemas/Result" }
+            required: [results]
+    Report:
+      description: Orphan report.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Report" }
+    BadRequest:
+      description: "`invalid_request` (malformed JSON, unknown fields, body over 64 KiB) or `invalid_path`."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unauthorized:
+      description: "`unauthorized`: missing or wrong bearer token."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    UnauthorizedVolume:
+      description: "`unauthorized_volume`: the path links outside the mounted volumes."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: "`not_found`: nothing exists at that path."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    InternalError:
+      description: "`internal_error`."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+          enum:
+            - invalid_request
+            - invalid_path
+            - unauthorized
+            - unauthorized_volume
+            - not_found
+            - no_report
+            - sync_disabled
+            - sync_failed
+            - internal_error
+      required: [error]
+    Result:
+      type: object
+      description: Outcome for a single source file.
+      properties:
+        source:
+          type: string
+          description: Path relative to `DOWNLOADS_DIR`.
+        dest:
+          type: string
+          description: Destination inside the library.
+        kind:
+          type: string
+          enum: [movie, episode, subtitle]
+        status:
+          type: string
+          enum: [linked, copied, exists, conflict, planned, skipped, error]
+          description: |
+            `linked` hardlink created; `copied` fallback when on another filesystem;
+            `exists` already in place; `conflict` destination holds different content
+            (never overwritten); `planned` preview/dry run; `skipped` not identified
+            or no matching video; `error` see `error`.
+        error: { type: string }
+      required: [source, status]
+    HistoryEntry:
+      type: object
+      properties:
+        time: { type: string, format: date-time }
+        action:
+          type: string
+          enum: [organize, sync, orphan_remove]
+        source: { type: string }
+        dest: { type: string }
+        status: { type: string }
+        error: { type: string }
+      required: [time, action, status]
+    SyncStatus:
+      type: object
+      properties:
+        time: { type: string, format: date-time }
+        status:
+          type: string
+          enum: [ok, error]
+        error: { type: string }
+      required: [time, status]
+    Report:
+      type: object
+      properties:
+        generated_at: { type: string, format: date-time }
+        server_check:
+          type: string
+          enum: [ok, disabled, error]
+        orphans:
+          type: array
+          items: { $ref: "#/components/schemas/Orphan" }
+        errors:
+          type: array
+          items: { $ref: "#/components/schemas/ReportError" }
+      required: [generated_at, server_check, orphans]
+    Orphan:
+      type: object
+      properties:
+        id: { type: string }
+        type:
+          type: string
+          enum: [server_item_missing_file, orphan_directory]
+          description: |
+            `server_item_missing_file`: the media server lists the item but none of its
+            files exist. `orphan_directory`: a library folder with no video in it.
+        path: { type: string }
+        server_item_id: { type: string }
+        title: { type: string }
+        detected_at: { type: string, format: date-time }
+      required: [id, type, path, detected_at]
+    ReportError:
+      type: object
+      properties:
+        server_item_id: { type: string }
+        title: { type: string }
+        error: { type: string }
+      required: [error]
+    RemoveResult:
+      type: object
+      properties:
+        id: { type: string }
+        status:
+          type: string
+          enum: [removed, stale, dry_run, error]
+        error: { type: string }
+      required: [id, status]

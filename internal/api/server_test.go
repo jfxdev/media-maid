@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -108,5 +110,47 @@ func TestAPI(t *testing.T) {
 	do(t, h, "POST", "/api/v1/preview", bearer, `{"path":"x"}`)
 	if !org.lastPreview {
 		t.Error("preview did not request a dry run")
+	}
+}
+
+func TestDocs(t *testing.T) {
+	h := New(token, &fakeOrg{}, &fakeOrphans{}, disabledSyncer{}, jobs.NewHistory(10), slog.New(slog.NewTextHandler(io.Discard, nil))).Handler()
+	for path, want := range map[string]string{
+		"/openapi.yaml": "openapi: 3.1.0",
+		"/docs":         "swagger-ui",
+		"/docs/init.js": "/openapi.yaml",
+	} {
+		code, body := do(t, h, "GET", path, "", "")
+		if code != 200 || !strings.Contains(body, want) {
+			t.Errorf("%s: got %d, want 200 containing %q", path, code, want)
+		}
+	}
+}
+
+// TestSpecCoversRoutes keeps openapi.yaml in sync with the routes in Handler.
+func TestSpecCoversRoutes(t *testing.T) {
+	src, err := os.ReadFile("server.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	routes := regexp.MustCompile(`HandleFunc\("(GET|POST) (/(?:api|healthz)[^"]*)"`).FindAllStringSubmatch(string(src), -1)
+	if len(routes) < 9 {
+		t.Fatalf("found only %d routes in server.go", len(routes))
+	}
+	spec := string(openAPISpec)
+	for _, r := range routes {
+		method, path := strings.ToLower(r[1]), r[2]
+		i := strings.Index(spec, "\n  "+path+":\n")
+		if i < 0 {
+			t.Errorf("%s missing from openapi.yaml", path)
+			continue
+		}
+		block := spec[i+len(path)+4:]
+		if j := regexp.MustCompile(`\n  /`).FindStringIndex(block); j != nil {
+			block = block[:j[0]]
+		}
+		if !strings.Contains(block, "\n    "+method+":") {
+			t.Errorf("%s %s missing from openapi.yaml", r[1], path)
+		}
 	}
 }
