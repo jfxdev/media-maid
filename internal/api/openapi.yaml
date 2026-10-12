@@ -210,7 +210,10 @@ components:
                   Atomically replace an existing, different regular file at the
                   destination (for example a 720p release with a 1080p one)
                   instead of reporting `conflict`. Directories and symlinks are
-                  never replaced. The watcher and scans never overwrite.
+                  never replaced, nor a file that changed after it was checked.
+                  Requires a filesystem with atomic exchange (renameat2
+                  RENAME_EXCHANGE); elsewhere the result is `error`. The
+                  watcher and scans never overwrite.
             required: [path]
   responses:
     Results:

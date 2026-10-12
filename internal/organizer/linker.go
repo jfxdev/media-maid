@@ -150,42 +150,62 @@ func replaceWith(root *os.Root, rel string, src *os.File, srcInfo, checked os.Fi
 	default:
 		return jobs.StatusError, fmt.Errorf("hardlink: %w", err)
 	}
-	status, err := swapIn(root, d, tmp, rel, checked)
-	root.Remove(tmp) // our staged file, or the replaced destination
-	return status, err
+	return swapIn(root, d, tmp, rel, checked)
 }
 
+// errNoAtomicReplace is returned where the filesystem cannot exchange two
+// entries atomically: overwrite is refused rather than raced.
+var errNoAtomicReplace = errors.New("overwrite needs renameat2 RENAME_EXCHANGE, which this filesystem does not support")
+
+// Test hooks.
+var (
+	renameat2        = unix.Renameat2
+	testHookRollback = func() {}
+)
+
 // swapIn atomically exchanges the staged tmp with rel, then checks that what
-// came out is still the regular file the caller inspected. If another writer
-// put a symlink or a different file there in the meantime, the swap is
-// undone and the result is a conflict. Filesystems without RENAME_EXCHANGE
-// fall back to a plain rename, guarded by a last check.
+// came out is still the regular file the caller inspected; only then is it
+// removed. Otherwise the exchange is undone and the result is a conflict.
+// Nothing is ever deleted unless it is provably the checked file or our own
+// staged file: if a writer races the rollback, both entries are kept.
 func swapIn(root *os.Root, d *os.File, tmp, rel string, checked os.FileInfo) (string, error) {
+	staged, err := root.Lstat(tmp)
+	if err != nil {
+		return jobs.StatusError, mapRootErr(err)
+	}
 	dfd, t, n := int(d.Fd()), path.Base(tmp), path.Base(rel)
-	err := unix.Renameat2(dfd, t, dfd, n, unix.RENAME_EXCHANGE)
-	switch {
+	switch err := renameat2(dfd, t, dfd, n, unix.RENAME_EXCHANGE); {
 	case err == nil:
-		out, err := root.Lstat(tmp)
-		if err == nil && unchanged(out, checked) {
-			return jobs.StatusReplaced, nil
-		}
-		if err := unix.Renameat2(dfd, t, dfd, n, unix.RENAME_EXCHANGE); err != nil {
-			return jobs.StatusError, fmt.Errorf("undo replace: %w", err)
-		}
-		return jobs.StatusConflict, nil
 	case errors.Is(err, unix.EINVAL), errors.Is(err, unix.ENOTSUP), errors.Is(err, unix.ENOSYS):
-		if cur, err := root.Lstat(rel); err != nil || !unchanged(cur, checked) {
-			return jobs.StatusConflict, nil
-		}
-		if err := unix.Renameat(dfd, t, dfd, n); err != nil {
-			return jobs.StatusError, fmt.Errorf("replace: %w", err)
-		}
-		return jobs.StatusReplaced, nil
+		root.Remove(tmp) // untouched, still ours
+		return jobs.StatusError, errNoAtomicReplace
 	case errors.Is(err, unix.ENOENT):
+		root.Remove(tmp)
 		return jobs.StatusConflict, nil // the destination disappeared
 	default:
+		root.Remove(tmp)
 		return jobs.StatusError, fmt.Errorf("replace: %w", err)
 	}
+
+	// tmp has a random name nobody else writes, so what it holds now is
+	// exactly what was at rel.
+	if out, err := root.Lstat(tmp); err == nil && unchanged(out, checked) {
+		root.Remove(tmp)
+		return jobs.StatusReplaced, nil
+	}
+
+	// Someone else's entry came out: put it back.
+	testHookRollback()
+	if err := renameat2(dfd, t, dfd, n, unix.RENAME_EXCHANGE); err != nil {
+		return jobs.StatusError, fmt.Errorf("replace interrupted, previous entry kept as %s: %w", t, err)
+	}
+	if back, err := root.Lstat(tmp); err == nil && unchanged(back, staged) {
+		root.Remove(tmp)
+		return jobs.StatusConflict, nil
+	}
+	// rel changed again during the rollback: tmp now holds that writer's
+	// entry. Keep it.
+	return jobs.StatusError, fmt.Errorf("destination changed during replace, entry kept as %s", t)
 }
 
 // unchanged reports whether cur is still the regular file seen as checked.

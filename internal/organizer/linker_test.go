@@ -1,9 +1,12 @@
 package organizer
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/jfxdev/media-maid/internal/jobs"
 )
@@ -149,5 +152,64 @@ func TestSwapInRechecksDestination(t *testing.T) {
 			t.Errorf("%s: destination was replaced", name)
 		}
 		os.Remove(filepath.Join(dst, ".staged"))
+	}
+}
+
+// Regression: a writer that replaces the destination again during the
+// rollback must not lose its file.
+func TestSwapInRollbackRace(t *testing.T) {
+	dst := t.TempDir()
+	root, _ := os.OpenRoot(dst)
+	defer root.Close()
+	d, _ := root.Open(".")
+	defer d.Close()
+	dest := filepath.Join(dst, "Movie.mkv")
+	os.WriteFile(dest, []byte("checked"), 0o644)
+	checked, _ := os.Lstat(dest)
+	os.Remove(dest)
+	os.Symlink("/etc/passwd", dest) // changed after the check
+	os.WriteFile(filepath.Join(dst, ".staged"), []byte("staged"), 0o644)
+
+	testHookRollback = func() {
+		os.Remove(dest)
+		os.WriteFile(dest, []byte("writer's file"), 0o644)
+	}
+	defer func() { testHookRollback = func() {} }()
+
+	st, err := swapIn(root, d, ".staged", "Movie.mkv", checked)
+	if st != jobs.StatusError || err == nil {
+		t.Fatalf("swapIn = %s, %v; want error", st, err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dst, ".staged")); string(b) != "writer's file" {
+		t.Errorf("the writer's file was lost: %q", b)
+	}
+	if target, _ := os.Readlink(dest); target != "/etc/passwd" {
+		t.Errorf("the symlink was not restored: %q", target)
+	}
+}
+
+// Without RENAME_EXCHANGE, overwrite is refused instead of raced.
+func TestSwapInNoExchange(t *testing.T) {
+	dst := t.TempDir()
+	root, _ := os.OpenRoot(dst)
+	defer root.Close()
+	d, _ := root.Open(".")
+	defer d.Close()
+	dest := filepath.Join(dst, "Movie.mkv")
+	os.WriteFile(dest, []byte("checked"), 0o644)
+	checked, _ := os.Lstat(dest)
+	os.WriteFile(filepath.Join(dst, ".staged"), []byte("staged"), 0o644)
+
+	renameat2 = func(int, string, int, string, uint) error { return unix.EINVAL }
+	defer func() { renameat2 = unix.Renameat2 }()
+
+	if st, err := swapIn(root, d, ".staged", "Movie.mkv", checked); st != jobs.StatusError || !errors.Is(err, errNoAtomicReplace) {
+		t.Fatalf("swapIn = %s, %v", st, err)
+	}
+	if b, _ := os.ReadFile(dest); string(b) != "checked" {
+		t.Error("destination changed")
+	}
+	if entries, _ := os.ReadDir(dst); len(entries) != 1 {
+		t.Errorf("staged file left behind: %v", entries)
 	}
 }

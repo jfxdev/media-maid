@@ -80,7 +80,8 @@ All platform-specific data lives in `internal/integration/platforms.go`
   `conflict`. Only an explicit `"overwrite": true` API request replaces it
   (regular files only: unique temp name, `renameat2(RENAME_EXCHANGE)` inside
   the `os.Root` directory, undone if the swapped-out entry is not the file
-  that was checked); the watcher
+  that was checked; no plain-rename fallback; an entry is only deleted when
+  it is provably the checked file or our staged file); the watcher
   and scans never overwrite. Releases sharing a destination in one run are
   deduplicated by `parser.Quality` before anything is written (`duplicate`).
 - **Sanitize names**: anything from the parser or TMDB goes through

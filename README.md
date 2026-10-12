@@ -149,8 +149,11 @@ then HDR, then file size); the others are reported as `duplicate`.
 
 A destination that already exists with different content is a `conflict` and
 is left alone. To upgrade it, call organize with `"overwrite": true`: the file
-is replaced atomically (directories and symlinks never are), the old download
-stays untouched, and the result is `replaced`. Preview with `overwrite` reports
+is replaced atomically (directories and symlinks never are, nor a file that
+changed after it was checked), the old download stays untouched, and the
+result is `replaced`. This needs a filesystem with `renameat2`
+`RENAME_EXCHANGE` (ext4, XFS, Btrfs, tmpfs, overlayfs); elsewhere (e.g. NFS)
+overwrite fails with an error instead of risking a race. Preview with `overwrite` reports
 `planned` with `"replaces": true`. The watcher and scans never overwrite.
 
 ## Orphans
