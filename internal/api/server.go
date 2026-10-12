@@ -54,6 +54,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
+	mux.HandleFunc("GET /openapi.yaml", serveSpec)
+	mux.HandleFunc("GET /docs", serveDocs)
+	mux.HandleFunc("GET /docs/init.js", serveDocsInit)
 
 	api := http.NewServeMux()
 	api.HandleFunc("POST /api/v1/scan", s.scan)
