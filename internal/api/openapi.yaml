@@ -203,6 +203,17 @@ components:
                 type: string
                 description: Relative to `DOWNLOADS_DIR`, or absolute inside it.
                 examples: ["Inception.2010.1080p.BluRay.x264-GRP"]
+              overwrite:
+                type: boolean
+                default: false
+                description: |
+                  Atomically replace an existing, different regular file at the
+                  destination (for example a 720p release with a 1080p one)
+                  instead of reporting `conflict`. Directories and symlinks are
+                  never replaced, nor a file that changed after it was checked.
+                  Requires a filesystem with atomic exchange (renameat2
+                  RENAME_EXCHANGE); elsewhere the result is `error`. The
+                  watcher and scans never overwrite.
             required: [path]
   responses:
     Results:
@@ -278,13 +289,27 @@ components:
           enum: [movie, episode, subtitle]
         status:
           type: string
-          enum: [linked, copied, exists, conflict, planned, skipped, error]
+          enum: [linked, copied, replaced, exists, conflict, duplicate, planned, skipped, error]
           description: |
             `linked` hardlink created; `copied` fallback when on another filesystem;
+            `replaced` existing destination replaced (only with `overwrite`);
             `exists` already in place; `conflict` destination holds different content
-            (never overwritten); `planned` preview/dry run; `skipped` not identified
-            or no matching video; `error` see `error`.
+            (not overwritten without `overwrite`); `duplicate` another release of the
+            same title in the same request has better quality (see `error`);
+            `planned` preview/dry run; `skipped` not identified or no matching video;
+            `error` see `error`.
         error: { type: string }
+        replaces:
+          type: boolean
+          description: On a `planned` result, the destination exists and would be replaced.
+        resolved_by:
+          type: string
+          enum: [parser, tmdb, llm]
+          description: Layer that identified a video (see "How titles are resolved" in the README).
+        title_source:
+          type: string
+          enum: [tmdb_translation, llm_localized, original]
+          description: Origin of the folder title when `PREFERRED_LANGUAGE` is set.
       required: [source, status]
     HistoryEntry:
       type: object

@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/jfxdev/media-maid/internal/assist"
 	"github.com/jfxdev/media-maid/internal/integration"
 	"github.com/jfxdev/media-maid/internal/jobs"
 	"github.com/jfxdev/media-maid/internal/metadata"
@@ -44,6 +45,10 @@ type Organizer struct {
 	filter    Filter
 	guard     *safepath.Guard
 	meta      metadata.Provider
+	hasMeta   bool
+	assist    assist.Resolver
+	minConf   float64
+	language  string
 	platform  integration.PlatformSpec
 	syncer    integration.LibrarySyncer
 	history   *jobs.History
@@ -59,20 +64,30 @@ type Options struct {
 	Movies, TV   Library
 	Filter       Filter
 	Guard        *safepath.Guard
-	Meta         metadata.Provider
-	Platform     integration.PlatformSpec
-	Syncer       integration.LibrarySyncer
-	History      *jobs.History
-	Log          *slog.Logger
-	DryRun       bool
+	// Meta is the optional TMDB layer; nil disables it.
+	Meta metadata.Provider
+	// Assist is the optional LLM decision layer; nil disables it.
+	Assist assist.Resolver
+	// MinConfidence is the parser confidence below which a decision is
+	// treated as ambiguous and handed to Assist.
+	MinConfidence float64
+	// Language (BCP 47) selects localized titles; empty keeps the original.
+	Language string
+	Platform integration.PlatformSpec
+	Syncer   integration.LibrarySyncer
+	History  *jobs.History
+	Log      *slog.Logger
+	DryRun   bool
 }
 
 // New builds an Organizer.
 func New(o Options) *Organizer {
-	if o.Meta == nil {
+	hasMeta := o.Meta != nil
+	if !hasMeta {
 		o.Meta = metadata.Noop{}
 	}
 	return &Organizer{
+		hasMeta: hasMeta, assist: o.Assist, minConf: o.MinConfidence, language: o.Language,
 		downloads: o.DownloadsDir, movies: o.Movies, tv: o.TV, filter: o.Filter,
 		guard: o.Guard, meta: o.Meta, platform: o.Platform, syncer: o.Syncer,
 		history: o.History, log: o.Log, dryRun: o.DryRun,
@@ -86,6 +101,23 @@ type Result struct {
 	Kind   string `json:"kind,omitempty"`
 	Status string `json:"status"`
 	Error  string `json:"error,omitempty"`
+	// Replaces is set on a planned result that would overwrite Dest.
+	Replaces bool `json:"replaces,omitempty"`
+	// ResolvedBy names the layer that identified a video: parser, tmdb or llm.
+	ResolvedBy string `json:"resolved_by,omitempty"`
+	// TitleSource is set with PREFERRED_LANGUAGE: tmdb_translation,
+	// llm_localized or original.
+	TitleSource string `json:"title_source,omitempty"`
+}
+
+// OrganizeOptions controls a single Organize call.
+type OrganizeOptions struct {
+	// Preview only reports what would happen (as does DRY_RUN).
+	Preview bool
+	// Overwrite atomically replaces an existing, different regular file at the
+	// destination instead of reporting a conflict. Automatic runs (watcher,
+	// scan) never set it.
+	Overwrite bool
 }
 
 // DownloadsDir returns the resolved downloads root.
@@ -93,21 +125,21 @@ func (o *Organizer) DownloadsDir() string { return o.downloads }
 
 // Scan organizes the whole downloads directory.
 func (o *Organizer) Scan(ctx context.Context) ([]Result, error) {
-	return o.Organize(ctx, o.downloads, false)
+	return o.Organize(ctx, o.downloads, OrganizeOptions{})
 }
 
 // Organize processes a file or directory inside the downloads root. With
-// preview set (or DRY_RUN), it only reports what would happen.
+// opts.Preview set (or DRY_RUN), it only reports what would happen.
 //
 // It returns safepath.ErrInvalidPath for malformed or out-of-root input,
 // ErrNotFound when nothing exists there and safepath.ErrUnauthorizedVolume
 // when the requested path itself is a link to an unauthorized volume.
-func (o *Organizer) Organize(ctx context.Context, input string, preview bool) ([]Result, error) {
+func (o *Organizer) Organize(ctx context.Context, input string, opts OrganizeOptions) ([]Result, error) {
 	p, err := safepath.CleanInput(o.downloads, input)
 	if err != nil {
 		return nil, err
 	}
-	dry := preview || o.dryRun
+	dry := opts.Preview || o.dryRun
 	if !dry {
 		o.mu.Lock()
 		defer o.mu.Unlock()
@@ -141,11 +173,11 @@ func (o *Organizer) Organize(ctx context.Context, input string, preview bool) ([
 		files = []string{p}
 	}
 
-	results := o.process(ctx, files, dry)
+	results := o.process(ctx, files, dry, opts.Overwrite)
 	changed := false
 	for _, r := range results {
 		o.record(dry, r)
-		if r.Status == jobs.StatusLinked || r.Status == jobs.StatusCopied {
+		if r.Status == jobs.StatusLinked || r.Status == jobs.StatusCopied || r.Status == jobs.StatusReplaced {
 			changed = true
 		}
 	}
@@ -200,15 +232,19 @@ func (o *Organizer) rel(p string) string {
 }
 
 type videoPlan struct {
-	src   string
-	media parser.Media
-	lib   Library
-	dest  string // relative to lib root
+	src     string
+	media   parser.Media
+	quality parser.Quality
+	lib     Library
+	dest    string // relative to lib root
+	result  Result // set when planning already decided the outcome
+	// resolvedBy and titleSource explain the decision (see Result).
+	resolvedBy, titleSource string
 }
 
 var subsDirs = map[string]bool{"subs": true, "subtitles": true, "legendas": true, "sub": true}
 
-func (o *Organizer) process(ctx context.Context, files []string, dry bool) []Result {
+func (o *Organizer) process(ctx context.Context, files []string, dry, overwrite bool) []Result {
 	type group struct {
 		videos []*videoPlan
 		subs   []string
@@ -238,27 +274,80 @@ func (o *Organizer) process(ctx context.Context, files []string, dry bool) []Res
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
+
+	// Plan every video before touching the disk, so releases of the same title
+	// in different qualities can be compared first.
+	var planned []*videoPlan
+	for _, k := range keys {
+		for _, v := range groups[k].videos {
+			if ctx.Err() != nil {
+				return results
+			}
+			v.result = o.planVideo(ctx, v)
+			if v.result.Status == "" {
+				planned = append(planned, v)
+			}
+		}
+	}
+	o.dedupe(planned)
+
 	for _, k := range keys {
 		g := groups[k]
 		for _, v := range g.videos {
 			if ctx.Err() != nil {
 				return results
 			}
-			r := o.planVideo(ctx, v)
+			r := v.result
 			if r.Status == "" {
-				r = o.apply(v.src, v.lib, v.dest, dry)
+				r = o.apply(v.src, v.lib, v.dest, dry, overwrite)
 				r.Kind = string(v.media.Kind)
+				r.ResolvedBy, r.TitleSource = v.resolvedBy, v.titleSource
 			}
-			if r.Status == jobs.StatusError {
+			if r.Status == jobs.StatusError || r.Status == jobs.StatusDuplicate {
 				v.dest = ""
 			}
 			results = append(results, r)
 		}
 		for _, s := range g.subs {
-			results = append(results, o.subtitle(s, g.videos, dry))
+			results = append(results, o.subtitle(s, g.videos, dry, overwrite))
 		}
 	}
 	return results
+}
+
+// dedupe keeps a single video per destination: the best quality, then the
+// largest file. The others are reported as duplicates and left untouched.
+func (o *Organizer) dedupe(videos []*videoPlan) {
+	best := map[string]*videoPlan{}
+	for _, v := range videos {
+		key := v.lib.Name + "/" + v.dest
+		if cur, ok := best[key]; !ok || better(v, cur) {
+			best[key] = v
+		}
+	}
+	for _, v := range videos {
+		if w := best[v.lib.Name+"/"+v.dest]; w != v {
+			v.result = Result{
+				Source: o.rel(v.src), Dest: v.lib.Name + "/" + v.dest, Kind: string(v.media.Kind),
+				Status: jobs.StatusDuplicate, Error: "superseded by " + o.rel(w.src),
+			}
+		}
+	}
+}
+
+func better(a, b *videoPlan) bool {
+	if ra, rb := a.quality.Rank(), b.quality.Rank(); ra != rb {
+		return ra > rb
+	}
+	return fileSize(a.src) > fileSize(b.src)
+}
+
+func fileSize(p string) int64 {
+	fi, err := os.Stat(p)
+	if err != nil {
+		return 0
+	}
+	return fi.Size()
 }
 
 // subtitleGroup maps a subtitle to the directory of the videos it belongs to,
@@ -276,37 +365,31 @@ func subtitleGroup(p string) string {
 
 func (o *Organizer) planVideo(ctx context.Context, v *videoPlan) Result {
 	rel := o.rel(v.src)
-	m, ok := parser.Parse(rel)
+	a, ok := parser.Analyze(rel)
+	v.quality = a.Quality
+	id, ok := o.identify(ctx, rel, a, ok)
 	if !ok {
 		return Result{Source: rel, Status: jobs.StatusSkipped, Error: "could not identify title"}
 	}
+	m := id.media
 	var tag string
+	if id.match != nil {
+		tag = o.platform.IDTag(id.match.TMDBID)
+	}
 	switch m.Kind {
 	case parser.Episode:
-		if res, ok := o.meta.LookupSeries(ctx, m.Title, m.Year); ok {
-			m.Title, tag = res.Title, o.platform.IDTag(res.TMDBID)
-			if res.Year > 0 {
-				m.Year = res.Year
-			}
-		}
 		v.lib = o.tv
 		v.dest = naming.EpisodePath(m, tag, filepath.Ext(v.src))
 	default:
-		if res, ok := o.meta.LookupMovie(ctx, m.Title, m.Year); ok {
-			m.Title, tag = res.Title, o.platform.IDTag(res.TMDBID)
-			if res.Year > 0 {
-				m.Year = res.Year
-			}
-		}
 		v.lib = o.movies
 		v.dest = naming.MoviePath(m, tag, filepath.Ext(v.src))
 	}
-	v.media = m
+	v.media, v.resolvedBy, v.titleSource = m, id.by, id.titleSource
 	return Result{}
 }
 
 // apply links src to dest inside lib (or reports what would happen when dry).
-func (o *Organizer) apply(src string, lib Library, dest string, dry bool) Result {
+func (o *Organizer) apply(src string, lib Library, dest string, dry, overwrite bool) Result {
 	r := Result{Source: o.rel(src), Dest: lib.Name + "/" + dest}
 
 	resolved := src
@@ -333,9 +416,12 @@ func (o *Organizer) apply(src string, lib Library, dest string, dry bool) Result
 
 	if dry {
 		if existing, err := lib.Root.Lstat(dest); err == nil {
-			if samePlaced(existing, fi) {
+			switch {
+			case samePlaced(existing, fi):
 				r.Status = jobs.StatusExists
-			} else {
+			case overwrite && existing.Mode().IsRegular():
+				r.Status, r.Replaces = jobs.StatusPlanned, true
+			default:
 				r.Status = jobs.StatusConflict
 			}
 		} else {
@@ -344,7 +430,7 @@ func (o *Organizer) apply(src string, lib Library, dest string, dry bool) Result
 		return r
 	}
 
-	status, err := place(lib.Root, dest, f, fi)
+	status, err := place(lib.Root, dest, f, fi, overwrite)
 	r.Status = status
 	if err != nil {
 		r.Error = describe(err)
@@ -365,7 +451,7 @@ func describe(err error) string {
 
 var reSubEp = regexp.MustCompile(`(?i)S(\d{1,2}) ?E(\d{1,3})`)
 
-func (o *Organizer) subtitle(sub string, videos []*videoPlan, dry bool) Result {
+func (o *Organizer) subtitle(sub string, videos []*videoPlan, dry, overwrite bool) Result {
 	rel := o.rel(sub)
 	var planned []*videoPlan
 	for _, v := range videos {
@@ -381,7 +467,7 @@ func (o *Organizer) subtitle(sub string, videos []*videoPlan, dry bool) Result {
 	vstem := strings.TrimSuffix(filepath.Base(target.src), filepath.Ext(target.src))
 	lang, forced, sdh := detectLang(strings.TrimPrefix(stem, vstem))
 	dest := naming.SubtitlePath(target.dest, lang, forced, sdh, filepath.Ext(sub))
-	r := o.apply(sub, target.lib, dest, dry)
+	r := o.apply(sub, target.lib, dest, dry, overwrite)
 	r.Kind = "subtitle"
 	return r
 }

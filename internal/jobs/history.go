@@ -12,6 +12,8 @@ const (
 	StatusCopied    = "copied"
 	StatusExists    = "exists"
 	StatusConflict  = "conflict"
+	StatusReplaced  = "replaced"
+	StatusDuplicate = "duplicate"
 	StatusPlanned   = "planned"
 	StatusSkipped   = "skipped"
 	StatusError     = "error"

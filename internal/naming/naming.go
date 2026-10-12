@@ -60,10 +60,14 @@ func MoviePath(m parser.Media, idTag, ext string) string {
 	return path.Join(name, name+cleanExt(ext))
 }
 
-// EpisodePath returns "Show (Year) tag/Season 01/Show S01E02[-E03].ext".
+// EpisodePath returns "Show (Year) tag/Season 01/Show S01E02[-E03].ext", or
+// "Show (Year) tag/Season 2024/Show 2024-03-15.ext" for date-based episodes.
 func EpisodePath(m parser.Media, idTag, ext string) string {
 	show := withTag(withYear(m.Title, m.Year), idTag)
 	season := fmt.Sprintf("Season %02d", m.Season)
+	if m.AirDate != "" {
+		return path.Join(show, season, Sanitize(m.Title)+" "+Sanitize(m.AirDate)+cleanExt(ext))
+	}
 	ep := fmt.Sprintf("S%02d", m.Season)
 	for i, e := range m.Episodes {
 		if i == 0 {

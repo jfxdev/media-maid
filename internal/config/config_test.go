@@ -46,6 +46,64 @@ func TestLoadValid(t *testing.T) {
 	}
 }
 
+func TestLoadLLM(t *testing.T) {
+	c, err := load(baseEnv())
+	if err != nil || c.LLM.Provider != "" || c.PreferredLanguage != "" {
+		t.Fatalf("llm must be off by default: %+v %v", c.LLM, err)
+	}
+	valid := []map[string]string{
+		{"LLM_PROVIDER": "anthropic", "LLM_API_KEY": "k"},
+		{"LLM_PROVIDER": "OpenAI", "LLM_API_KEY": "k", "LLM_MODEL": "gpt-x"},
+		{"LLM_PROVIDER": "openai", "LLM_BASE_URL": "http://ollama:11434/v1/", "LLM_MODEL": "llama3", "LLM_MIN_CONFIDENCE": "0.5", "LLM_TIMEOUT": "45s"},
+		{"PREFERRED_LANGUAGE": "pt-BR"},
+		{"PREFERRED_LANGUAGE": "es-419"},
+		{"PREFERRED_LANGUAGE": "fr"},
+	}
+	for _, extra := range valid {
+		env := baseEnv()
+		for k, v := range extra {
+			env[k] = v
+		}
+		if _, err := load(env); err != nil {
+			t.Errorf("%v: %v", extra, err)
+		}
+	}
+	c, _ = load(map[string]string{"INTEGRATION_MODE": "jellyfin", "API_TOKEN": strings.Repeat("x", 32), "DOWNLOADS_DIR": "/d", "MOVIES_DIR": "/m", "TV_DIR": "/t",
+		"LLM_PROVIDER": "openai", "LLM_BASE_URL": "http://ollama:11434/v1/", "LLM_MODEL": "llama3", "LLM_MIN_CONFIDENCE": "0.5", "LLM_TIMEOUT": "45s"})
+	if c == nil || c.LLM.BaseURL != "http://ollama:11434/v1" || c.LLM.MinConfidence != 0.5 || c.LLM.Timeout.Seconds() != 45 {
+		t.Errorf("llm config = %+v", c)
+	}
+
+	invalid := []struct {
+		env  map[string]string
+		want string
+	}{
+		{map[string]string{"LLM_PROVIDER": "gemini", "LLM_API_KEY": "k"}, "LLM_PROVIDER"},
+		{map[string]string{"LLM_PROVIDER": "openai,anthropic", "LLM_API_KEY": "k"}, "single value"},
+		{map[string]string{"LLM_PROVIDER": "anthropic"}, "LLM_API_KEY is required"},
+		{map[string]string{"LLM_PROVIDER": "openai", "LLM_API_KEY": "k"}, "LLM_MODEL is required"},
+		{map[string]string{"LLM_MODEL": "x"}, "require LLM_PROVIDER"},
+		{map[string]string{"LLM_PROVIDER": "anthropic", "LLM_API_KEY": "k", "LLM_BASE_URL": "ftp://x"}, "LLM_BASE_URL"},
+		{map[string]string{"LLM_PROVIDER": "anthropic", "LLM_API_KEY": "k", "LLM_MIN_CONFIDENCE": "2"}, "LLM_MIN_CONFIDENCE"},
+		{map[string]string{"LLM_PROVIDER": "anthropic", "LLM_API_KEY": "k", "LLM_TIMEOUT": "1h"}, "LLM_TIMEOUT"},
+		{map[string]string{"PREFERRED_LANGUAGE": "portuguese"}, "PREFERRED_LANGUAGE"},
+		{map[string]string{"PREFERRED_LANGUAGE": "pt-BR,en"}, "PREFERRED_LANGUAGE"},
+	}
+	for _, tt := range invalid {
+		env := baseEnv()
+		for k, v := range tt.env {
+			env[k] = v
+		}
+		_, err := load(env)
+		if err == nil || !strings.Contains(err.Error(), tt.want) {
+			t.Errorf("%v: err = %v, want %q", tt.env, err, tt.want)
+		}
+		if err != nil && strings.Contains(err.Error(), "sk-") {
+			t.Error("error leaks the key")
+		}
+	}
+}
+
 func TestLoadSyncDisabled(t *testing.T) {
 	env := baseEnv()
 	delete(env, "MEDIA_SERVER_URL")

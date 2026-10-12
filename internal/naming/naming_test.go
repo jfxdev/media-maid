@@ -39,6 +39,10 @@ func TestPaths(t *testing.T) {
 	if got := EpisodePath(ep, "{tmdb-1396}", ".mkv"); got != "Breaking Bad (2008) {tmdb-1396}/Season 01/Breaking Bad S01E02-E03.mkv" {
 		t.Errorf("EpisodePath = %q", got)
 	}
+	daily := parser.Media{Kind: parser.Episode, Title: "The Daily Show", Season: 2024, AirDate: "2024-03-15"}
+	if got := EpisodePath(daily, "", ".mkv"); got != "The Daily Show/Season 2024/The Daily Show 2024-03-15.mkv" {
+		t.Errorf("EpisodePath air date = %q", got)
+	}
 	evil := parser.Media{Kind: parser.Movie, Title: "../../../root/.ssh/x"}
 	if got := MoviePath(evil, "", ".mkv"); strings.Contains(got, "..") || strings.Count(got, "/") != 1 {
 		t.Errorf("escaping path produced: %q", got)

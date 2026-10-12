@@ -14,38 +14,57 @@ import (
 	"time"
 )
 
+// Kind selects movies or series.
+type Kind string
+
+const (
+	Movie  Kind = "movie"
+	Series Kind = "tv"
+)
+
 // Result is canonical information about a movie or series.
 type Result struct {
-	Title  string
-	Year   int
-	TMDBID int
+	Title         string `json:"title"`
+	OriginalTitle string `json:"original_title,omitempty"`
+	Year          int    `json:"year,omitempty"`
+	TMDBID        int    `json:"tmdb_id"`
 }
 
-// Provider looks up canonical titles. ok is false when nothing was found.
-type Provider interface {
-	LookupMovie(ctx context.Context, title string, year int) (Result, bool)
-	LookupSeries(ctx context.Context, title string, year int) (Result, bool)
+// Title is an official title of an entry in some language or country.
+type Title struct {
+	Language string `json:"language,omitempty"` // ISO 639-1, e.g. "pt"
+	Country  string `json:"country,omitempty"`  // ISO 3166-1, e.g. "BR"
+	Title    string `json:"title"`
+	// Source is "translation" or "alternative".
+	Source string `json:"source"`
 }
+
+// Provider looks up canonical titles.
+type Provider interface {
+	// Search returns up to MaxCandidates results in relevance order.
+	Search(ctx context.Context, kind Kind, title string, year int) ([]Result, error)
+	// Titles returns the translations and alternative titles of an entry.
+	Titles(ctx context.Context, kind Kind, id int) ([]Title, error)
+}
+
+// MaxCandidates bounds how many search results are considered.
+const MaxCandidates = 5
 
 // Noop is used when no metadata provider is configured.
 type Noop struct{}
 
-func (Noop) LookupMovie(context.Context, string, int) (Result, bool)  { return Result{}, false }
-func (Noop) LookupSeries(context.Context, string, int) (Result, bool) { return Result{}, false }
+func (Noop) Search(context.Context, Kind, string, int) ([]Result, error) { return nil, nil }
+func (Noop) Titles(context.Context, Kind, int) ([]Title, error)          { return nil, nil }
 
-// TMDB queries The Movie Database search API.
+// TMDB queries The Movie Database API.
 type TMDB struct {
 	key     string
 	baseURL string
 	http    *http.Client
 
-	mu    sync.Mutex
-	cache map[string]cached
-}
-
-type cached struct {
-	res Result
-	ok  bool
+	mu     sync.Mutex
+	cache  map[string][]Result
+	titles map[string][]Title
 }
 
 // DefaultTMDBURL is the TMDB v3 API base.
@@ -60,54 +79,139 @@ func NewTMDB(key, baseURL string) *TMDB {
 		key:     key,
 		baseURL: strings.TrimRight(baseURL, "/"),
 		http:    &http.Client{Timeout: 10 * time.Second},
-		cache:   map[string]cached{},
+		cache:   map[string][]Result{},
+		titles:  map[string][]Title{},
 	}
 }
 
-func (t *TMDB) LookupMovie(ctx context.Context, title string, year int) (Result, bool) {
-	return t.lookup(ctx, "movie", title, year)
-}
-
-func (t *TMDB) LookupSeries(ctx context.Context, title string, year int) (Result, bool) {
-	return t.lookup(ctx, "tv", title, year)
-}
-
-func (t *TMDB) lookup(ctx context.Context, kind, title string, year int) (Result, bool) {
-	key := kind + "|" + strings.ToLower(title) + "|" + strconv.Itoa(year)
+// Search queries /search/{movie,tv}. Transient failures are returned as
+// errors and not cached; the caller falls back to the parser result.
+func (t *TMDB) Search(ctx context.Context, kind Kind, title string, year int) ([]Result, error) {
+	key := string(kind) + "|" + strings.ToLower(title) + "|" + strconv.Itoa(year)
 	t.mu.Lock()
 	if c, ok := t.cache[key]; ok {
 		t.mu.Unlock()
-		return c.res, c.ok
+		return c, nil
 	}
 	t.mu.Unlock()
 
-	res, ok, err := t.search(ctx, kind, title, year)
+	res, err := t.search(ctx, kind, title, year)
 	if err != nil {
-		// Transient failures are not cached; the parser result is used instead.
-		return Result{}, false
+		return nil, err
 	}
 	t.mu.Lock()
-	t.cache[key] = cached{res, ok}
+	t.cache[key] = res
 	t.mu.Unlock()
-	return res, ok
+	return res, nil
 }
 
-func (t *TMDB) search(ctx context.Context, kind, title string, year int) (Result, bool, error) {
+func (t *TMDB) search(ctx context.Context, kind Kind, title string, year int) ([]Result, error) {
 	q := url.Values{"query": {title}}
 	if year > 0 {
-		if kind == "movie" {
+		if kind == Movie {
 			q.Set("year", strconv.Itoa(year))
 		} else {
 			q.Set("first_air_date_year", strconv.Itoa(year))
 		}
 	}
+	var body struct {
+		Results []struct {
+			ID            int    `json:"id"`
+			Title         string `json:"title"`
+			Name          string `json:"name"`
+			OriginalTitle string `json:"original_title"`
+			OriginalName  string `json:"original_name"`
+			ReleaseDate   string `json:"release_date"`
+			FirstAirDate  string `json:"first_air_date"`
+		} `json:"results"`
+	}
+	if err := t.get(ctx, "/search/"+string(kind), q, &body); err != nil {
+		return nil, err
+	}
+	var out []Result
+	for _, r := range body.Results {
+		name, orig, date := r.Title, r.OriginalTitle, r.ReleaseDate
+		if kind == Series {
+			name, orig, date = r.Name, r.OriginalName, r.FirstAirDate
+		}
+		if name == "" || r.ID <= 0 {
+			continue
+		}
+		res := Result{Title: name, OriginalTitle: orig, TMDBID: r.ID}
+		if len(date) >= 4 {
+			res.Year, _ = strconv.Atoi(date[:4])
+		}
+		out = append(out, res)
+		if len(out) == MaxCandidates {
+			break
+		}
+	}
+	return out, nil
+}
+
+// Titles fetches translations and alternative titles in a single request.
+func (t *TMDB) Titles(ctx context.Context, kind Kind, id int) ([]Title, error) {
+	key := string(kind) + "|" + strconv.Itoa(id)
+	t.mu.Lock()
+	if c, ok := t.titles[key]; ok {
+		t.mu.Unlock()
+		return c, nil
+	}
+	t.mu.Unlock()
+
+	type alt struct {
+		Country string `json:"iso_3166_1"`
+		Title   string `json:"title"`
+	}
+	var body struct {
+		Translations struct {
+			Translations []struct {
+				Language string `json:"iso_639_1"`
+				Country  string `json:"iso_3166_1"`
+				Data     struct {
+					Title string `json:"title"`
+					Name  string `json:"name"`
+				} `json:"data"`
+			} `json:"translations"`
+		} `json:"translations"`
+		AlternativeTitles struct {
+			Titles  []alt `json:"titles"`  // movies
+			Results []alt `json:"results"` // series
+		} `json:"alternative_titles"`
+	}
+	q := url.Values{"append_to_response": {"translations,alternative_titles"}}
+	if err := t.get(ctx, "/"+string(kind)+"/"+strconv.Itoa(id), q, &body); err != nil {
+		return nil, err
+	}
+	var out []Title
+	for _, tr := range body.Translations.Translations {
+		name := tr.Data.Title
+		if kind == Series {
+			name = tr.Data.Name
+		}
+		if name != "" {
+			out = append(out, Title{Language: tr.Language, Country: tr.Country, Title: name, Source: "translation"})
+		}
+	}
+	for _, a := range append(body.AlternativeTitles.Titles, body.AlternativeTitles.Results...) {
+		if a.Title != "" {
+			out = append(out, Title{Country: a.Country, Title: a.Title, Source: "alternative"})
+		}
+	}
+	t.mu.Lock()
+	t.titles[key] = out
+	t.mu.Unlock()
+	return out, nil
+}
+
+func (t *TMDB) get(ctx context.Context, path string, q url.Values, into any) error {
 	bearer := strings.HasPrefix(t.key, "eyJ")
 	if !bearer {
 		q.Set("api_key", t.key)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, t.baseURL+"/search/"+kind+"?"+q.Encode(), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, t.baseURL+path+"?"+q.Encode(), nil)
 	if err != nil {
-		return Result{}, false, err
+		return err
 	}
 	if bearer {
 		req.Header.Set("Authorization", "Bearer "+t.key)
@@ -115,38 +219,14 @@ func (t *TMDB) search(ctx context.Context, kind, title string, year int) (Result
 	req.Header.Set("Accept", "application/json")
 	resp, err := t.http.Do(req)
 	if err != nil {
-		return Result{}, false, fmt.Errorf("tmdb request failed")
+		return fmt.Errorf("tmdb request failed")
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return Result{}, false, fmt.Errorf("tmdb status %d", resp.StatusCode)
+		return fmt.Errorf("tmdb status %d", resp.StatusCode)
 	}
-	var body struct {
-		Results []struct {
-			ID           int    `json:"id"`
-			Title        string `json:"title"`
-			Name         string `json:"name"`
-			ReleaseDate  string `json:"release_date"`
-			FirstAirDate string `json:"first_air_date"`
-		} `json:"results"`
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(into); err != nil {
+		return fmt.Errorf("tmdb response: invalid json")
 	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&body); err != nil {
-		return Result{}, false, err
-	}
-	if len(body.Results) == 0 {
-		return Result{}, false, nil
-	}
-	r := body.Results[0]
-	name, date := r.Title, r.ReleaseDate
-	if kind == "tv" {
-		name, date = r.Name, r.FirstAirDate
-	}
-	res := Result{Title: name, TMDBID: r.ID}
-	if len(date) >= 4 {
-		res.Year, _ = strconv.Atoi(date[:4])
-	}
-	if res.Title == "" {
-		return Result{}, false, nil
-	}
-	return res, true, nil
+	return nil
 }

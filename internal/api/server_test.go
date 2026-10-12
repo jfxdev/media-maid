@@ -18,10 +18,10 @@ import (
 	"github.com/jfxdev/media-maid/internal/safepath"
 )
 
-type fakeOrg struct{ lastPreview bool }
+type fakeOrg struct{ last organizer.OrganizeOptions }
 
-func (f *fakeOrg) Organize(_ context.Context, p string, preview bool) ([]organizer.Result, error) {
-	f.lastPreview = preview
+func (f *fakeOrg) Organize(_ context.Context, p string, opts organizer.OrganizeOptions) ([]organizer.Result, error) {
+	f.last = opts
 	switch p {
 	case "../etc":
 		return nil, safepath.ErrInvalidPath
@@ -86,6 +86,8 @@ func TestAPI(t *testing.T) {
 		{"traversal", "POST", "/api/v1/organize", bearer, `{"path":"../etc"}`, 400, "invalid_path"},
 		{"unauthorized volume", "POST", "/api/v1/organize", bearer, `{"path":"evil-link"}`, 403, "unauthorized_volume"},
 		{"missing", "POST", "/api/v1/organize", bearer, `{"path":"missing"}`, 404, "not_found"},
+		{"organize overwrite", "POST", "/api/v1/organize", bearer, `{"path":"Movie.2010","overwrite":true}`, 200, "planned"},
+		{"overwrite not bool", "POST", "/api/v1/organize", bearer, `{"path":"a","overwrite":"yes"}`, 400, "invalid_request"},
 		{"unknown field", "POST", "/api/v1/organize", bearer, `{"path":"a","x":1}`, 400, "invalid_request"},
 		{"bad json", "POST", "/api/v1/organize", bearer, `{`, 400, "invalid_request"},
 		{"too large", "POST", "/api/v1/organize", bearer, `{"path":"` + strings.Repeat("a", 70<<10) + `"}`, 400, "invalid_request"},
@@ -107,9 +109,13 @@ func TestAPI(t *testing.T) {
 		})
 	}
 
-	do(t, h, "POST", "/api/v1/preview", bearer, `{"path":"x"}`)
-	if !org.lastPreview {
-		t.Error("preview did not request a dry run")
+	do(t, h, "POST", "/api/v1/preview", bearer, `{"path":"x","overwrite":true}`)
+	if !org.last.Preview || !org.last.Overwrite {
+		t.Errorf("preview options = %+v, want preview and overwrite", org.last)
+	}
+	do(t, h, "POST", "/api/v1/organize", bearer, `{"path":"x"}`)
+	if org.last.Preview || org.last.Overwrite {
+		t.Errorf("organize options = %+v, want neither preview nor overwrite", org.last)
 	}
 }
 

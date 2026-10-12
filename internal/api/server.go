@@ -22,7 +22,7 @@ const maxBody = 64 << 10
 
 // Organizer is what the API needs from the organizer.
 type Organizer interface {
-	Organize(ctx context.Context, path string, preview bool) ([]organizer.Result, error)
+	Organize(ctx context.Context, path string, opts organizer.OrganizeOptions) ([]organizer.Result, error)
 	Scan(ctx context.Context) ([]organizer.Result, error)
 }
 
@@ -119,12 +119,13 @@ func (s *Server) scan(w http.ResponseWriter, r *http.Request) {
 func (s *Server) organize(preview bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
-			Path string `json:"path"`
+			Path      string `json:"path"`
+			Overwrite bool   `json:"overwrite"`
 		}
 		if !decode(w, r, &req) {
 			return
 		}
-		res, err := s.organizer.Organize(r.Context(), req.Path, preview)
+		res, err := s.organizer.Organize(r.Context(), req.Path, organizer.OrganizeOptions{Preview: preview, Overwrite: req.Overwrite})
 		if err != nil {
 			s.fail(w, err)
 			return
