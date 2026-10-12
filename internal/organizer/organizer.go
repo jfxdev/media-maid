@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/jfxdev/media-maid/internal/assist"
 	"github.com/jfxdev/media-maid/internal/integration"
 	"github.com/jfxdev/media-maid/internal/jobs"
 	"github.com/jfxdev/media-maid/internal/metadata"
@@ -44,6 +45,10 @@ type Organizer struct {
 	filter    Filter
 	guard     *safepath.Guard
 	meta      metadata.Provider
+	hasMeta   bool
+	assist    assist.Resolver
+	minConf   float64
+	language  string
 	platform  integration.PlatformSpec
 	syncer    integration.LibrarySyncer
 	history   *jobs.History
@@ -59,20 +64,30 @@ type Options struct {
 	Movies, TV   Library
 	Filter       Filter
 	Guard        *safepath.Guard
-	Meta         metadata.Provider
-	Platform     integration.PlatformSpec
-	Syncer       integration.LibrarySyncer
-	History      *jobs.History
-	Log          *slog.Logger
-	DryRun       bool
+	// Meta is the optional TMDB layer; nil disables it.
+	Meta metadata.Provider
+	// Assist is the optional LLM decision layer; nil disables it.
+	Assist assist.Resolver
+	// MinConfidence is the parser confidence below which a decision is
+	// treated as ambiguous and handed to Assist.
+	MinConfidence float64
+	// Language (BCP 47) selects localized titles; empty keeps the original.
+	Language string
+	Platform integration.PlatformSpec
+	Syncer   integration.LibrarySyncer
+	History  *jobs.History
+	Log      *slog.Logger
+	DryRun   bool
 }
 
 // New builds an Organizer.
 func New(o Options) *Organizer {
-	if o.Meta == nil {
+	hasMeta := o.Meta != nil
+	if !hasMeta {
 		o.Meta = metadata.Noop{}
 	}
 	return &Organizer{
+		hasMeta: hasMeta, assist: o.Assist, minConf: o.MinConfidence, language: o.Language,
 		downloads: o.DownloadsDir, movies: o.Movies, tv: o.TV, filter: o.Filter,
 		guard: o.Guard, meta: o.Meta, platform: o.Platform, syncer: o.Syncer,
 		history: o.History, log: o.Log, dryRun: o.DryRun,
@@ -88,6 +103,11 @@ type Result struct {
 	Error  string `json:"error,omitempty"`
 	// Replaces is set on a planned result that would overwrite Dest.
 	Replaces bool `json:"replaces,omitempty"`
+	// ResolvedBy names the layer that identified a video: parser, tmdb or llm.
+	ResolvedBy string `json:"resolved_by,omitempty"`
+	// TitleSource is set with PREFERRED_LANGUAGE: tmdb_translation,
+	// llm_localized or original.
+	TitleSource string `json:"title_source,omitempty"`
 }
 
 // OrganizeOptions controls a single Organize call.
@@ -218,6 +238,8 @@ type videoPlan struct {
 	lib     Library
 	dest    string // relative to lib root
 	result  Result // set when planning already decided the outcome
+	// resolvedBy and titleSource explain the decision (see Result).
+	resolvedBy, titleSource string
 }
 
 var subsDirs = map[string]bool{"subs": true, "subtitles": true, "legendas": true, "sub": true}
@@ -279,6 +301,7 @@ func (o *Organizer) process(ctx context.Context, files []string, dry, overwrite 
 			if r.Status == "" {
 				r = o.apply(v.src, v.lib, v.dest, dry, overwrite)
 				r.Kind = string(v.media.Kind)
+				r.ResolvedBy, r.TitleSource = v.resolvedBy, v.titleSource
 			}
 			if r.Status == jobs.StatusError || r.Status == jobs.StatusDuplicate {
 				v.dest = ""
@@ -343,33 +366,25 @@ func subtitleGroup(p string) string {
 func (o *Organizer) planVideo(ctx context.Context, v *videoPlan) Result {
 	rel := o.rel(v.src)
 	a, ok := parser.Analyze(rel)
-	m := a.Media
 	v.quality = a.Quality
+	id, ok := o.identify(ctx, rel, a, ok)
 	if !ok {
 		return Result{Source: rel, Status: jobs.StatusSkipped, Error: "could not identify title"}
 	}
+	m := id.media
 	var tag string
+	if id.match != nil {
+		tag = o.platform.IDTag(id.match.TMDBID)
+	}
 	switch m.Kind {
 	case parser.Episode:
-		if res, ok := o.meta.LookupSeries(ctx, m.Title, m.Year); ok {
-			m.Title, tag = res.Title, o.platform.IDTag(res.TMDBID)
-			if res.Year > 0 {
-				m.Year = res.Year
-			}
-		}
 		v.lib = o.tv
 		v.dest = naming.EpisodePath(m, tag, filepath.Ext(v.src))
 	default:
-		if res, ok := o.meta.LookupMovie(ctx, m.Title, m.Year); ok {
-			m.Title, tag = res.Title, o.platform.IDTag(res.TMDBID)
-			if res.Year > 0 {
-				m.Year = res.Year
-			}
-		}
 		v.lib = o.movies
 		v.dest = naming.MoviePath(m, tag, filepath.Ext(v.src))
 	}
-	v.media = m
+	v.media, v.resolvedBy, v.titleSource = m, id.by, id.titleSource
 	return Result{}
 }
 

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/jfxdev/media-maid/internal/api"
+	"github.com/jfxdev/media-maid/internal/assist"
 	"github.com/jfxdev/media-maid/internal/config"
 	"github.com/jfxdev/media-maid/internal/integration"
 	"github.com/jfxdev/media-maid/internal/jobs"
@@ -100,16 +101,33 @@ func run(log *slog.Logger) error {
 	syncer := integration.NewSyncer(client, cfg.SyncDebounce, history, log)
 	defer syncer.Stop()
 
-	var meta metadata.Provider = metadata.Noop{}
+	var meta metadata.Provider // nil disables the TMDB layer
 	if cfg.TMDBKey != "" {
 		meta = metadata.NewTMDB(cfg.TMDBKey, "")
 		log.Info("tmdb enrichment enabled")
 	}
 
+	var resolver assist.Resolver // nil disables the LLM layer
+	if cfg.LLM.Provider != "" {
+		c, err := assist.New(assist.Options{
+			Provider: cfg.LLM.Provider, BaseURL: cfg.LLM.BaseURL, APIKey: cfg.LLM.APIKey, Model: cfg.LLM.Model,
+			Timeout: cfg.LLM.Timeout, MinConfidence: cfg.LLM.MinConfidence, Log: log,
+		})
+		if err != nil {
+			return err
+		}
+		resolver = c
+		log.Info("llm decision layer enabled", "provider", cfg.LLM.Provider, "model", c.Model(), "min_confidence", cfg.LLM.MinConfidence)
+	}
+	if cfg.PreferredLanguage != "" {
+		log.Info("localized titles", "language", cfg.PreferredLanguage)
+	}
+
 	filter := organizer.Filter{Video: cfg.VideoExts, Subtitle: cfg.SubtitleExts}
 	org := organizer.New(organizer.Options{
 		DownloadsDir: downloads, Movies: movies, TV: tv, Filter: filter, Guard: guard,
-		Meta: meta, Platform: cfg.Platform, Syncer: syncer, History: history, Log: log, DryRun: cfg.DryRun,
+		Meta: meta, Assist: resolver, MinConfidence: cfg.LLM.MinConfidence, Language: cfg.PreferredLanguage,
+		Platform: cfg.Platform, Syncer: syncer, History: history, Log: log, DryRun: cfg.DryRun,
 	})
 
 	var server orphans.Server

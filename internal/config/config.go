@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/url"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -22,7 +23,18 @@ const (
 	defaultSyncDebounce  = 30 * time.Second
 	defaultStableSeconds = 30
 	defaultListenAddr    = ":8080"
+	defaultLLMMinConf    = 0.7
+	defaultLLMTimeout    = 20 * time.Second
+	maxLLMTimeout        = 2 * time.Minute
 )
+
+// LLM providers accepted in LLM_PROVIDER.
+const (
+	LLMOpenAI    = "openai"
+	LLMAnthropic = "anthropic"
+)
+
+var reLanguage = regexp.MustCompile(`^[a-z]{2,3}(-[A-Z]{2}|-[0-9]{3})?$`)
 
 // foreignPrefixes are variables of specific servers. Media Maid is single
 // tenant and only accepts the generic MEDIA_SERVER_* variables.
@@ -60,12 +72,25 @@ type Config struct {
 	VideoExts          map[string]bool
 	SubtitleExts       map[string]bool
 	TMDBKey            string
+	LLM                LLMConfig
+	PreferredLanguage  string
 	PathMap            *PathMap
 	OrphanScanInterval time.Duration
 	SyncDebounce       time.Duration
 	StableDuration     time.Duration
 	ListenAddr         string
 	DryRun             bool
+}
+
+// LLMConfig configures the optional LLM decision layer. Provider is empty
+// when the layer is disabled.
+type LLMConfig struct {
+	Provider      string
+	BaseURL       string
+	APIKey        string
+	Model         string
+	MinConfidence float64
+	Timeout       time.Duration
 }
 
 // SyncEnabled reports whether a media server is configured.
@@ -147,6 +172,15 @@ func Load(getenv func(string) string, environ []string) (*Config, error) {
 
 	c.TMDBKey = strings.TrimSpace(getenv("TMDB_API_KEY"))
 
+	c.LLM = loadLLM(getenv, fail)
+
+	if v := strings.TrimSpace(getenv("PREFERRED_LANGUAGE")); v != "" {
+		if !reLanguage.MatchString(v) {
+			fail("PREFERRED_LANGUAGE must be a single BCP 47 tag such as pt-BR or es")
+		}
+		c.PreferredLanguage = v
+	}
+
 	if v := strings.TrimSpace(getenv("SERVER_PATH_MAP")); v != "" {
 		pm, err := parsePathMap(v)
 		if err != nil {
@@ -188,6 +222,60 @@ func Load(getenv func(string) string, environ []string) (*Config, error) {
 		return nil, errors.Join(errs...)
 	}
 	return c, nil
+}
+
+func loadLLM(getenv func(string) string, fail func(string, ...any)) LLMConfig {
+	l := LLMConfig{MinConfidence: defaultLLMMinConf, Timeout: defaultLLMTimeout}
+	l.Provider = strings.ToLower(strings.TrimSpace(getenv("LLM_PROVIDER")))
+	l.BaseURL = strings.TrimRight(strings.TrimSpace(getenv("LLM_BASE_URL")), "/")
+	l.APIKey = strings.TrimSpace(getenv("LLM_API_KEY"))
+	l.Model = strings.TrimSpace(getenv("LLM_MODEL"))
+	if l.Provider == "" {
+		if l.BaseURL != "" || l.APIKey != "" || l.Model != "" {
+			fail("LLM_BASE_URL, LLM_API_KEY and LLM_MODEL require LLM_PROVIDER (%s or %s)", LLMOpenAI, LLMAnthropic)
+		}
+		return LLMConfig{}
+	}
+	switch l.Provider {
+	case LLMOpenAI, LLMAnthropic:
+	default:
+		if hasMultiple(l.Provider) {
+			fail("LLM_PROVIDER must be a single value")
+		} else {
+			fail("LLM_PROVIDER %q is not supported (%s or %s)", l.Provider, LLMOpenAI, LLMAnthropic)
+		}
+	}
+	if l.BaseURL != "" {
+		if u, err := url.Parse(l.BaseURL); err != nil || hasMultiple(l.BaseURL) || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			fail("LLM_BASE_URL must be a single http(s) URL")
+		}
+	}
+	// The public endpoints always need a key; a custom base URL (Ollama, a
+	// gateway) may not.
+	if l.APIKey == "" && l.BaseURL == "" {
+		fail("LLM_API_KEY is required unless LLM_BASE_URL points to a server that needs none")
+	}
+	if hasMultiple(l.APIKey) {
+		fail("LLM_API_KEY must be a single value")
+	}
+	if l.Model == "" && l.Provider == LLMOpenAI {
+		fail("LLM_MODEL is required with LLM_PROVIDER=openai")
+	}
+	if hasMultiple(l.Model) {
+		fail("LLM_MODEL must be a single value")
+	}
+	if v := strings.TrimSpace(getenv("LLM_MIN_CONFIDENCE")); v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil || f < 0 || f > 1 {
+			fail("LLM_MIN_CONFIDENCE must be a number between 0 and 1")
+		}
+		l.MinConfidence = f
+	}
+	l.Timeout = parseDuration("LLM_TIMEOUT", getenv, defaultLLMTimeout, fail)
+	if l.Timeout <= 0 || l.Timeout > maxLLMTimeout {
+		fail("LLM_TIMEOUT must be between 1s and 2m")
+	}
+	return l
 }
 
 // DistinctRoots fails if any two roots are equal or nested.

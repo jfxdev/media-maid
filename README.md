@@ -44,6 +44,13 @@ run one sidecar per server.
 | `DOWNLOADS_DIR` | yes | — | source folder |
 | `MOVIES_DIR` / `TV_DIR` | yes | — | library folders |
 | `TMDB_API_KEY` | no | — | TMDB v3 key or v4 token for canonical title/year/ID |
+| `PREFERRED_LANGUAGE` | no | — | BCP 47 tag (`pt-BR`, `es`) for localized folder names, see below |
+| `LLM_PROVIDER` | no | — | `openai` or `anthropic`; leave empty to disable the LLM layer |
+| `LLM_API_KEY` | no² | — | key for the LLM endpoint |
+| `LLM_MODEL` | no² | `claude-opus-5-5` (anthropic) | model name; required for `openai` |
+| `LLM_BASE_URL` | no | provider default | any OpenAI-compatible server (Ollama, LM Studio, OpenRouter, vLLM) or an Anthropic gateway |
+| `LLM_MIN_CONFIDENCE` | no | `0.7` | below this parser confidence the LLM is consulted; also the minimum confidence its answers need |
+| `LLM_TIMEOUT` | no | `20s` | per request, at most `2m` |
 | `SERVER_PATH_MAP` | no | — | `server_prefix=local_prefix` when the server sees other paths |
 | `ORPHAN_SCAN_INTERVAL` | no | — | periodic orphan report (e.g. `24h`) |
 | `VIDEO_EXTENSIONS` | no | `mkv,mp4,avi,m4v,mov,wmv,ts,webm` | video allowlist |
@@ -54,6 +61,8 @@ run one sidecar per server.
 | `DRY_RUN` | no | `false` | never link or remove anything |
 
 ¹ Set both or neither; without them, sync and server-side orphan checks are off.
+² `LLM_API_KEY` is required with the public endpoints (no `LLM_BASE_URL`);
+`LLM_MODEL` is required with `openai`.
 The three folders must be distinct, non-nested and inside mounted volumes.
 
 ## API
@@ -81,6 +90,54 @@ qBittorrent hook (*Run external program on torrent finished*):
 curl -s -X POST -H "Authorization: Bearer $API_TOKEN" \
   -d "{\"path\":\"%N\"}" http://media-maid:8080/api/v1/organize
 ```
+
+## How titles are resolved
+
+Identification runs in layers. Only the first is always on; each optional
+layer can only refine the previous one, and when it fails, times out or is
+disabled, the previous decision stands.
+
+1. **Parser** (always, local, deterministic). Cleans the name (dots,
+   underscores, `+`, `~`, spaced dashes, release groups, site prefixes,
+   invisible Unicode; keeps `Spider-Man`, `Grey's`, `S.H.I.E.L.D`), extracts
+   year, season/episodes (`S01E02`, `S01E01-E03`, `1x02`, `Season 1 Episode 2`,
+   `T01E02`, air dates, `Part 2 of 6`, anime `- 12`) and quality, and scores
+   its own confidence.
+2. **TMDB** (optional, `TMDB_API_KEY`). Up to five candidates are scored
+   against the parsed title and year; a clear winner sets the canonical
+   title, year and ID tag.
+3. **LLM** (optional, `LLM_PROVIDER`, off by default). Consulted only when
+   the parser's confidence is below `LLM_MIN_CONFIDENCE`, TMDB found nothing,
+   or the candidates are too close to call. It acts as a tie-breaker: it picks
+   a TMDB candidate or confirms the parse. Its answer is treated as untrusted
+   data and validated: season, episode and year numbers must appear in the
+   file name (or in the chosen TMDB entry), a title it proposes outside the
+   candidates must be confirmed by TMDB, and it never chooses paths, IDs or
+   libraries.
+
+Each organize result reports `resolved_by` (`parser`, `tmdb` or `llm`).
+
+What the LLM receives: the file name and at most two parent folders, the
+parser's reading and the TMDB candidates. Nothing else leaves the container.
+Calls are cached, and after five consecutive failures the layer pauses for
+five minutes. A local model works too:
+
+```yaml
+LLM_PROVIDER: openai
+LLM_BASE_URL: http://ollama:11434/v1
+LLM_MODEL: llama3.1
+```
+
+### Localized titles
+
+With `PREFERRED_LANGUAGE` (e.g. `pt-BR`), folders use the official title in
+that language: the TMDB translation for that language and country first; if
+there is none, the LLM (when enabled) may only pick one of the titles TMDB
+lists for that language or market; without TMDB, it may answer only when it
+is confident an official title exists. Otherwise the original title is kept.
+The ID tag still points at the TMDB entry, so the server matches it either
+way. Results report `title_source` (`tmdb_translation`, `llm_localized` or
+`original`).
 
 ## Duplicate releases
 
@@ -114,7 +171,9 @@ returns `stale` if it is no longer an orphan.
 - Source files are opened with `O_NOFOLLOW` and verified with `fstat`; library
   writes go through `os.Root`; existing files are only replaced on an explicit
   `"overwrite": true` request, atomically and never through a symlink.
-- Names from parsing and TMDB are sanitized; server item IDs are validated.
+- Names from parsing, TMDB and the LLM are sanitized; server item IDs are
+  validated. LLM answers are schema-checked and cross-checked against the
+  file name and TMDB; `LLM_API_KEY` never appears in logs or errors.
 - Non-root distroless image; examples use `read_only`, `cap_drop: [ALL]` and
   `no-new-privileges`.
 

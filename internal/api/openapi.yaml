@@ -299,6 +299,14 @@ components:
         replaces:
           type: boolean
           description: On a `planned` result, the destination exists and would be replaced.
+        resolved_by:
+          type: string
+          enum: [parser, tmdb, llm]
+          description: Layer that identified a video (see "How titles are resolved" in the README).
+        title_source:
+          type: string
+          enum: [tmdb_translation, llm_localized, original]
+          description: Origin of the folder title when `PREFERRED_LANGUAGE` is set.
       required: [source, status]
     HistoryEntry:
       type: object

@@ -36,14 +36,22 @@ Go 1.25+ is required (`os.Root`). Dependencies are stdlib plus `fsnotify` and
    `organizer.Library`.
 4. `internal/integration`: `Client` (generic HTTP) + `Syncer` (debounced
    refresh). A nil client means sync is disabled (`ErrSyncDisabled`).
-5. `internal/metadata`: `TMDB` provider when `TMDB_API_KEY` is set, else `Noop`.
-6. `internal/organizer`: `parser` → `metadata` → `naming` → `linker`
-   (hardlink, copy fallback) → `jobs.History` + `Syncer.Request()`.
-7. `internal/orphans`: `Detector.Scan` builds a report; `Remove` revalidates
+5. `internal/metadata`: `TMDB` provider when `TMDB_API_KEY` is set, else nil
+   (the layer is skipped); `Search` + `Pick` scoring, `Titles` + `Localized`.
+6. `internal/assist`: optional LLM decision layer (`LLM_PROVIDER`; nil
+   `assist.Resolver` = disabled). OpenAI-compatible and Anthropic clients on
+   stdlib `net/http`, fixed versioned prompts in `prompt.go`, strict decoding
+   and validation in `validate.go`, cache and circuit breaker.
+7. `internal/organizer`: `parser.Analyze` → `metadata` (candidates +
+   `metadata.Pick`) → `assist` only when ambiguous (`identify.go`) →
+   optional localization (`PREFERRED_LANGUAGE`) → `naming` → dedupe by
+   quality → `linker` (hardlink, copy fallback, opt-in atomic replace) →
+   `jobs.History` + `Syncer.Request()`.
+8. `internal/orphans`: `Detector.Scan` builds a report; `Remove` revalidates
    each ID before acting.
-8. `internal/watcher`: fsnotify, groups events by top-level release, waits
+9. `internal/watcher`: fsnotify, groups events by top-level release, waits
    `STABLE_SECONDS`, organizes on a single worker goroutine.
-9. `internal/api`: stdlib `ServeMux`; `/api/v1/*` behind bearer auth;
+10. `internal/api`: stdlib `ServeMux`; `/api/v1/*` behind bearer auth;
    `/healthz`, `/openapi.yaml`, `/docs` are public.
 
 Other packages: `parser` (release name → `Analysis`: `Media`, `Quality`,
@@ -79,11 +87,20 @@ All platform-specific data lives in `internal/integration/platforms.go`
   `POST /api/v1/orphans/remove`, after revalidation; doubt means keep
   (`containsVideo` treats walk errors as "has video"). Server items with any
   path outside the managed libraries are ignored.
-- **Secrets**: `API_TOKEN` and `MEDIA_SERVER_TOKEN` never reach logs, errors or
-  responses; token comparison is constant time.
+- **Secrets**: `API_TOKEN`, `MEDIA_SERVER_TOKEN`, `TMDB_API_KEY` and
+  `LLM_API_KEY` never reach logs, errors or responses; token comparison is
+  constant time.
 - **Single tenant**: one media server per process.
 - `DRY_RUN` must make every mutating path a no-op (`planned` / `dry_run`).
 - Server item IDs are validated (`reItemID`) before being put in URLs.
+- **The LLM layer is optional**: the pipeline must behave the same with
+  `LLM_PROVIDER` unset, and every LLM failure falls back to the parser/TMDB
+  decision. LLM output is untrusted data: schema-checked, numbers must appear
+  in the name or TMDB, free titles need TMDB confirmation (when TMDB is on),
+  localized titles must be one of TMDB's when TMDB is on, and it never
+  becomes a path, ID or library choice. Release names reach the model only
+  JSON-encoded in the user message, cleaned of control characters. Bump
+  `promptVersion` when changing a prompt or schema. `LLM_API_KEY` is a secret.
 
 ## Conventions
 
@@ -98,8 +115,8 @@ All platform-specific data lives in `internal/integration/platforms.go`
   snake_case strings returned as `{"error": "..."}`.
 - **Tests**: table-driven, real filesystems under `t.TempDir()`, small fakes
   for the interfaces each package consumes (`api.Organizer`, `api.Orphans`,
-  `integration.LibrarySyncer`, `metadata.Provider`, `orphans.Server`),
-  `httptest` for media server/TMDB clients. Add a regression test for every
+  `integration.LibrarySyncer`, `metadata.Provider`, `assist.Resolver`, `orphans.Server`),
+  `httptest` for media server/TMDB/LLM clients. Add a regression test for every
   security fix.
 - **Logging**: `log/slog` JSON; pass `*slog.Logger` explicitly.
 - **Config**: every new variable is validated in `config.Load`, documented in
