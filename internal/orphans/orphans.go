@@ -1,0 +1,428 @@
+// Package orphans detects library entries that no longer match the
+// filesystem: server items whose files are gone and directories without any
+// video. Removal only ever happens on explicit request, after revalidation.
+package orphans
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"io/fs"
+	"log/slog"
+	"os"
+	"path"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/jfxdev/media-maid/internal/config"
+	"github.com/jfxdev/media-maid/internal/integration"
+	"github.com/jfxdev/media-maid/internal/jobs"
+	"github.com/jfxdev/media-maid/internal/organizer"
+	"github.com/jfxdev/media-maid/internal/safepath"
+)
+
+// Orphan types.
+const (
+	TypeServerItemMissingFile = "server_item_missing_file"
+	TypeOrphanDirectory       = "orphan_directory"
+)
+
+// Orphan is one detected inconsistency.
+type Orphan struct {
+	ID           string    `json:"id"`
+	Type         string    `json:"type"`
+	Path         string    `json:"path"`
+	ServerItemID string    `json:"server_item_id,omitempty"`
+	Title        string    `json:"title,omitempty"`
+	DetectedAt   time.Time `json:"detected_at"`
+
+	library string   // library name ("movies"/"tv") for directories
+	rel     string   // path relative to the library root, for directories
+	paths   []string // local paths for server items
+}
+
+// ReportError is a problem found while scanning (e.g. unauthorized volume).
+type ReportError struct {
+	ServerItemID string `json:"server_item_id,omitempty"`
+	Title        string `json:"title,omitempty"`
+	Error        string `json:"error"`
+}
+
+// Report is the result of an orphan scan.
+type Report struct {
+	GeneratedAt time.Time     `json:"generated_at"`
+	ServerCheck string        `json:"server_check"` // "ok", "disabled" or "error"
+	Orphans     []Orphan      `json:"orphans"`
+	Errors      []ReportError `json:"errors,omitempty"`
+}
+
+// RemoveResult is the outcome of removing one orphan.
+type RemoveResult struct {
+	ID     string `json:"id"`
+	Status string `json:"status"`
+	Error  string `json:"error,omitempty"`
+}
+
+// Server is the subset of the integration client used here.
+type Server interface {
+	ListItems(ctx context.Context) ([]integration.ServerItem, error)
+	DeleteItem(ctx context.Context, id string) error
+}
+
+// Detector finds and removes orphans.
+type Detector struct {
+	server    Server // nil when no media server is configured
+	pathMap   *config.PathMap
+	libraries []organizer.Library
+	filter    organizer.Filter
+	guard     *safepath.Guard
+	history   *jobs.History
+	log       *slog.Logger
+	dryRun    bool
+
+	mu     sync.Mutex
+	report *Report
+	byID   map[string]Orphan
+}
+
+// Options configures a Detector.
+type Options struct {
+	Server    Server
+	PathMap   *config.PathMap
+	Libraries []organizer.Library
+	Filter    organizer.Filter
+	Guard     *safepath.Guard
+	History   *jobs.History
+	Log       *slog.Logger
+	DryRun    bool
+}
+
+// New builds a Detector.
+func New(o Options) *Detector {
+	return &Detector{
+		server: o.Server, pathMap: o.PathMap, libraries: o.Libraries, filter: o.Filter,
+		guard: o.Guard, history: o.History, log: o.Log, dryRun: o.DryRun,
+		byID: map[string]Orphan{},
+	}
+}
+
+func makeID(kind, key string) string {
+	sum := sha256.Sum256([]byte(kind + "\x00" + key))
+	return hex.EncodeToString(sum[:8])
+}
+
+// Report returns the latest report, or nil before the first scan.
+func (d *Detector) Report() *Report {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.report == nil {
+		return nil
+	}
+	r := *d.report
+	r.Orphans = append([]Orphan(nil), d.report.Orphans...)
+	return &r
+}
+
+// Scan builds a fresh report, replacing the previous one. It never removes.
+func (d *Detector) Scan(ctx context.Context) (*Report, error) {
+	now := time.Now().UTC()
+	rep := &Report{GeneratedAt: now, ServerCheck: "disabled", Orphans: []Orphan{}}
+
+	if d.server != nil {
+		items, err := d.server.ListItems(ctx)
+		if err != nil {
+			rep.ServerCheck = "error"
+			rep.Errors = append(rep.Errors, ReportError{Error: err.Error()})
+			d.log.Warn("orphan scan: listing server items failed", "err", err)
+		} else {
+			rep.ServerCheck = "ok"
+			for _, it := range items {
+				o, rerr := d.checkItem(it)
+				if rerr != nil {
+					rep.Errors = append(rep.Errors, *rerr)
+					continue
+				}
+				if o != nil {
+					o.DetectedAt = now
+					rep.Orphans = append(rep.Orphans, *o)
+				}
+			}
+		}
+	}
+
+	for _, lib := range d.libraries {
+		dirs, err := d.orphanDirs(lib.Root)
+		if err != nil {
+			rep.Errors = append(rep.Errors, ReportError{Error: lib.Name + ": " + err.Error()})
+			continue
+		}
+		for _, rel := range dirs {
+			rep.Orphans = append(rep.Orphans, Orphan{
+				ID:         makeID(TypeOrphanDirectory, lib.Name+"/"+rel),
+				Type:       TypeOrphanDirectory,
+				Path:       lib.Name + "/" + rel,
+				DetectedAt: now,
+				library:    lib.Name,
+				rel:        rel,
+			})
+		}
+	}
+
+	byID := make(map[string]Orphan, len(rep.Orphans))
+	for _, o := range rep.Orphans {
+		byID[o.ID] = o
+	}
+	d.mu.Lock()
+	d.report, d.byID = rep, byID
+	d.mu.Unlock()
+	d.log.Info("orphan scan finished", "orphans", len(rep.Orphans), "errors", len(rep.Errors), "server_check", rep.ServerCheck)
+	return d.Report(), nil
+}
+
+// locate maps a local absolute path to the managed library containing it.
+func (d *Detector) locate(local string) (organizer.Library, string, bool) {
+	for _, lib := range d.libraries {
+		if safepath.Within(lib.Path, local) && local != lib.Path {
+			rel, err := filepath.Rel(lib.Path, local)
+			if err == nil {
+				return lib, filepath.ToSlash(rel), true
+			}
+		}
+	}
+	return organizer.Library{}, "", false
+}
+
+// exists checks a library-relative path through os.Root, so a link that
+// escapes to an unauthorized volume surfaces as ErrUnauthorizedVolume.
+func exists(lib organizer.Library, rel string) (bool, error) {
+	_, err := lib.Root.Lstat(rel)
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, fs.ErrNotExist):
+		return false, nil
+	case strings.Contains(err.Error(), "path escapes from parent"):
+		return false, safepath.ErrUnauthorizedVolume
+	default:
+		return false, err
+	}
+}
+
+// checkItem returns an orphan only when every path of the item lies inside a
+// managed library and none of them exist. An item with any path outside the
+// managed libraries is ignored: removing it on the server could also remove
+// media Media Maid does not manage (e.g. a Plex item with several parts).
+func (d *Detector) checkItem(it integration.ServerItem) (*Orphan, *ReportError) {
+	var managed []string
+	var display string
+	for _, p := range it.Paths {
+		local := d.pathMap.Translate(p)
+		if !filepath.IsAbs(local) {
+			return nil, nil
+		}
+		lib, rel, ok := d.locate(local)
+		if !ok {
+			return nil, nil
+		}
+		ok, err := exists(lib, rel)
+		if err != nil {
+			msg := err.Error()
+			if errors.Is(err, safepath.ErrUnauthorizedVolume) {
+				msg = "unauthorized_volume"
+			}
+			return nil, &ReportError{ServerItemID: it.ID, Title: it.Title, Error: msg}
+		}
+		if ok {
+			return nil, nil
+		}
+		managed = append(managed, local)
+		if display == "" {
+			display = lib.Name + "/" + rel
+		}
+	}
+	if len(managed) == 0 {
+		return nil, nil
+	}
+	return &Orphan{
+		ID:           makeID(TypeServerItemMissingFile, it.ID),
+		Type:         TypeServerItemMissingFile,
+		Path:         display,
+		ServerItemID: it.ID,
+		Title:        it.Title,
+		paths:        managed,
+	}, nil
+}
+
+// orphanDirs returns the topmost directories (relative to root) that contain
+// no video anywhere in their tree. The root itself is never reported.
+// Symlinked directories are not followed.
+func (d *Detector) orphanDirs(root *os.Root) ([]string, error) {
+	fsys := root.FS()
+	hasVideo := map[string]bool{}
+	var dirs []string
+	err := fs.WalkDir(fsys, ".", func(p string, e fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if e.IsDir() {
+			if p != "." {
+				dirs = append(dirs, p)
+			}
+			return nil
+		}
+		if d.filter.Video[strings.ToLower(path.Ext(p))] {
+			for dir := path.Dir(p); ; dir = path.Dir(dir) {
+				hasVideo[dir] = true
+				if dir == "." {
+					break
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(dirs)
+	var out []string
+	for _, dir := range dirs {
+		if hasVideo[dir] {
+			continue
+		}
+		parentOrphan := false
+		for _, o := range out {
+			if strings.HasPrefix(dir, o+"/") {
+				parentOrphan = true
+				break
+			}
+		}
+		if !parentOrphan {
+			out = append(out, dir)
+		}
+	}
+	return out, nil
+}
+
+// Remove deletes the given orphans from the current report after
+// revalidating each one. Unknown or no-longer-orphan IDs are "stale".
+func (d *Detector) Remove(ctx context.Context, ids []string) []RemoveResult {
+	out := make([]RemoveResult, 0, len(ids))
+	for _, id := range ids {
+		d.mu.Lock()
+		o, ok := d.byID[id]
+		d.mu.Unlock()
+		if !ok {
+			out = append(out, RemoveResult{ID: id, Status: jobs.StatusStale})
+			continue
+		}
+		res := d.removeOne(ctx, o)
+		if res.Status == jobs.StatusRemoved || res.Status == jobs.StatusStale {
+			d.mu.Lock()
+			delete(d.byID, id)
+			if d.report != nil {
+				kept := d.report.Orphans[:0:0]
+				for _, x := range d.report.Orphans {
+					if x.ID != id {
+						kept = append(kept, x)
+					}
+				}
+				d.report.Orphans = kept
+			}
+			d.mu.Unlock()
+		}
+		d.history.Add(jobs.Entry{Action: jobs.ActionOrphanRm, Source: o.Path, Status: res.Status, Error: res.Error})
+		out = append(out, res)
+	}
+	return out
+}
+
+func (d *Detector) removeOne(ctx context.Context, o Orphan) RemoveResult {
+	res := RemoveResult{ID: o.ID}
+	switch o.Type {
+	case TypeServerItemMissingFile:
+		if d.server == nil {
+			res.Status, res.Error = jobs.StatusError, "sync_disabled"
+			return res
+		}
+		for _, p := range o.paths {
+			lib, rel, ok := d.locate(p)
+			if !ok {
+				continue
+			}
+			if ok, err := exists(lib, rel); err != nil || ok {
+				res.Status = jobs.StatusStale
+				return res
+			}
+		}
+		if d.dryRun {
+			res.Status = jobs.StatusDryRun
+			return res
+		}
+		if err := d.server.DeleteItem(ctx, o.ServerItemID); err != nil {
+			if errors.Is(err, integration.ErrNotFound) {
+				res.Status = jobs.StatusStale
+				return res
+			}
+			res.Status, res.Error = jobs.StatusError, err.Error()
+			return res
+		}
+		res.Status = jobs.StatusRemoved
+		return res
+
+	case TypeOrphanDirectory:
+		var lib *organizer.Library
+		for i := range d.libraries {
+			if d.libraries[i].Name == o.library {
+				lib = &d.libraries[i]
+			}
+		}
+		rel := path.Clean(o.rel)
+		if lib == nil || rel == "." || rel == "" || strings.HasPrefix(rel, "/") || rel == ".." || strings.HasPrefix(rel, "../") {
+			res.Status, res.Error = jobs.StatusError, "invalid_path"
+			return res
+		}
+		fi, err := lib.Root.Lstat(rel)
+		if err != nil || !fi.IsDir() {
+			// Gone, replaced by a symlink or a file: no longer the orphan we reported.
+			res.Status = jobs.StatusStale
+			return res
+		}
+		if containsVideo(lib.Root, rel, d.filter) {
+			res.Status = jobs.StatusStale
+			return res
+		}
+		if d.dryRun {
+			res.Status = jobs.StatusDryRun
+			return res
+		}
+		if err := lib.Root.RemoveAll(rel); err != nil {
+			res.Status, res.Error = jobs.StatusError, err.Error()
+			return res
+		}
+		res.Status = jobs.StatusRemoved
+		return res
+	}
+	res.Status, res.Error = jobs.StatusError, "unknown orphan type"
+	return res
+}
+
+// containsVideo reports whether any allowlisted video exists under rel.
+// Walk errors count as "contains video" so nothing is removed on doubt.
+func containsVideo(root *os.Root, rel string, f organizer.Filter) bool {
+	found := false
+	err := fs.WalkDir(root.FS(), rel, func(p string, e fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !e.IsDir() && f.Video[strings.ToLower(path.Ext(p))] {
+			found = true
+			return fs.SkipAll
+		}
+		return nil
+	})
+	return found || err != nil
+}
