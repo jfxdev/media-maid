@@ -42,7 +42,7 @@ func TestCopyFallback(t *testing.T) {
 		t.Errorf("second copy = %s, want conflict", st)
 	}
 	// place recognises the earlier copy as already done.
-	if st, err := place(root, "Movie (2000)/Movie (2000).mkv", f, fi, false); st != jobs.StatusExists || err != nil {
+	if st, err := place(root, "Movie (2000)/Movie (2000).mkv", f, fi, false, false); st != jobs.StatusExists || err != nil {
 		t.Errorf("place over copy = %s, %v; want exists", st, err)
 	}
 }
@@ -62,10 +62,10 @@ func TestPlaceOverwrite(t *testing.T) {
 	defer f.Close()
 	fi, _ := f.Stat()
 
-	if st, _ := place(root, rel, f, fi, false); st != jobs.StatusConflict {
+	if st, _ := place(root, rel, f, fi, false, false); st != jobs.StatusConflict {
 		t.Fatalf("without overwrite = %s, want conflict", st)
 	}
-	if st, err := place(root, rel, f, fi, true); st != jobs.StatusReplaced || err != nil {
+	if st, err := place(root, rel, f, fi, true, false); st != jobs.StatusReplaced || err != nil {
 		t.Fatalf("overwrite = %s, %v; want replaced", st, err)
 	}
 	got, _ := os.Stat(old)
@@ -76,19 +76,19 @@ func TestPlaceOverwrite(t *testing.T) {
 	if len(entries) != 1 {
 		t.Errorf("temp file left behind: %v", entries)
 	}
-	if st, _ := place(root, rel, f, fi, true); st != jobs.StatusExists {
+	if st, _ := place(root, rel, f, fi, true, false); st != jobs.StatusExists {
 		t.Errorf("second overwrite = %s, want exists", st)
 	}
 
 	// Directories and symlinks at the destination are never replaced.
 	os.Remove(old)
 	os.Mkdir(old, 0o755)
-	if st, _ := place(root, rel, f, fi, true); st != jobs.StatusConflict {
+	if st, _ := place(root, rel, f, fi, true, false); st != jobs.StatusConflict {
 		t.Errorf("overwrite of a directory = %s, want conflict", st)
 	}
 	os.Remove(old)
 	os.Symlink("/etc/passwd", old)
-	if st, _ := place(root, rel, f, fi, true); st != jobs.StatusConflict {
+	if st, _ := place(root, rel, f, fi, true, false); st != jobs.StatusConflict {
 		t.Errorf("overwrite of a symlink = %s, want conflict", st)
 	}
 	if b, _ := os.ReadFile("/etc/passwd"); string(b) == "1080p" {
@@ -113,7 +113,7 @@ func TestPlaceKeepsForeignTemp(t *testing.T) {
 	f, _ := os.Open(src)
 	defer f.Close()
 	fi, _ := f.Stat()
-	if st, err := place(root, "Movie (2000)/Movie (2000).mkv", f, fi, true); st != jobs.StatusReplaced || err != nil {
+	if st, err := place(root, "Movie (2000)/Movie (2000).mkv", f, fi, true, false); st != jobs.StatusReplaced || err != nil {
 		t.Fatalf("overwrite = %s, %v", st, err)
 	}
 	if b, _ := os.ReadFile(foreign); string(b) != "not ours" {
@@ -211,5 +211,48 @@ func TestSwapInNoExchange(t *testing.T) {
 	}
 	if entries, _ := os.ReadDir(dst); len(entries) != 1 {
 		t.Errorf("staged file left behind: %v", entries)
+	}
+}
+
+// With COPY_FALLBACK=false a file that cannot be hardlinked is an error, for
+// a new destination and for an overwrite alike, and nothing is written.
+func TestPlaceNoCopy(t *testing.T) {
+	linkat = func(int, string, int, string, int) error { return unix.EXDEV }
+	defer func() { linkat = unix.Linkat }()
+
+	src := filepath.Join(t.TempDir(), "a.mkv")
+	os.WriteFile(src, []byte("payload"), 0o644)
+	f, _ := os.Open(src)
+	defer f.Close()
+	fi, _ := f.Stat()
+	dst := t.TempDir()
+	root, _ := os.OpenRoot(dst)
+	defer root.Close()
+
+	st, err := place(root, "New (2000)/New (2000).mkv", f, fi, false, true)
+	if st != jobs.StatusError || !errors.Is(err, errNoCopy) {
+		t.Errorf("new destination = %s, %v; want error %v", st, err, errNoCopy)
+	}
+	if entries, _ := os.ReadDir(filepath.Join(dst, "New (2000)")); len(entries) != 0 {
+		t.Errorf("something was written: %v", entries)
+	}
+
+	old := filepath.Join(dst, "Old (2000)", "Old (2000).mkv")
+	os.MkdirAll(filepath.Dir(old), 0o755)
+	os.WriteFile(old, []byte("720p"), 0o644)
+	st, err = place(root, "Old (2000)/Old (2000).mkv", f, fi, true, true)
+	if st != jobs.StatusError || !errors.Is(err, errNoCopy) {
+		t.Errorf("overwrite = %s, %v; want error %v", st, err, errNoCopy)
+	}
+	if b, _ := os.ReadFile(old); string(b) != "720p" {
+		t.Errorf("destination changed: %q", b)
+	}
+	if entries, _ := os.ReadDir(filepath.Dir(old)); len(entries) != 1 {
+		t.Errorf("temp file left behind: %v", entries)
+	}
+
+	// The default still copies.
+	if st, err := place(root, "New (2000)/New (2000).mkv", f, fi, false, false); st != jobs.StatusCopied || err != nil {
+		t.Errorf("with copy fallback = %s, %v; want copied", st, err)
 	}
 }

@@ -68,6 +68,20 @@ func (g *Guard) Authorized(p string) bool {
 	return false
 }
 
+// VolumeOf returns the authorized mount point holding the resolved path p
+// (the deepest one when volumes are nested), or "" outside every volume.
+// link(2) never works across mount points, even of the same filesystem, so
+// two roots in different volumes cannot be hardlinked.
+func (g *Guard) VolumeOf(p string) string {
+	best := ""
+	for _, v := range g.volumes {
+		if Within(v, p) && len(v) > len(best) {
+			best = v
+		}
+	}
+	return best
+}
+
 // ResolveRoot resolves a configured root directory and checks it is a
 // directory inside an authorized volume.
 func (g *Guard) ResolveRoot(name, dir string) (string, error) {

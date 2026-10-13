@@ -27,7 +27,9 @@ The ID tag only appears when `TMDB_API_KEY` is set, in the server's format:
 Pick a ready-made compose file from [`examples/`](examples/) (one per server),
 set `MEDIA_SERVER_TOKEN` and `MEDIA_MAID_API_TOKEN`, and run
 `docker compose up -d`. Keep downloads and library on the **same filesystem**
-so hardlinks work (otherwise files are copied).
+so hardlinks work (otherwise files are copied, or fail with
+`COPY_FALLBACK=false`; a startup warning names the folders on different
+mounts).
 
 Each instance is bound to **exactly one** media server (`INTEGRATION_MODE`).
 Multiple values, or `JELLYFIN_*` / `EMBY_*` / `PLEX_*` variables of *another*
@@ -62,6 +64,7 @@ server (say `PLEX_CLAIM` from a shared env file) are ignored with a warning.
 | `STABLE_SECONDS` | no | `30` | quiet time before a download counts as done |
 | `LISTEN_ADDR` | no | `:8080` | HTTP address |
 | `DRY_RUN` | no | `false` | never link or remove anything |
+| `COPY_FALLBACK` | no | `true` | copy a file that cannot be hardlinked (different filesystem or mount); `false` reports an error instead of using extra disk space |
 
 ¹ Set both or neither; without them, sync and server-side orphan checks are off.
 ² `LLM_API_KEY` is required with the public endpoints (no `LLM_BASE_URL`);

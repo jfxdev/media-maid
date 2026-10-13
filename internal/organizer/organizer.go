@@ -59,6 +59,7 @@ type Organizer struct {
 	history   *jobs.History
 	log       *slog.Logger
 	dryRun    bool
+	noCopy    bool
 	ledger    *Ledger
 
 	// mu serializes placement (dedupe and writes). Identification, which
@@ -86,6 +87,9 @@ type Options struct {
 	History  *jobs.History
 	Log      *slog.Logger
 	DryRun   bool
+	// NoCopy turns a file that cannot be hardlinked (another filesystem or
+	// mount) into an error instead of a full copy (COPY_FALLBACK=false).
+	NoCopy bool
 	// Ledger remembers placed files across runs; nil uses a fresh one.
 	Ledger *Ledger
 }
@@ -103,7 +107,7 @@ func New(o Options) *Organizer {
 		hasMeta: hasMeta, assist: o.Assist, minConf: o.MinConfidence, language: o.Language,
 		downloads: o.DownloadsDir, movies: o.Movies, tv: o.TV, filter: o.Filter,
 		guard: o.Guard, meta: o.Meta, platform: o.Platform, syncer: o.Syncer,
-		history: o.History, log: o.Log, dryRun: o.DryRun, ledger: o.Ledger,
+		history: o.History, log: o.Log, dryRun: o.DryRun, noCopy: o.NoCopy, ledger: o.Ledger,
 	}
 }
 
@@ -576,7 +580,7 @@ func (o *Organizer) apply(src string, lib Library, dest string, dry, overwrite b
 		return r
 	}
 
-	status, err := place(lib.Root, dest, f, fi, overwrite)
+	status, err := place(lib.Root, dest, f, fi, overwrite, o.noCopy)
 	r.Status = status
 	if err != nil {
 		r.Error = describe(err)

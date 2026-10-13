@@ -85,6 +85,17 @@ func run(log *slog.Logger) error {
 	if err := config.DistinctRoots(roots); err != nil {
 		return err
 	}
+	// link(2) fails across mount points: say so now rather than on every file.
+	for _, lib := range []string{"MOVIES_DIR", "TV_DIR"} {
+		if guard.VolumeOf(roots[lib]) == guard.VolumeOf(downloads) {
+			continue
+		}
+		if cfg.CopyFallback {
+			log.Warn("hardlinks impossible: different mounts, files will be copied and use extra disk space", "from", "DOWNLOADS_DIR", "to", lib)
+		} else {
+			log.Warn("hardlinks impossible: different mounts, organizing will fail with COPY_FALLBACK=false", "from", "DOWNLOADS_DIR", "to", lib)
+		}
+	}
 	var store *state.Store // nil keeps everything in memory
 	if dir := roots["STATE_DIR"]; dir != "" {
 		if store, err = state.Open(dir); err != nil {
@@ -179,7 +190,7 @@ func run(log *slog.Logger) error {
 		DownloadsDir: downloads, Movies: movies, TV: tv, Filter: filter, Guard: guard,
 		Meta: meta, Assist: resolver, MinConfidence: cfg.LLM.MinConfidence, Language: cfg.PreferredLanguage,
 		Platform: cfg.Platform, Syncer: syncer, History: history, Log: log, DryRun: cfg.DryRun,
-		Ledger: ledger,
+		Ledger: ledger, NoCopy: !cfg.CopyFallback,
 	})
 
 	var server orphans.Server

@@ -34,8 +34,13 @@ func TestLoadValid(t *testing.T) {
 	if c.Mode != "jellyfin" || c.ServerURL != "http://jellyfin:8096" || !c.SyncEnabled() {
 		t.Errorf("unexpected config: %+v", c)
 	}
-	if !c.VideoExts[".mkv"] || !c.SubtitleExts[".srt"] || c.SyncDebounce.Seconds() != 30 {
+	if !c.VideoExts[".mkv"] || !c.SubtitleExts[".srt"] || c.SyncDebounce.Seconds() != 30 || !c.CopyFallback {
 		t.Errorf("defaults not applied")
+	}
+	env := baseEnv()
+	env["COPY_FALLBACK"] = "false"
+	if c, err := load(env); err != nil || c.CopyFallback {
+		t.Errorf("COPY_FALLBACK=false: %+v %v", c, err)
 	}
 	for _, mode := range []string{"emby", "plex", "PLEX"} {
 		env := baseEnv()
@@ -148,6 +153,7 @@ func TestLoadInvalid(t *testing.T) {
 		{"overlapping exts", func(e map[string]string) { e["SUBTITLE_EXTENSIONS"] = "srt,mkv" }, nil, "both a video and a subtitle"},
 		{"multi path map", func(e map[string]string) { e["SERVER_PATH_MAP"] = "/a=/b,/c=/d" }, nil, "SERVER_PATH_MAP"},
 		{"relative path map", func(e map[string]string) { e["SERVER_PATH_MAP"] = "media=/b" }, nil, "SERVER_PATH_MAP"},
+		{"copy fallback not bool", func(e map[string]string) { e["COPY_FALLBACK"] = "maybe" }, nil, "COPY_FALLBACK"},
 		{"tiny orphan interval", func(e map[string]string) { e["ORPHAN_SCAN_INTERVAL"] = "5s" }, nil, "ORPHAN_SCAN_INTERVAL"},
 	}
 	for _, tt := range tests {

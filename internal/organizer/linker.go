@@ -23,8 +23,9 @@ import (
 // library even if a folder inside it is a symlink pointing elsewhere.
 //
 // An existing different destination is a conflict, unless overwrite is set and
-// the destination is a regular file: it is then atomically replaced.
-func place(root *os.Root, rel string, src *os.File, srcInfo os.FileInfo, overwrite bool) (string, error) {
+// the destination is a regular file: it is then atomically replaced. With
+// noCopy, a file that cannot be hardlinked is an error instead of a copy.
+func place(root *os.Root, rel string, src *os.File, srcInfo os.FileInfo, overwrite, noCopy bool) (string, error) {
 	dir, name := path.Split(rel)
 	dir = strings.TrimSuffix(dir, "/")
 	if dir == "" {
@@ -43,7 +44,7 @@ func place(root *os.Root, rel string, src *os.File, srcInfo os.FileInfo, overwri
 		if !overwrite || !existing.Mode().IsRegular() {
 			return jobs.StatusConflict, nil
 		}
-		return replaceWith(root, rel, src, srcInfo, existing)
+		return replaceWith(root, rel, src, srcInfo, existing, noCopy)
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return jobs.StatusError, mapRootErr(err)
 	}
@@ -57,17 +58,29 @@ func place(root *os.Root, rel string, src *os.File, srcInfo os.FileInfo, overwri
 	// Link the already-open source descriptor into the already-open destination
 	// directory, so neither side can be swapped between check and use.
 	srcProc := "/proc/self/fd/" + strconv.Itoa(int(src.Fd()))
-	err = unix.Linkat(unix.AT_FDCWD, srcProc, int(d.Fd()), name, unix.AT_SYMLINK_FOLLOW)
+	err = linkat(unix.AT_FDCWD, srcProc, int(d.Fd()), name, unix.AT_SYMLINK_FOLLOW)
 	switch {
 	case err == nil:
 		return jobs.StatusLinked, nil
 	case errors.Is(err, unix.EEXIST):
 		return jobs.StatusConflict, nil
-	case errors.Is(err, unix.EXDEV), errors.Is(err, unix.EPERM), errors.Is(err, unix.EMLINK):
+	case noHardlink(err):
+		if noCopy {
+			return jobs.StatusError, fmt.Errorf("%w: %w", errNoCopy, err)
+		}
 		return copyInto(root, rel, src, srcInfo)
 	default:
 		return jobs.StatusError, fmt.Errorf("hardlink: %w", err)
 	}
+}
+
+// errNoCopy is returned when a hardlink is impossible and COPY_FALLBACK is off.
+var errNoCopy = errors.New("cannot hardlink and COPY_FALLBACK=false")
+
+// noHardlink reports a link(2) error that a copy can work around: another
+// mount (EXDEV), hardlinks not permitted (EPERM) or too many links (EMLINK).
+func noHardlink(err error) bool {
+	return errors.Is(err, unix.EXDEV) || errors.Is(err, unix.EPERM) || errors.Is(err, unix.EMLINK)
 }
 
 // tmpName returns a fresh temporary name next to rel. It is unique per
@@ -132,7 +145,7 @@ func copyInto(root *os.Root, rel string, src *os.File, srcInfo os.FileInfo) (str
 // and swaps it with rel. Both steps go through the directory descriptor
 // opened by os.Root. Only the file checked by the caller (checked) is ever
 // replaced: see swapIn.
-func replaceWith(root *os.Root, rel string, src *os.File, srcInfo, checked os.FileInfo) (string, error) {
+func replaceWith(root *os.Root, rel string, src *os.File, srcInfo, checked os.FileInfo, noCopy bool) (string, error) {
 	tmp := tmpName(rel)
 	d, err := root.Open(path.Dir(rel))
 	if err != nil {
@@ -140,10 +153,13 @@ func replaceWith(root *os.Root, rel string, src *os.File, srcInfo, checked os.Fi
 	}
 	defer d.Close()
 	srcProc := "/proc/self/fd/" + strconv.Itoa(int(src.Fd()))
-	err = unix.Linkat(unix.AT_FDCWD, srcProc, int(d.Fd()), path.Base(tmp), unix.AT_SYMLINK_FOLLOW)
+	err = linkat(unix.AT_FDCWD, srcProc, int(d.Fd()), path.Base(tmp), unix.AT_SYMLINK_FOLLOW)
 	switch {
 	case err == nil:
-	case errors.Is(err, unix.EXDEV), errors.Is(err, unix.EPERM), errors.Is(err, unix.EMLINK):
+	case noHardlink(err):
+		if noCopy {
+			return jobs.StatusError, fmt.Errorf("%w: %w", errNoCopy, err)
+		}
 		if err := copyTemp(root, tmp, src, srcInfo); err != nil {
 			return jobs.StatusError, err
 		}
@@ -159,6 +175,7 @@ var errNoAtomicReplace = errors.New("overwrite needs renameat2 RENAME_EXCHANGE, 
 
 // Test hooks.
 var (
+	linkat           = unix.Linkat
 	renameat2        = unix.Renameat2
 	testHookRollback = func() {}
 )

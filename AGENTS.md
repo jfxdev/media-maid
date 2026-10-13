@@ -15,7 +15,7 @@ User docs: [`README.md`](README.md). API contract: [`internal/api/openapi.yaml`]
 ```sh
 gofmt -l .                 # must print nothing
 go vet ./...
-go test ./...              # watcher tests take ~10s
+go test -race ./...        # watcher tests take ~10s; CI runs all of these
 go build ./cmd/media-maid
 docker build -t media-maid .
 ```
@@ -117,6 +117,9 @@ All platform-specific data lives in `internal/integration/platforms.go`
   constant time.
 - **Single tenant**: one media server per process.
 - `DRY_RUN` must make every mutating path a no-op (`planned` / `dry_run`).
+- **Copies are the exception**: a file that cannot be hardlinked (EXDEV,
+  EPERM, EMLINK) is copied only while `COPY_FALLBACK` is on (default); with it
+  off, `place` returns `errNoCopy` and writes nothing.
 - Server item IDs are validated (`reItemID`) before being put in URLs.
 - **The LLM layer is optional**: the pipeline must behave the same with
   `LLM_PROVIDER` unset, and every LLM failure falls back to the parser/TMDB
