@@ -192,7 +192,9 @@ The watcher groups files by **release folder**, not by the first folder under
 `DOWNLOADS_DIR`: with torrent client categories (`downloads/movies/<release>`),
 each release is organized as soon as it is complete, whatever else is still
 downloading in the category. Loose files in a category folder are organized one
-by one.
+by one. If the kernel drops events (inotify queue overflow, e.g.
+when a large pack is extracted at once), the whole downloads folder is walked
+again.
 
 Every placed video is recorded in an **organize ledger** (by device and inode,
 so renames keep their entry). Automatic runs (watcher, scans) skip

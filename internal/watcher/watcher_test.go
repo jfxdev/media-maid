@@ -2,6 +2,7 @@ package watcher
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -9,6 +10,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/fsnotify/fsnotify"
 )
 
 func TestWatcherWaitsForStableFiles(t *testing.T) {
@@ -189,4 +192,28 @@ func TestWatcherCategoryFolders(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
 	}
 	t.Fatalf("finished release was held back by an active one: calls = %v", calls)
+}
+
+// When the kernel event queue overflows, files whose events were dropped
+// must still be picked up.
+func TestWatcherRescansOnOverflow(t *testing.T) {
+	root := t.TempDir()
+	w, err := New(root, time.Second, func(context.Context, string) {}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.fsw.Close()
+	// Run is not started, so these events are never handled: they are "lost".
+	rel := filepath.Join(root, "Lost.2020")
+	os.MkdirAll(rel, 0o755)
+	f := filepath.Join(rel, "Lost.2020.mkv")
+	os.WriteFile(f, []byte("x"), 0o644)
+	if _, ok := w.pending[f]; ok {
+		t.Fatal("file pending before the overflow")
+	}
+	w.handleError(fsnotify.ErrEventOverflow)
+	if _, ok := w.pending[f]; !ok {
+		t.Errorf("file not rescanned after overflow: pending = %v", w.pending)
+	}
+	w.handleError(errors.New("other"))
 }

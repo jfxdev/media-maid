@@ -4,6 +4,7 @@ package watcher
 
 import (
 	"context"
+	"errors"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -176,11 +177,23 @@ func (w *Watcher) Run(ctx context.Context) {
 			if !ok {
 				return
 			}
-			w.log.Warn("watcher error", "err", err)
+			w.handleError(err)
 		case <-tick.C:
 			w.flush()
 		}
 	}
+}
+
+// handleError logs a watcher error. When the kernel queue overflowed, events
+// were lost: the whole tree is walked again so every file is reconsidered
+// (files already placed are recognized by the organizer and left as they are).
+func (w *Watcher) handleError(err error) {
+	if errors.Is(err, fsnotify.ErrEventOverflow) {
+		w.log.Warn("filesystem events were lost, rescanning the downloads folder", "err", err)
+		_ = w.addTree(w.root)
+		return
+	}
+	w.log.Warn("watcher error", "err", err)
 }
 
 func (w *Watcher) handle(ev fsnotify.Event) {
