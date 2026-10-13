@@ -125,7 +125,7 @@ func TestWatcherKeepsProcessingDuringOrganize(t *testing.T) {
 
 func TestUnitOf(t *testing.T) {
 	root := t.TempDir()
-	for _, d := range []string{"movies/Done.2001/Subs", "tv/Show.S01/Season 01", "Release.2020/Sample", "loose"} {
+	for _, d := range []string{"movies/Done.2001/Subs", "tv/Show.S01/Season 01", "Release.2020/Sample", "loose", "movies/Bonus.2005/Behind The Scenes", "movies/Bonus.2005/Deleted.Scenes"} {
 		os.MkdirAll(filepath.Join(root, d), 0o755)
 	}
 	w := &Watcher{root: root}
@@ -137,6 +137,10 @@ func TestUnitOf(t *testing.T) {
 		"tv/Show.S01/Season 01/Show.S01E01.mkv": "tv/Show.S01",
 		"Release.2020/Sample/sample.mkv":        "Release.2020",
 		"loose/Movie.2004.mkv":                  "loose",
+		// Extras folders keep the release a single unit.
+		"movies/Bonus.2005/Bonus.2005.mkv":                "movies/Bonus.2005",
+		"movies/Bonus.2005/Behind The Scenes/making.mkv":  "movies/Bonus.2005",
+		"movies/Bonus.2005/Deleted.Scenes/scene.2005.mkv": "movies/Bonus.2005",
 	}
 	for rel, want := range tests {
 		if got := w.unitOf(filepath.Join(root, rel), map[string]bool{}); got != filepath.Join(root, want) {

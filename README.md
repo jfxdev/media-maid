@@ -140,6 +140,10 @@ Release shapes the parser understands besides plain names:
   and Emby a ` - Extended Cut` version file in the movie's folder.
 - **Anime absolute numbering** (`[Group] Show - 1080`): with TMDB, the number
   is mapped onto the series' seasons; without, it stays `S01E1080`.
+- **Extras folders** (`Sample`, `Extras`, `Featurettes`, `Trailers`,
+  `Behind The Scenes`, `Deleted Scenes`, `Interviews`, `Scenes`, `Shorts`,
+  `Clips`, `Bonus`) are skipped and keep the release a single unit, so bonus
+  videos never land in the library as movies of their own.
 - **Origin markers** (`The Office US`): TMDB is searched for `The Office` and
   the series from that country is preferred.
 

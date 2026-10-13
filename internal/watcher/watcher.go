@@ -97,8 +97,9 @@ func (w *Watcher) touch(p string) {
 }
 
 // supportDir matches folders that belong to the release around them: seasons,
-// subtitles, samples and extras.
-var supportDir = regexp.MustCompile(`(?i)^(?:season[ ._-]?\d{1,4}|s\d{1,2}|temporada[ ._-]?\d{1,2}|specials|subs?|subtitles|legendas|samples?|extras|featurettes|trailers)$`)
+// subtitles, samples and extras (including the Jellyfin and Plex extras
+// folders; keep in sync with organizer's junkDirs).
+var supportDir = regexp.MustCompile(`(?i)^(?:season[ ._-]?\d{1,4}|s\d{1,2}|temporada[ ._-]?\d{1,2}|specials|subs?|subtitles|legendas|samples?|extras|featurettes|trailers|behind[ ._-]the[ ._-]scenes|deleted[ ._-]scenes|interviews|scenes|shorts|clips|bonus)$`)
 
 // unitOf returns the path organized for p: its release folder (the folder
 // holding it, above any season, subtitle or extras folder), or p itself when
