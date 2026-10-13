@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/jfxdev/media-maid/internal/assist"
@@ -40,8 +41,11 @@ func metaKind(k parser.Kind) metadata.Kind {
 
 // identify runs the layers in order: parser (always), TMDB (optional), then
 // the LLM (optional) only when the first two are unsure. Any failure of an
-// optional layer falls back to what the previous layers decided.
-func (o *Organizer) identify(ctx context.Context, rel string, a parser.Analysis, parsed bool) (identity, bool) {
+// optional layer falls back to what the previous layers decided, except a
+// TMDB pick that is itself unsure (a tie or a weak score): that is not a
+// decision, so the file waits for a manual identification (why says so)
+// unless AMBIGUOUS_MATCH=best. why is set when nothing was identified.
+func (o *Organizer) identify(ctx context.Context, rel string, a parser.Analysis, parsed bool) (identity, string) {
 	id := identity{media: a.Media, by: ByParser}
 
 	var cands []metadata.Result
@@ -57,10 +61,12 @@ func (o *Organizer) identify(ctx context.Context, rel string, a parser.Analysis,
 		best, score, margin, found = metadata.PickIn(query, a.Year, a.Country, cands)
 	}
 
-	ambiguous := !parsed || a.Confidence < o.minConf
+	// unsure: TMDB answered, but its best candidate is weak or tied.
+	unsure := o.hasMeta && parsed && !tmdbFailed && found &&
+		(score < metadata.GoodScore || (len(cands) > 1 && margin < metadata.MinMargin))
+	ambiguous := !parsed || a.Confidence < o.minConf || unsure
 	if o.hasMeta && parsed && !tmdbFailed {
-		ambiguous = ambiguous || !found || score < metadata.GoodScore ||
-			(len(cands) > 1 && margin < metadata.MinMargin)
+		ambiguous = ambiguous || !found
 	}
 
 	decided := false
@@ -69,9 +75,12 @@ func (o *Organizer) identify(ctx context.Context, rel string, a parser.Analysis,
 	}
 	if !decided {
 		if !parsed {
-			return identity{}, false
+			return identity{}, errUnidentifiedMsg
 		}
 		if found && score >= metadata.MinScore {
+			if unsure && !o.ambiguousBest {
+				return identity{}, ambiguousMsg(cands)
+			}
 			id.match, id.by = &best, ByTMDB
 		}
 	}
@@ -85,7 +94,36 @@ func (o *Organizer) identify(ctx context.Context, rel string, a parser.Analysis,
 	if o.language != "" {
 		o.localize(ctx, &id)
 	}
-	return id, true
+	return id, ""
+}
+
+// errUnidentifiedMsg explains a file whose title could not be read.
+const errUnidentifiedMsg = "could not identify title"
+
+// maxListedCandidates bounds the candidates named in an ambiguous result.
+const maxListedCandidates = 5
+
+// ambiguousMsg explains an unsure TMDB pick, naming the candidates so the
+// user can pick one with a manual identification (tmdb_id).
+func ambiguousMsg(cands []metadata.Result) string {
+	var b strings.Builder
+	b.WriteString("ambiguous title: ")
+	for i, c := range cands {
+		if i == maxListedCandidates {
+			b.WriteString(", ...")
+			break
+		}
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(c.Title)
+		if c.Year > 0 {
+			b.WriteString(" (" + strconv.Itoa(c.Year) + ")")
+		}
+		b.WriteString(" [tmdb " + strconv.Itoa(c.TMDBID) + "]")
+	}
+	b.WriteString("; identify it manually")
+	return b.String()
 }
 
 // manual is an Override resolved once per request.
@@ -173,7 +211,7 @@ func (o *Organizer) manualIdentity(ctx context.Context, a parser.Analysis, parse
 		m.Year = man.year
 	}
 	if m.Title == "" {
-		return identity{}, "could not identify title"
+		return identity{}, errUnidentifiedMsg
 	}
 	id := identity{media: m, match: man.match, by: ByManual}
 	if id.match != nil && o.hasMeta {

@@ -94,6 +94,8 @@ type Organizer struct {
 	notify    func(Result)
 	upgrade   bool
 	extras    bool
+	// ambiguousBest accepts an unsure TMDB pick (AMBIGUOUS_MATCH=best).
+	ambiguousBest bool
 
 	// mu serializes placement (dedupe and writes). Identification, which
 	// may wait on TMDB or the LLM, runs outside it.
@@ -136,6 +138,9 @@ type Options struct {
 	// LinkExtras links videos from a release's extras folders into the
 	// server's extras folders (LINK_EXTRAS).
 	LinkExtras bool
+	// AmbiguousBest accepts the best TMDB candidate when it is weak or tied
+	// (AMBIGUOUS_MATCH=best); by default such a file waits as pending.
+	AmbiguousBest bool
 }
 
 // New builds an Organizer.
@@ -151,7 +156,7 @@ func New(o Options) *Organizer {
 		o.Pending = NewPending()
 	}
 	return &Organizer{
-		pending: o.Pending, notify: o.Notify, upgrade: o.AutoUpgrade, extras: o.LinkExtras,
+		pending: o.Pending, notify: o.Notify, upgrade: o.AutoUpgrade, extras: o.LinkExtras, ambiguousBest: o.AmbiguousBest,
 		hasMeta: hasMeta, assist: o.Assist, minConf: o.MinConfidence, language: o.Language,
 		downloads: o.DownloadsDir, movies: o.Movies, tv: o.TV, filter: o.Filter,
 		guard: o.Guard, meta: o.Meta, platform: o.Platform, syncer: o.Syncer,
@@ -858,8 +863,11 @@ func (o *Organizer) planVideo(ctx context.Context, v *videoPlan, opts OrganizeOp
 		if id, why = o.manualIdentity(ctx, a, ok, man); why != "" {
 			return Result{Source: rel, Status: jobs.StatusSkipped, Error: why}
 		}
-	} else if id, ok = o.identify(ctx, rel, a, ok); !ok {
-		return Result{Source: rel, Status: jobs.StatusSkipped, Error: "could not identify title"}
+	} else {
+		var why string
+		if id, why = o.identify(ctx, rel, a, ok); why != "" {
+			return Result{Source: rel, Status: jobs.StatusSkipped, Error: why}
+		}
 	}
 	m := id.media
 	var tag string
