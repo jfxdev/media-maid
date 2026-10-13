@@ -102,7 +102,7 @@ Every `/api/v1/*` route requires `Authorization: Bearer $API_TOKEN`.
 |---|---|---|
 | `GET` | `/healthz` | liveness: `503` when the downloads watcher stopped or stalled |
 | `POST` | `/api/v1/scan` | organize the whole downloads folder; `?async=true` answers `202` and logs to the history |
-| `POST` | `/api/v1/organize` | `{"path": "...", "overwrite": false}` organize one file/folder; `kind`, `tmdb_id`, `title`, `year` identify it manually |
+| `POST` | `/api/v1/organize` | `{"path": "...", "overwrite": false}` organize one file/folder; `kind`, `tmdb_id`, `title`, `year` identify it manually; `"automatic": true` behaves like the watcher (for hooks) |
 | `POST` | `/api/v1/preview` | same as organize, without touching disk |
 | `GET` | `/api/v1/pending` | downloads that need a decision: conflicts, duplicates, unidentified titles, errors |
 | `GET` | `/api/v1/history` | recent actions and last sync |
@@ -127,7 +127,9 @@ qBittorrent (*Run external program on torrent finished*), use
 ```
 
 It passes the content path (`%F`, which works with categories and subfolders)
-JSON-encoded with `jq`. Mount the downloads folder at the same path in both
+JSON-encoded with `jq`, with `"automatic": true`: the request then behaves
+like the watcher, so a hook fired again for the same torrent (after a
+recheck) never links again a file you deleted from the library. Mount the downloads folder at the same path in both
 containers. Never paste the torrent name into a JSON template by hand: the API
 rejects duplicate keys and trailing data, so a crafted name cannot add fields
 such as `overwrite`, but it would still break the request.

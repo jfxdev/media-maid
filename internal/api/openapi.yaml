@@ -102,9 +102,10 @@ paths:
       summary: Organize one file or folder
       description: |
         `path` is relative to `DOWNLOADS_DIR` or absolute inside it.
-        Handy as a qBittorrent "run external program" hook. An explicit
-        request ignores the ledger: the files are identified again and
-        re-linked even if their library copy was deleted.
+        Handy as a qBittorrent "run external program" hook (send
+        `automatic: true`). An explicit request ignores the ledger: the files
+        are identified again and re-linked even if their library copy was
+        deleted; with `automatic` it behaves like the watcher.
 
         `kind` with `tmdb_id` and/or `title` (and `year`) replaces automatic
         identification for every video of the request (`resolved_by:
@@ -302,6 +303,17 @@ components:
                   checked. Requires a filesystem with atomic exchange
                   (renameat2); elsewhere the result is `error`. The watcher and
                   scans never overwrite; they upgrade only with `AUTO_UPGRADE`.
+              automatic:
+                type: boolean
+                default: false
+                description: |
+                  Organize as the watcher does instead of as an explicit
+                  request: files already placed keep their recorded placement
+                  and a file deleted from the library is not linked again.
+                  Meant for a torrent client's completion hook, which may fire
+                  again for the same download (a recheck). Cannot be combined
+                  with `overwrite` or a manual identification (`400
+                  invalid_request`).
               kind:
                 type: string
                 enum: [movie, episode]

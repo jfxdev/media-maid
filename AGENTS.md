@@ -145,7 +145,8 @@ All platform-specific data lives in `internal/integration/platforms.go`
   imported aliases are validated again, and one TMDB rejects is ignored.
 - **Respect deletions**: automatic runs never re-link a file (video or extra)
   the ledger says was placed and whose library copy is gone or was replaced
-  by another release; only an explicit organize does.
+  by another release; only an explicit organize does. An organize request
+  with `"automatic": true` (the completion hook) is an automatic run.
 - **Sanitize names**: anything from the parser or TMDB goes through
   `naming.Sanitize` before becoming a path component.
 - **Strict request JSON**: `api.decode` rejects unknown fields, duplicate keys

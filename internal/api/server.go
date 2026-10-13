@@ -249,6 +249,10 @@ func (s *Server) organize(preview bool) http.HandlerFunc {
 		var req struct {
 			Path      string `json:"path"`
 			Overwrite bool   `json:"overwrite"`
+			// Automatic organizes like the watcher (a torrent client's
+			// completion hook): the ledger is reused, so a file deleted
+			// from the library is not linked again on a re-fired hook.
+			Automatic bool   `json:"automatic"`
 			Kind      string `json:"kind"`
 			Title     string `json:"title"`
 			Year      int    `json:"year"`
@@ -257,8 +261,15 @@ func (s *Server) organize(preview bool) http.HandlerFunc {
 		if !decode(w, r, &req) {
 			return
 		}
-		opts := organizer.OrganizeOptions{Preview: preview, Overwrite: req.Overwrite, Explicit: true}
-		if req.Kind != "" || req.Title != "" || req.Year != 0 || req.TMDBID != 0 {
+		manual := req.Kind != "" || req.Title != "" || req.Year != 0 || req.TMDBID != 0
+		if req.Automatic && (req.Overwrite || manual) {
+			// Overwriting and naming a title are decisions; an automatic
+			// run never takes them.
+			writeError(w, http.StatusBadRequest, "invalid_request")
+			return
+		}
+		opts := organizer.OrganizeOptions{Preview: preview, Overwrite: req.Overwrite, Explicit: !req.Automatic}
+		if manual {
 			ov, ok := override(req.Kind, req.Title, req.Year, req.TMDBID)
 			if !ok {
 				writeError(w, http.StatusBadRequest, "invalid_override")

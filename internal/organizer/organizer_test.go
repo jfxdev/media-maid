@@ -772,6 +772,11 @@ func TestLedger(t *testing.T) {
 	if _, err := os.Stat(dest); err == nil {
 		t.Error("a deleted library entry was linked again by a scan")
 	}
+	// So does an automatic request for that path (a re-fired completion hook).
+	res, _ = e2.org.Organize(context.Background(), src, OrganizeOptions{})
+	if len(res) != 1 || res[0].Status != jobs.StatusSkipped || res[0].Error != errRemovedMsg {
+		t.Errorf("automatic organize after deletion: %+v", res)
+	}
 	// An explicit request links it again.
 	res, _ = e2.org.Organize(context.Background(), src, OrganizeOptions{Explicit: true})
 	if len(res) != 1 || res[0].Status != jobs.StatusLinked || !sameInode(t, src, dest) {
