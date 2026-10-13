@@ -29,7 +29,10 @@ set `MEDIA_SERVER_TOKEN` and `MEDIA_MAID_API_TOKEN`, and run
 `docker compose up -d`. Keep downloads and library on the **same filesystem**
 so hardlinks work: otherwise organizing fails with an error (a startup warning
 names the folders on different mounts), unless `COPY_FALLBACK=true` lets Media
-Maid copy the files, using as much disk space again.
+Maid copy the files, using as much disk space again. Run it as the user that
+owns the downloads (`user:` in compose): with `fs.protected_hardlinks`, the
+default on most distributions, a process may only hardlink files it owns or
+can write to, and the error says so (`hardlink not permitted (EPERM)`).
 
 Images for `linux/amd64` and `linux/arm64` are published to
 `ghcr.io/jfxdev/media-maid` for every version tag (`1.2.3`, `1.2`, `1` and

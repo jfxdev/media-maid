@@ -224,6 +224,40 @@ func TestSwapInNoExchange(t *testing.T) {
 
 // With COPY_FALLBACK=false a file that cannot be hardlinked is an error, for
 // a new destination and for an overwrite alike, and nothing is written.
+// EPERM on the same filesystem is a permission problem: the error says so
+// instead of pointing at copies, and nothing is written.
+func TestPlaceHardlinkDenied(t *testing.T) {
+	linkat = func(int, string, int, string, int) error { return unix.EPERM }
+	defer func() { linkat = unix.Linkat }()
+
+	src := filepath.Join(t.TempDir(), "a.mkv")
+	os.WriteFile(src, []byte("payload"), 0o644)
+	f, _ := os.Open(src)
+	defer f.Close()
+	fi, _ := f.Stat()
+	dst := t.TempDir()
+	root, _ := os.OpenRoot(dst)
+	defer root.Close()
+
+	st, err := place(root, "New (2000)/New (2000).mkv", f, fi, false, true, nil)
+	if st != jobs.StatusError || !errors.Is(err, errHardlinkDenied) || !errors.Is(err, unix.EPERM) {
+		t.Errorf("denied = %s, %v; want %v", st, err, errHardlinkDenied)
+	}
+	if entries, _ := os.ReadDir(filepath.Join(dst, "New (2000)")); len(entries) != 0 {
+		t.Errorf("something was written: %v", entries)
+	}
+	old := filepath.Join(dst, "Old (2000)", "Old (2000).mkv")
+	os.MkdirAll(filepath.Dir(old), 0o755)
+	os.WriteFile(old, []byte("720p"), 0o644)
+	if st, err := place(root, "Old (2000)/Old (2000).mkv", f, fi, true, true, nil); st != jobs.StatusError || !errors.Is(err, errHardlinkDenied) {
+		t.Errorf("overwrite denied = %s, %v", st, err)
+	}
+	// With COPY_FALLBACK the file is still copied.
+	if st, err := place(root, "Copy (2000)/Copy (2000).mkv", f, fi, false, false, nil); st != jobs.StatusCopied || err != nil {
+		t.Errorf("copy fallback = %s, %v", st, err)
+	}
+}
+
 func TestPlaceNoCopy(t *testing.T) {
 	linkat = func(int, string, int, string, int) error { return unix.EXDEV }
 	defer func() { linkat = unix.Linkat }()
