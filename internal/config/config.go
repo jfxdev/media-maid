@@ -102,6 +102,9 @@ type Config struct {
 	StableDuration time.Duration
 	ListenAddr     string
 	DryRun         bool
+	// CopyFallback copies a file that cannot be hardlinked (another
+	// filesystem or mount); false makes that an error.
+	CopyFallback bool
 	// Warnings are non-fatal configuration notes to log at startup.
 	Warnings []string
 }
@@ -192,6 +195,9 @@ func Load(getenv func(string) string, environ []string) (*Config, error) {
 	c.TVDir = requireAbs("TV_DIR", getenv, fail)
 	if v := strings.TrimSpace(getenv("STATE_DIR")); v != "" {
 		c.StateDir = requireAbs("STATE_DIR", getenv, fail)
+	} else {
+		c.Warnings = append(c.Warnings, "STATE_DIR is not set: the organize ledger lives in memory, so after a restart "+
+			"files removed from the library are linked again and TMDB/LLM lookups are repeated")
 	}
 	if c.DownloadsDir != "" && c.MoviesDir != "" && c.TVDir != "" {
 		if err := DistinctRoots(c.Roots()); err != nil {
@@ -262,6 +268,15 @@ func Load(getenv func(string) string, environ []string) (*Config, error) {
 			fail("DRY_RUN must be a boolean")
 		}
 		c.DryRun = b
+	}
+
+	c.CopyFallback = true
+	if v := strings.TrimSpace(getenv("COPY_FALLBACK")); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			fail("COPY_FALLBACK must be a boolean")
+		}
+		c.CopyFallback = b
 	}
 
 	if len(errs) > 0 {

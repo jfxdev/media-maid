@@ -48,6 +48,8 @@ type Server struct {
 	// bg bounds background work (async scans); it is cancelled at shutdown.
 	bg       context.Context
 	scanning atomic.Bool
+	// watcherOK, when set, makes /healthz fail while the watcher is down.
+	watcherOK func() bool
 }
 
 // New builds the API server. token must already be validated.
@@ -59,12 +61,14 @@ func New(token string, org Organizer, orph Orphans, syncer integration.LibrarySy
 // shutdown). Call it before serving.
 func (s *Server) SetContext(ctx context.Context) { s.bg = ctx }
 
+// SetHealth makes /healthz report 503 while watcherOK returns false. Call it
+// before serving.
+func (s *Server) SetHealth(watcherOK func() bool) { s.watcherOK = watcherOK }
+
 // Handler returns the HTTP handler.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-	})
+	mux.HandleFunc("GET /healthz", s.health)
 	mux.HandleFunc("GET /openapi.yaml", serveSpec)
 	mux.HandleFunc("GET /docs", serveDocs)
 	mux.HandleFunc("GET /docs/init.js", serveDocsInit)
@@ -178,6 +182,16 @@ func strictValue(dec *json.Decoder) error {
 		return err
 	}
 	return nil
+}
+
+// health is the liveness probe: the process serves requests and, when
+// configured, the downloads watcher is running.
+func (s *Server) health(w http.ResponseWriter, r *http.Request) {
+	if s.watcherOK != nil && !s.watcherOK() {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "unhealthy", "watcher": "stopped"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 // scan organizes the whole downloads folder. With ?async=true it answers 202

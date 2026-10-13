@@ -121,3 +121,24 @@ func TestResolveRoot(t *testing.T) {
 		t.Errorf("symlinked root: err = %v", err)
 	}
 }
+
+func TestVolumeOf(t *testing.T) {
+	data, media := t.TempDir(), t.TempDir()
+	nested := filepath.Join(data, "library")
+	os.MkdirAll(nested, 0o755)
+	g, err := NewGuard([]string{data, media, nested})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := map[string]string{
+		filepath.Join(data, "downloads"):       data,
+		filepath.Join(nested, "movies"):        nested, // deepest mount wins
+		filepath.Join(media, "tv"):             media,
+		filepath.Join(filepath.Dir(data), "x"): "",
+	}
+	for p, want := range tests {
+		if got := g.VolumeOf(p); got != want {
+			t.Errorf("VolumeOf(%s) = %q, want %q", p, got, want)
+		}
+	}
+}

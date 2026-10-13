@@ -4,12 +4,14 @@ package watcher
 
 import (
 	"context"
+	"errors"
 	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -37,6 +39,21 @@ type Watcher struct {
 	queued map[string]bool
 	work   chan string
 	done   chan string
+
+	// running and lastLoop back Healthy: set while Run is active, and the
+	// last time its loop went round (unix nanoseconds).
+	running  atomic.Bool
+	lastLoop atomic.Int64
+}
+
+// stallLimit is how long the event loop may go without a tick before the
+// watcher reports itself unhealthy. The loop never blocks on organizing, so
+// only a stuck filesystem call can hold it that long.
+const stallLimit = 30 * time.Second
+
+// Healthy reports whether Run is active and its event loop is not stalled.
+func (w *Watcher) Healthy() bool {
+	return w.running.Load() && time.Since(time.Unix(0, w.lastLoop.Load())) < stallLimit
 }
 
 const workQueueSize = 256
@@ -96,8 +113,9 @@ func (w *Watcher) touch(p string) {
 }
 
 // supportDir matches folders that belong to the release around them: seasons,
-// subtitles, samples and extras.
-var supportDir = regexp.MustCompile(`(?i)^(?:season[ ._-]?\d{1,4}|s\d{1,2}|temporada[ ._-]?\d{1,2}|specials|subs?|subtitles|legendas|samples?|extras|featurettes|trailers)$`)
+// subtitles, samples and extras (including the Jellyfin and Plex extras
+// folders; keep in sync with organizer's junkDirs).
+var supportDir = regexp.MustCompile(`(?i)^(?:season[ ._-]?\d{1,4}|s\d{1,2}|temporada[ ._-]?\d{1,2}|specials|subs?|subtitles|legendas|samples?|extras|featurettes|trailers|behind[ ._-]the[ ._-]scenes|deleted[ ._-]scenes|interviews|scenes|shorts|clips|bonus)$`)
 
 // unitOf returns the path organized for p: its release folder (the folder
 // holding it, above any season, subtitle or extras folder), or p itself when
@@ -157,6 +175,9 @@ func (w *Watcher) worker(ctx context.Context) {
 
 // Run processes events until ctx is cancelled.
 func (w *Watcher) Run(ctx context.Context) {
+	w.lastLoop.Store(time.Now().UnixNano())
+	w.running.Store(true)
+	defer w.running.Store(false)
 	defer w.fsw.Close()
 	go w.worker(ctx)
 	tick := time.NewTicker(time.Second)
@@ -176,11 +197,24 @@ func (w *Watcher) Run(ctx context.Context) {
 			if !ok {
 				return
 			}
-			w.log.Warn("watcher error", "err", err)
+			w.handleError(err)
 		case <-tick.C:
+			w.lastLoop.Store(time.Now().UnixNano())
 			w.flush()
 		}
 	}
+}
+
+// handleError logs a watcher error. When the kernel queue overflowed, events
+// were lost: the whole tree is walked again so every file is reconsidered
+// (files already placed are recognized by the organizer and left as they are).
+func (w *Watcher) handleError(err error) {
+	if errors.Is(err, fsnotify.ErrEventOverflow) {
+		w.log.Warn("filesystem events were lost, rescanning the downloads folder", "err", err)
+		_ = w.addTree(w.root)
+		return
+	}
+	w.log.Warn("watcher error", "err", err)
 }
 
 func (w *Watcher) handle(ev fsnotify.Event) {

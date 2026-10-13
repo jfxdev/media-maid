@@ -7,9 +7,18 @@ import (
 )
 
 var (
-	reSample  = regexp.MustCompile(`(?i)(^|[ ._\-\[(])(sample|trailer)([ ._\-\])]|$)`)
-	junkDirs  = map[string]bool{"sample": true, "samples": true, "extras": true, "featurettes": true, "trailers": true}
-	partialRe = regexp.MustCompile(`(?i)\.(part|!qb|crdownload|tmp|partial|aria2)$`)
+	reSample = regexp.MustCompile(`(?i)(^|[ ._\-\[(])(sample|trailer)([ ._\-\])]|$)`)
+	// junkDirs are sample and bonus folders, including the extras folders
+	// Jellyfin and Plex recognize. Names are compared lower-cased with dots,
+	// underscores and dashes read as spaces ("Behind.The.Scenes"). "Other" is
+	// left out: it is also a common torrent client category.
+	junkDirs = map[string]bool{
+		"sample": true, "samples": true, "extras": true, "featurettes": true, "trailers": true,
+		"behind the scenes": true, "deleted scenes": true, "interviews": true, "scenes": true,
+		"shorts": true, "clips": true, "bonus": true,
+	}
+	dirSeparators = strings.NewReplacer(".", " ", "_", " ", "-", " ")
+	partialRe     = regexp.MustCompile(`(?i)\.(part|!qb|crdownload|tmp|partial|aria2)$`)
 )
 
 // Filter decides which files are eligible, based on the extension allowlists.
@@ -40,7 +49,7 @@ func isJunk(path string) bool {
 		return true
 	}
 	for _, part := range strings.Split(filepath.Dir(path), string(filepath.Separator)) {
-		if junkDirs[strings.ToLower(part)] {
+		if junkDirs[strings.ToLower(dirSeparators.Replace(part))] {
 			return true
 		}
 	}

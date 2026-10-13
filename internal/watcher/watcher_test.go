@@ -2,6 +2,7 @@ package watcher
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -9,6 +10,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/fsnotify/fsnotify"
 )
 
 func TestWatcherWaitsForStableFiles(t *testing.T) {
@@ -122,7 +125,7 @@ func TestWatcherKeepsProcessingDuringOrganize(t *testing.T) {
 
 func TestUnitOf(t *testing.T) {
 	root := t.TempDir()
-	for _, d := range []string{"movies/Done.2001/Subs", "tv/Show.S01/Season 01", "Release.2020/Sample", "loose"} {
+	for _, d := range []string{"movies/Done.2001/Subs", "tv/Show.S01/Season 01", "Release.2020/Sample", "loose", "movies/Bonus.2005/Behind The Scenes", "movies/Bonus.2005/Deleted.Scenes"} {
 		os.MkdirAll(filepath.Join(root, d), 0o755)
 	}
 	w := &Watcher{root: root}
@@ -134,6 +137,10 @@ func TestUnitOf(t *testing.T) {
 		"tv/Show.S01/Season 01/Show.S01E01.mkv": "tv/Show.S01",
 		"Release.2020/Sample/sample.mkv":        "Release.2020",
 		"loose/Movie.2004.mkv":                  "loose",
+		// Extras folders keep the release a single unit.
+		"movies/Bonus.2005/Bonus.2005.mkv":                "movies/Bonus.2005",
+		"movies/Bonus.2005/Behind The Scenes/making.mkv":  "movies/Bonus.2005",
+		"movies/Bonus.2005/Deleted.Scenes/scene.2005.mkv": "movies/Bonus.2005",
 	}
 	for rel, want := range tests {
 		if got := w.unitOf(filepath.Join(root, rel), map[string]bool{}); got != filepath.Join(root, want) {
@@ -189,4 +196,57 @@ func TestWatcherCategoryFolders(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
 	}
 	t.Fatalf("finished release was held back by an active one: calls = %v", calls)
+}
+
+// When the kernel event queue overflows, files whose events were dropped
+// must still be picked up.
+func TestWatcherRescansOnOverflow(t *testing.T) {
+	root := t.TempDir()
+	w, err := New(root, time.Second, func(context.Context, string) {}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.fsw.Close()
+	// Run is not started, so these events are never handled: they are "lost".
+	rel := filepath.Join(root, "Lost.2020")
+	os.MkdirAll(rel, 0o755)
+	f := filepath.Join(rel, "Lost.2020.mkv")
+	os.WriteFile(f, []byte("x"), 0o644)
+	if _, ok := w.pending[f]; ok {
+		t.Fatal("file pending before the overflow")
+	}
+	w.handleError(fsnotify.ErrEventOverflow)
+	if _, ok := w.pending[f]; !ok {
+		t.Errorf("file not rescanned after overflow: pending = %v", w.pending)
+	}
+	w.handleError(errors.New("other"))
+}
+
+func TestWatcherHealthy(t *testing.T) {
+	w, err := New(t.TempDir(), time.Second, func(context.Context, string) {}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.Healthy() {
+		t.Error("healthy before Run")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	stopped := make(chan struct{})
+	go func() { w.Run(ctx); close(stopped) }()
+	deadline := time.Now().Add(2 * time.Second)
+	for !w.Healthy() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !w.Healthy() {
+		t.Fatal("not healthy while running")
+	}
+	w.lastLoop.Store(time.Now().Add(-time.Minute).UnixNano())
+	if w.Healthy() {
+		t.Error("healthy with a stalled loop")
+	}
+	cancel()
+	<-stopped
+	if w.Healthy() {
+		t.Error("healthy after Run returned")
+	}
 }

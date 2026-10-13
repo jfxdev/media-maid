@@ -789,3 +789,28 @@ func TestLedgerKeepsSubtitleMatching(t *testing.T) {
 		}
 	}
 }
+
+func TestFilterSkipsExtras(t *testing.T) {
+	f := Filter{Video: map[string]bool{".mkv": true}, Subtitle: map[string]bool{".srt": true}}
+	tests := map[string]bool{
+		"Movie.2010/Movie.2010.mkv":                  true,
+		"movies/Movie.2010/Movie.2010.mkv":           true,
+		"other/Movie.2010/Movie.2010.mkv":            true, // "other" is a category, not junk
+		"Movie.2010/Sample/sample.mkv":               false,
+		"Movie.2010/Behind The Scenes/Making Of.mkv": false,
+		"Movie.2010/Behind.The.Scenes/Making.Of.mkv": false,
+		"Movie.2010/deleted_scenes/Scene 1.mkv":      false,
+		"Movie.2010/Interviews/Director.mkv":         false,
+		"Movie.2010/Shorts/Short.Film.2010.mkv":      false,
+		"Movie.2010/Featurettes/Visual Effects.mkv":  false,
+		"Movie.2010/Bonus/Gag Reel.mkv":              false,
+		"Movie.2010/Clips/Clip.mkv":                  false,
+		"Movie.2010/Scenes/Opening.mkv":              false,
+		"Movie.2010/Movie.2010.mkv.part":             false,
+	}
+	for p, want := range tests {
+		if got := f.IsVideo(filepath.FromSlash(p)); got != want {
+			t.Errorf("IsVideo(%s) = %v, want %v", p, got, want)
+		}
+	}
+}

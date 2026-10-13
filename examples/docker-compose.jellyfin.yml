@@ -40,6 +40,7 @@ services:
       # LLM_MODEL: claude-haiku-5-5
       # ORPHAN_SCAN_INTERVAL: 24h
       # SCAN_INTERVAL: 15m                           # fallback when inotify misses events (NFS/SMB)
+      # COPY_FALLBACK: "false"                       # fail instead of copying when hardlinks are impossible
     ports:
       - "127.0.0.1:8080:8080"
     depends_on: [jellyfin]

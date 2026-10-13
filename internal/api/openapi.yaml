@@ -28,11 +28,15 @@ paths:
     get:
       tags: [meta]
       summary: Liveness probe
+      description: >-
+        Answers 200 while the process serves requests and the downloads
+        watcher is running; 503 when the watcher stopped or its event loop
+        stalled for more than 30 seconds.
       operationId: health
       security: []
       responses:
         "200":
-          description: The process is up.
+          description: The process and the watcher are up.
           content:
             application/json:
               schema:
@@ -40,6 +44,16 @@ paths:
                 properties:
                   status: { type: string, const: ok }
                 required: [status]
+        "503":
+          description: The downloads watcher is not running.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, const: unhealthy }
+                  watcher: { type: string, const: stopped }
+                required: [status, watcher]
   /api/v1/scan:
     post:
       tags: [organize]

@@ -126,6 +126,20 @@ func TestAPI(t *testing.T) {
 	}
 }
 
+func TestHealthReflectsWatcher(t *testing.T) {
+	srv := New(token, &fakeOrg{}, &fakeOrphans{}, disabledSyncer{}, jobs.NewHistory(10), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	up := true
+	srv.SetHealth(func() bool { return up })
+	h := srv.Handler()
+	if code, body := do(t, h, "GET", "/healthz", "", ""); code != 200 || !strings.Contains(body, `"ok"`) {
+		t.Errorf("watcher up: got %d %s", code, body)
+	}
+	up = false
+	if code, body := do(t, h, "GET", "/healthz", "", ""); code != 503 || !strings.Contains(body, `"watcher":"stopped"`) {
+		t.Errorf("watcher down: got %d %s", code, body)
+	}
+}
+
 // blockingOrg holds Scan until release is closed.
 type blockingOrg struct {
 	fakeOrg
