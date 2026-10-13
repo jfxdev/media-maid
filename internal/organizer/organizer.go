@@ -11,6 +11,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -52,6 +53,10 @@ const (
 	errRemovedMsg    = "previously organized; removed from the library"
 	errSupersededMsg = "previously organized; replaced in the library by another release"
 )
+
+// errArchiveMsg reports a compressed release, which Media Maid does not
+// extract: it needs attention instead of being ignored silently.
+const errArchiveMsg = "archive: extract it first (compressed releases are not supported)"
 
 // leftAlone reports a quiet skip: a file automatic runs leave alone on
 // purpose. It is neither recorded in the history nor pending.
@@ -436,6 +441,7 @@ func (o *Organizer) process(ctx context.Context, files []string, dry bool, opts 
 	}
 	var results []Result
 	var extras []extraFile
+	var archives []string
 
 	sort.Strings(files)
 	for _, f := range files {
@@ -445,6 +451,8 @@ func (o *Organizer) process(ctx context.Context, files []string, dry bool, opts 
 			get(filepath.Dir(f)).videos = append(get(filepath.Dir(f)).videos, &videoPlan{src: f})
 		case o.filter.IsSubtitle(rel):
 			get(subtitleGroup(f)).subs = append(get(subtitleGroup(f)).subs, f)
+		case o.filter.Archive(rel):
+			archives = append(archives, f)
 		case o.extras:
 			if cat, dir, ok := o.filter.Extra(rel); ok {
 				extras = append(extras, extraFile{src: f, category: cat, release: filepath.Join(o.downloads, dir)})
@@ -512,7 +520,37 @@ func (o *Organizer) process(ctx context.Context, files []string, dry bool, opts 
 		}
 		results = append(results, o.extra(x, all, dry, opts))
 	}
+	for _, a := range archives {
+		if ctx.Err() != nil {
+			return results
+		}
+		if r, ok := o.archive(a); ok {
+			results = append(results, r)
+		}
+	}
 	return results
+}
+
+// archive reports a compressed video release as an error, so it shows up as
+// pending (and is notified) instead of being ignored. An archive is left
+// alone, like any other file, when its folder already holds a video (it was
+// extracted next to it) or when its name does not look like a video release
+// (software, music).
+func (o *Organizer) archive(src string) (Result, bool) {
+	rel := o.rel(src)
+	a, ok := parser.Analyze(rel)
+	if !ok || (a.Kind != parser.Episode && !slices.Contains(a.Signals, parser.SigReleaseTokens)) {
+		return Result{}, false
+	}
+	dir := filepath.Dir(src)
+	if entries, err := os.ReadDir(dir); err == nil {
+		for _, e := range entries {
+			if !e.IsDir() && o.filter.IsVideo(o.rel(filepath.Join(dir, e.Name()))) {
+				return Result{}, false
+			}
+		}
+	}
+	return Result{Source: rel, Status: jobs.StatusError, Error: errArchiveMsg}, true
 }
 
 // stem drops the extension: releases in .mkv and .mp4 of the same title are
