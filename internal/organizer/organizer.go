@@ -95,6 +95,7 @@ type Organizer struct {
 	noCopy    bool
 	ledger    *Ledger
 	pending   *Pending
+	aliases   *Aliases
 	notify    func(Result)
 	upgrade   bool
 	extras    bool
@@ -133,6 +134,9 @@ type Options struct {
 	Ledger *Ledger
 	// Pending tracks downloads that need attention; nil uses a fresh one.
 	Pending *Pending
+	// Aliases remembers manual identifications for files whose name reads
+	// the same way; nil uses a fresh one.
+	Aliases *Aliases
 	// Notify, when set, receives results worth telling the user about: new
 	// or changed pending items and successful placements (not "exists").
 	Notify func(Result)
@@ -159,8 +163,11 @@ func New(o Options) *Organizer {
 	if o.Pending == nil {
 		o.Pending = NewPending()
 	}
+	if o.Aliases == nil {
+		o.Aliases = NewAliases()
+	}
 	return &Organizer{
-		pending: o.Pending, notify: o.Notify, upgrade: o.AutoUpgrade, extras: o.LinkExtras, ambiguousBest: o.AmbiguousBest,
+		pending: o.Pending, aliases: o.Aliases, notify: o.Notify, upgrade: o.AutoUpgrade, extras: o.LinkExtras, ambiguousBest: o.AmbiguousBest,
 		hasMeta: hasMeta, assist: o.Assist, minConf: o.MinConfidence, language: o.Language,
 		downloads: o.DownloadsDir, movies: o.Movies, tv: o.TV, filter: o.Filter,
 		guard: o.Guard, meta: o.Meta, platform: o.Platform, syncer: o.Syncer,
@@ -455,6 +462,9 @@ type videoPlan struct {
 	// upgraded is set when this video replaced a lower-quality release; its
 	// subtitles then replace the old release's ones.
 	upgraded bool
+	// aliasKey is the parsed reading a manual identification of this video
+	// is remembered under (see Aliases).
+	aliasKey string
 }
 
 // extraFile is a video from a release's extras folder.
@@ -540,6 +550,9 @@ func (o *Organizer) process(ctx context.Context, files []string, dry bool, opts 
 				r = o.placeVideo(v, dry, opts)
 				if !dry {
 					o.remember(v, r)
+					if man != nil && placed(r.Status) {
+						o.aliases.Put(v.aliasKey, remembered(man))
+					}
 				}
 			}
 			// Subtitles and extras never follow a video that was not placed
@@ -909,27 +922,44 @@ func (o *Organizer) planVideo(ctx context.Context, v *videoPlan, opts OrganizeOp
 	// The parser's reading is kept for subtitle matching even when the
 	// ledger supplies the destination.
 	v.quality, v.media = a.Quality, a.Media
+	if ok {
+		v.aliasKey = aliasKey(a)
+	}
 	if !opts.Explicit {
 		if r, ok := o.fromLedger(v); ok {
 			return r
 		}
 	}
 	var id identity
-	if man != nil {
+	var why string
+	switch {
+	case man != nil:
+		// A manual identification may move the earlier placement.
 		if fi, err := os.Stat(v.src); err == nil {
 			if e, ok := o.ledger.Lookup(fi); ok {
 				v.prev = &e
 			}
 		}
-		var why string
-		if id, why = o.manualIdentity(ctx, a, ok, man); why != "" {
-			return Result{Source: rel, Status: jobs.StatusSkipped, Error: why}
+		id, why = o.manualIdentity(ctx, a, ok, man)
+	default:
+		// A name read like one identified by hand before gets the same
+		// identification; one that does not fit is identified as usual.
+		var remembered *manual
+		if ok {
+			remembered, why = o.alias(ctx, v.aliasKey)
 		}
-	} else {
-		var why string
-		if id, why = o.identify(ctx, rel, a, ok); why != "" {
-			return Result{Source: rel, Status: jobs.StatusSkipped, Error: why}
+		if remembered != nil {
+			id, why = o.manualIdentity(ctx, a, ok, remembered)
 		}
+		if why == errMetadataUnavailableMsg {
+			break
+		}
+		if remembered == nil || why != "" {
+			id, why = o.identify(ctx, rel, a, ok)
+		}
+	}
+	if why != "" {
+		return Result{Source: rel, Status: jobs.StatusSkipped, Error: why}
 	}
 	m := id.media
 	var tag string
@@ -949,6 +979,25 @@ func (o *Organizer) planVideo(ctx context.Context, v *videoPlan, opts OrganizeOp
 	}
 	v.media, v.resolvedBy, v.titleSource, v.identified = m, id.by, id.titleSource, id.match != nil
 	return Result{}
+}
+
+// alias resolves the identification remembered for key, if any. TMDB being
+// unreachable leaves the file pending (why); an identification TMDB no
+// longer accepts is ignored, and the file is identified automatically.
+func (o *Organizer) alias(ctx context.Context, key string) (*manual, string) {
+	ov, ok := o.aliases.Get(key)
+	if !ok {
+		return nil, ""
+	}
+	man, err := o.resolveOverride(ctx, &ov)
+	if errors.Is(err, ErrMetadataUnavailable) {
+		return nil, errMetadataUnavailableMsg
+	}
+	if err != nil {
+		o.log.Warn("remembered identification ignored", "kind", ov.Kind, "tmdb_id", ov.TMDBID, "err", err)
+		return nil, ""
+	}
+	return man, ""
 }
 
 var (

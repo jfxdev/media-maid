@@ -143,6 +143,8 @@ func run(log *slog.Logger) error {
 	ledger.OnChange = persist("ledger", ledger.Import, ledger.Export)
 	pending := organizer.NewPending()
 	pending.OnChange = persist("pending", pending.Import, pending.Export)
+	aliases := organizer.NewAliases()
+	aliases.OnChange = persist("aliases", aliases.Import, aliases.Export)
 
 	var notifier *notify.Notifier // nil disables notifications
 	var notifyFn func(organizer.Result)
@@ -212,7 +214,7 @@ func run(log *slog.Logger) error {
 		DownloadsDir: downloads, Movies: movies, TV: tv, Filter: filter, Guard: guard,
 		Meta: meta, Assist: resolver, MinConfidence: cfg.LLM.MinConfidence, Language: cfg.PreferredLanguage,
 		Platform: cfg.Platform, Syncer: syncer, History: history, Log: log, DryRun: cfg.DryRun,
-		Ledger: ledger, NoCopy: !cfg.CopyFallback, Pending: pending, Notify: notifyFn,
+		Ledger: ledger, NoCopy: !cfg.CopyFallback, Pending: pending, Aliases: aliases, Notify: notifyFn,
 		AutoUpgrade: cfg.AutoUpgrade, LinkExtras: cfg.LinkExtras, AmbiguousBest: cfg.AmbiguousBest,
 	})
 	log.Info("organizer", "auto_upgrade", cfg.AutoUpgrade, "link_extras", cfg.LinkExtras, "copy_fallback", cfg.CopyFallback,

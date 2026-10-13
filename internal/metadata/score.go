@@ -96,10 +96,25 @@ func Pick(title string, year int, cands []Result) (best Result, score, margin fl
 	return PickIn(title, year, "", cands)
 }
 
+// Popularity tie-break: among candidates scoring within MinMargin of the
+// best, one with at least minVotes TMDB votes and voteDominance times the
+// votes of every other such candidate is the clear pick ("Shameless" the US
+// series over a little-known namesake). Comparable entries (Dune 1984 and
+// 2021) stay a tie.
+const (
+	minVotes      = 100
+	voteDominance = 10
+)
+
 // PickIn is Pick for a title with an origin marker ("The Office US"):
 // candidates from that country are preferred over remakes from elsewhere.
+// A tie settled by popularity reports a margin of exactly MinMargin.
 func PickIn(title string, year int, country string, cands []Result) (best Result, score, margin float64, ok bool) {
-	second := 0.0
+	if len(cands) == 0 {
+		return Result{}, 0, 0, false
+	}
+	scores := make([]float64, len(cands))
+	top := 0
 	for i, c := range cands {
 		s := Score(title, year, c)
 		if country != "" && c.OriginCountry != "" {
@@ -109,21 +124,57 @@ func PickIn(title string, year int, country string, cands []Result) (best Result
 				s = max(s-0.15, 0)
 			}
 		}
-		switch {
-		case i == 0 || s > score:
-			if i > 0 {
-				second = score
-			}
-			best, score = c, s
-		case s > second:
+		scores[i] = s
+		if s > scores[top] {
+			top = i
+		}
+	}
+	second := 0.0
+	for i, s := range scores {
+		if i != top && s > second {
 			second = s
 		}
 	}
-	if len(cands) == 0 {
-		return Result{}, 0, 0, false
+	if i, ok := popular(cands, scores, scores[top]); ok {
+		return cands[i], scores[i], MinMargin, true
 	}
-	return best, score, score - second, true
+	return cands[top], scores[top], scores[top] - second, true
 }
+
+// popular returns the candidate that settles a tie by popularity (see
+// minVotes), if any. A tie needs at least two candidates within MinMargin
+// of the top score.
+func popular(cands []Result, scores []float64, topScore float64) (int, bool) {
+	var tied []int
+	for i, s := range scores {
+		if topScore-s < MinMargin {
+			tied = append(tied, i)
+		}
+	}
+	if len(tied) < 2 {
+		return 0, false
+	}
+	lead := tied[0]
+	for _, i := range tied[1:] {
+		if cands[i].VoteCount > cands[lead].VoteCount {
+			lead = i
+		}
+	}
+	if cands[lead].VoteCount < minVotes {
+		return 0, false
+	}
+	for _, i := range tied {
+		if i != lead && cands[i].VoteCount*voteDominance > cands[lead].VoteCount {
+			return 0, false
+		}
+	}
+	return lead, true
+}
+
+// Normalize folds a title the way scoring compares titles (lower case, no
+// accents or punctuation), for keys that must match the same title written
+// differently.
+func Normalize(title string) string { return strings.Join(fold(title), " ") }
 
 // Localized returns the official translated title for lang ("pt-BR" or "pt").
 // With a country, only a translation for that country (or one without a

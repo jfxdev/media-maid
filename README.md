@@ -152,7 +152,9 @@ disabled, the previous decision stands.
    the candidates, and waits in `/api/v1/pending` for a manual
    identification, instead of getting a possibly wrong ID
    (`AMBIGUOUS_MATCH=best` takes the best candidate anyway). When TMDB finds
-   nothing, the parser's reading is used without an ID. When TMDB cannot be
+   nothing, the parser's reading is used without an ID. A tie is settled by
+   popularity only when it is clear-cut: a candidate with at least 100 TMDB
+   votes and ten times the votes of every other tied one. When TMDB cannot be
    reached, the file is `skipped` (`metadata unavailable: ...`, pending) and
    organized again every 10 minutes until TMDB answers, so a short outage
    never leaves an episode in a folder without the ID next to the tagged one.
@@ -186,6 +188,13 @@ the wrong name before, that entry is removed once the new one is in place
 (`previous` names it; only while it still is the same file), and the ledger
 remembers the correction, so scans keep it. Subtitles linked next to the
 wrong entry stay behind; the orphan report lists the emptied folder.
+
+A placed manual identification is also remembered for the name's reading
+(kind, title, year and origin marker as parsed): once `Shameless.S01E01` was
+identified as the US series, `Shameless.S01E02` and the next episodes get the
+same entry without asking again (`resolved_by: manual`). A reading with a
+year or a country marker is a different one. A new manual identification of
+the same reading replaces the remembered one; previews remember nothing.
 
 Release shapes the parser understands besides plain names:
 
@@ -327,8 +336,9 @@ identification for files already placed, and leave alone a file whose library
 copy you deleted (it is `skipped`, quietly). An explicit `POST /api/v1/organize`
 ignores the ledger and links it again.
 
-`STATE_DIR` keeps the ledger, the pending list, the TMDB and LLM caches, the
-history and the last orphan report across restarts, so a restart costs no
+`STATE_DIR` keeps the ledger, the pending list, the remembered manual
+identifications, the TMDB and LLM caches, the history and the last orphan
+report across restarts, so a restart costs no
 TMDB or LLM calls for work already done and never links again a file you
 deleted from the library. Empty TMDB results expire after a day, so a title
 added to TMDB later is found. The folder is created if missing; it must be

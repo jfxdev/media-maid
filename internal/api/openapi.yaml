@@ -110,7 +110,9 @@ paths:
         identification for every video of the request (`resolved_by:
         manual`). When the file was placed before under another name, that
         earlier placement is removed once the new one is in place, but only
-        while it still is the same file (`previous` names it).
+        while it still is the same file (`previous` names it). A placed
+        manual identification is remembered for later files whose name reads
+        the same way (same kind, title, year and origin marker).
       operationId: organize
       requestBody: { $ref: "#/components/requestBodies/PathRequest" }
       responses:

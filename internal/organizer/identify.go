@@ -138,6 +138,8 @@ type manual struct {
 	match *metadata.Result
 	// fixed is set when the user typed the title: it is not localized.
 	fixed bool
+	// ov is the identification as requested, remembered as an Alias.
+	ov Override
 }
 
 // resolveOverride checks an Override against TMDB (when enabled) once for the
@@ -149,7 +151,7 @@ func (o *Organizer) resolveOverride(ctx context.Context, ov *Override) (*manual,
 	if ov.Kind != parser.Movie && ov.Kind != parser.Episode {
 		return nil, ErrInvalidOverride
 	}
-	m := &manual{kind: ov.Kind, title: strings.TrimSpace(ov.Title), year: ov.Year}
+	m := &manual{kind: ov.Kind, title: strings.TrimSpace(ov.Title), year: ov.Year, ov: *ov}
 	m.fixed = m.title != ""
 	kind := metaKind(ov.Kind)
 	switch {
