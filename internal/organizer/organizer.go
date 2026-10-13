@@ -221,6 +221,14 @@ type Override struct {
 
 func (o *Organizer) DownloadsDir() string { return o.downloads }
 
+// Exclusive runs fn while no placement is in progress (orphan removal uses it
+// so a folder is never deleted while a file is being linked into it).
+func (o *Organizer) Exclusive(fn func()) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	fn()
+}
+
 // Ledger returns the organize ledger.
 func (o *Organizer) Ledger() *Ledger { return o.ledger }
 

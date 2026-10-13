@@ -98,6 +98,7 @@ type Detector struct {
 	dryRun    bool
 	downloads string
 	ledger    *organizer.Ledger
+	exclusive func(func())
 
 	// OnChange, when set, is called after the report changes (see Export).
 	OnChange func()
@@ -121,6 +122,10 @@ type Options struct {
 	// copies (one link by design) apart from files missing from the library.
 	Downloads string
 	Ledger    *organizer.Ledger
+	// Exclusive, when set, runs a directory removal (with its revalidation)
+	// while the organizer places nothing, so a file linked into the folder in
+	// between is never deleted with it.
+	Exclusive func(func())
 }
 
 // New builds a Detector.
@@ -128,9 +133,30 @@ func New(o Options) *Detector {
 	return &Detector{
 		server: o.Server, pathMap: o.PathMap, libraries: o.Libraries, filter: o.Filter,
 		guard: o.Guard, history: o.History, log: o.Log, dryRun: o.DryRun,
-		downloads: o.Downloads, ledger: o.Ledger,
+		downloads: o.Downloads, ledger: o.Ledger, exclusive: o.Exclusive,
 		byID: map[string]Orphan{},
 	}
+}
+
+// metadataExts are files a media server or a user keeps next to a video
+// (artwork, nfo, notes). A folder holding only these, or nothing, is an
+// orphan; any other file (an ISO, a Blu-ray stream, a .strm, theme music)
+// is content and keeps the folder.
+var metadataExts = map[string]bool{
+	".nfo": true, ".jpg": true, ".jpeg": true, ".png": true, ".webp": true, ".gif": true,
+	".tbn": true, ".bif": true, ".xml": true, ".txt": true,
+	".srt": true, ".ass": true, ".ssa": true, ".sub": true, ".idx": true, ".vtt": true, ".sup": true,
+}
+
+// metadataNames are system files that never count as content.
+var metadataNames = map[string]bool{"thumbs.db": true, "desktop.ini": true, ".ds_store": true}
+
+// isMetadata reports whether the library file p is only metadata: artwork,
+// nfo, notes or a subtitle.
+func (d *Detector) isMetadata(p string) bool {
+	base := strings.ToLower(path.Base(p))
+	ext := path.Ext(base)
+	return metadataNames[base] || metadataExts[ext] || d.filter.Subtitle[ext]
 }
 
 func makeID(kind, key string) string {
@@ -431,12 +457,12 @@ func (d *Detector) checkItem(it integration.ServerItem) (*Orphan, *ReportError) 
 	}, nil
 }
 
-// orphanDirs returns the topmost directories (relative to root) that contain
-// no video anywhere in their tree. The root itself is never reported.
-// Symlinked directories are not followed.
+// orphanDirs returns the topmost directories (relative to root) that hold
+// nothing but metadata (see isMetadata) anywhere in their tree. The root
+// itself is never reported. Symlinked directories are not followed.
 func (d *Detector) orphanDirs(root *os.Root) ([]string, error) {
 	fsys := root.FS()
-	hasVideo := map[string]bool{}
+	hasContent := map[string]bool{}
 	var dirs []string
 	err := fs.WalkDir(fsys, ".", func(p string, e fs.DirEntry, err error) error {
 		if err != nil {
@@ -448,9 +474,9 @@ func (d *Detector) orphanDirs(root *os.Root) ([]string, error) {
 			}
 			return nil
 		}
-		if d.filter.Video[strings.ToLower(path.Ext(p))] {
+		if !d.isMetadata(p) {
 			for dir := path.Dir(p); ; dir = path.Dir(dir) {
-				hasVideo[dir] = true
+				hasContent[dir] = true
 				if dir == "." {
 					break
 				}
@@ -464,7 +490,7 @@ func (d *Detector) orphanDirs(root *os.Root) ([]string, error) {
 	sort.Strings(dirs)
 	var out []string
 	for _, dir := range dirs {
-		if hasVideo[dir] {
+		if hasContent[dir] {
 			continue
 		}
 		parentOrphan := false
@@ -562,25 +588,11 @@ func (d *Detector) removeOne(ctx context.Context, o Orphan) RemoveResult {
 			res.Status, res.Error = jobs.StatusError, "invalid_path"
 			return res
 		}
-		fi, err := lib.Root.Lstat(rel)
-		if err != nil || !fi.IsDir() {
-			// Gone, replaced by a symlink or a file: no longer the orphan we reported.
-			res.Status = jobs.StatusStale
-			return res
+		run := d.exclusive
+		if run == nil {
+			run = func(f func()) { f() }
 		}
-		if containsVideo(lib.Root, rel, d.filter) {
-			res.Status = jobs.StatusStale
-			return res
-		}
-		if d.dryRun {
-			res.Status = jobs.StatusDryRun
-			return res
-		}
-		if err := lib.Root.RemoveAll(rel); err != nil {
-			res.Status, res.Error = jobs.StatusError, err.Error()
-			return res
-		}
-		res.Status = jobs.StatusRemoved
+		run(func() { res = d.removeDir(*lib, rel, res) })
 		return res
 
 	case TypeUnlinkedDownload:
@@ -591,15 +603,39 @@ func (d *Detector) removeOne(ctx context.Context, o Orphan) RemoveResult {
 	return res
 }
 
-// containsVideo reports whether any allowlisted video exists under rel.
-// Walk errors count as "contains video" so nothing is removed on doubt.
-func containsVideo(root *os.Root, rel string, f organizer.Filter) bool {
+// removeDir revalidates and removes the orphan directory rel of lib.
+func (d *Detector) removeDir(lib organizer.Library, rel string, res RemoveResult) RemoveResult {
+	fi, err := lib.Root.Lstat(rel)
+	if err != nil || !fi.IsDir() {
+		// Gone, replaced by a symlink or a file: no longer the orphan we reported.
+		res.Status = jobs.StatusStale
+		return res
+	}
+	if d.containsContent(lib.Root, rel) {
+		res.Status = jobs.StatusStale
+		return res
+	}
+	if d.dryRun {
+		res.Status = jobs.StatusDryRun
+		return res
+	}
+	if err := lib.Root.RemoveAll(rel); err != nil {
+		res.Status, res.Error = jobs.StatusError, err.Error()
+		return res
+	}
+	res.Status = jobs.StatusRemoved
+	return res
+}
+
+// containsContent reports whether anything but metadata exists under rel.
+// Walk errors count as content so nothing is removed on doubt.
+func (d *Detector) containsContent(root *os.Root, rel string) bool {
 	found := false
 	err := fs.WalkDir(root.FS(), rel, func(p string, e fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		if !e.IsDir() && f.Video[strings.ToLower(path.Ext(p))] {
+		if !e.IsDir() && !d.isMetadata(p) {
 			found = true
 			return fs.SkipAll
 		}

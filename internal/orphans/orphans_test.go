@@ -390,3 +390,47 @@ func TestReportPersistence(t *testing.T) {
 		t.Error("directory not removed")
 	}
 }
+
+// Only folders holding nothing but metadata are orphans: an ISO, a Blu-ray
+// stream or a .strm keeps the folder, in the report and on removal. Removal
+// runs under the organizer's exclusive lock.
+func TestOrphanDirsKeepContent(t *testing.T) {
+	e := newEnv(t, false, false)
+	var locked int
+	e.det.exclusive = func(f func()) { locked++; f() }
+	for _, p := range []string{
+		filepath.Join(e.movies, "Disc (2000)", "Disc (2000).iso"),
+		filepath.Join(e.movies, "BD (2001)", "BDMV", "STREAM", "00001.m2ts"),
+		filepath.Join(e.movies, "Stream (2002)", "Stream (2002).strm"),
+		filepath.Join(e.movies, "Meta (2003)", "poster.jpg"),
+		filepath.Join(e.movies, "Meta (2003)", "movie.nfo"),
+		filepath.Join(e.movies, "Meta (2003)", "Meta (2003).pt-BR.srt"),
+		filepath.Join(e.movies, "Meta (2003)", "Thumbs.db"),
+	} {
+		write(t, p)
+	}
+	rep, err := e.det.Scan(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dirs []string
+	for _, o := range byType(rep)[TypeOrphanDirectory] {
+		dirs = append(dirs, o.Path)
+	}
+	if len(dirs) != 1 || dirs[0] != "movies/Meta (2003)" {
+		t.Fatalf("orphan dirs = %v", dirs)
+	}
+	id := byType(rep)[TypeOrphanDirectory][0].ID
+
+	// Content added after the report keeps the folder.
+	write(t, filepath.Join(e.movies, "Meta (2003)", "Meta (2003).iso"))
+	if res := e.det.Remove(context.Background(), []string{id}); res[0].Status != jobs.StatusStale {
+		t.Errorf("remove with content = %+v", res)
+	}
+	if _, err := os.Stat(filepath.Join(e.movies, "Meta (2003)", "Meta (2003).iso")); err != nil {
+		t.Error("content removed")
+	}
+	if locked != 1 {
+		t.Errorf("exclusive lock taken %d times, want 1", locked)
+	}
+}

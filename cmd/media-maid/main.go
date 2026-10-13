@@ -224,7 +224,7 @@ func run(log *slog.Logger) error {
 	det := orphans.New(orphans.Options{
 		Server: server, PathMap: cfg.PathMap, Libraries: []organizer.Library{movies, tv},
 		Filter: filter, Guard: guard, History: history, Log: log, DryRun: cfg.DryRun,
-		Downloads: downloads, Ledger: ledger,
+		Downloads: downloads, Ledger: ledger, Exclusive: org.Exclusive,
 	})
 	det.OnChange = persist("orphans", det.Import, det.Export)
 
