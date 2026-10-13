@@ -30,8 +30,9 @@ set `MEDIA_SERVER_TOKEN` and `MEDIA_MAID_API_TOKEN`, and run
 so hardlinks work (otherwise files are copied).
 
 Each instance is bound to **exactly one** media server (`INTEGRATION_MODE`).
-Multiple values or `JELLYFIN_*` / `EMBY_*` / `PLEX_*` variables abort startup;
-run one sidecar per server.
+Multiple values, or `JELLYFIN_*` / `EMBY_*` / `PLEX_*` variables of *another*
+server, abort startup; run one sidecar per server. Variables of the configured
+server (say `PLEX_CLAIM` from a shared env file) are ignored with a warning.
 
 ## Configuration
 
@@ -43,6 +44,7 @@ run one sidecar per server.
 | `API_TOKEN` | yes | — | bearer token for the API (≥ 32 chars) |
 | `DOWNLOADS_DIR` | yes | — | source folder |
 | `MOVIES_DIR` / `TV_DIR` | yes | — | library folders |
+| `STATE_DIR` | no | — | folder for caches, history, orphan report and the organize ledger, kept across restarts (see below); empty keeps everything in memory |
 | `TMDB_API_KEY` | no | — | TMDB v3 key or v4 token for canonical title/year/ID |
 | `PREFERRED_LANGUAGE` | no | — | BCP 47 tag (`pt-BR`, `es`) for localized folder names, see below |
 | `LLM_PROVIDER` | no | — | `openai` or `anthropic`; leave empty to disable the LLM layer |
@@ -53,9 +55,10 @@ run one sidecar per server.
 | `LLM_TIMEOUT` | no | `20s` | per request, at most `2m` |
 | `SERVER_PATH_MAP` | no | — | `server_prefix=local_prefix` when the server sees other paths |
 | `ORPHAN_SCAN_INTERVAL` | no | — | periodic orphan report (e.g. `24h`) |
+| `SCAN_INTERVAL` | no | — | periodic downloads scan (e.g. `15m`), a fallback when filesystem events are missed (NFS/SMB) |
 | `VIDEO_EXTENSIONS` | no | `mkv,mp4,avi,m4v,mov,wmv,ts,webm` | video allowlist |
 | `SUBTITLE_EXTENSIONS` | no | `srt,ass,ssa,sub,idx,vtt` | subtitle allowlist |
-| `SYNC_DEBOUNCE` | no | `30s` | coalesce links into one refresh |
+| `SYNC_DEBOUNCE` | no | `30s` | coalesce links into one refresh (never delayed more than 5×) |
 | `STABLE_SECONDS` | no | `30` | quiet time before a download counts as done |
 | `LISTEN_ADDR` | no | `:8080` | HTTP address |
 | `DRY_RUN` | no | `false` | never link or remove anything |
@@ -63,7 +66,8 @@ run one sidecar per server.
 ¹ Set both or neither; without them, sync and server-side orphan checks are off.
 ² `LLM_API_KEY` is required with the public endpoints (no `LLM_BASE_URL`);
 `LLM_MODEL` is required with `openai`.
-The three folders must be distinct, non-nested and inside mounted volumes.
+The folders (including `STATE_DIR`) must be distinct, non-nested and inside
+mounted volumes.
 
 ## API
 
@@ -75,7 +79,7 @@ Every `/api/v1/*` route requires `Authorization: Bearer $API_TOKEN`.
 | Method | Route | Description |
 |---|---|---|
 | `GET` | `/healthz` | liveness |
-| `POST` | `/api/v1/scan` | organize the whole downloads folder |
+| `POST` | `/api/v1/scan` | organize the whole downloads folder; `?async=true` answers `202` and logs to the history |
 | `POST` | `/api/v1/organize` | `{"path": "...", "overwrite": false}` organize one file/folder |
 | `POST` | `/api/v1/preview` | same as organize, without touching disk |
 | `GET` | `/api/v1/history` | recent actions and last sync |
@@ -84,12 +88,20 @@ Every `/api/v1/*` route requires `Authorization: Bearer $API_TOKEN`.
 | `GET` | `/api/v1/orphans` | latest report |
 | `POST` | `/api/v1/orphans/remove` | `{"ids": [...]}` remove reported orphans |
 
-qBittorrent hook (*Run external program on torrent finished*):
+The watcher already picks up finished downloads, so a torrent client hook is
+optional; it only saves the `STABLE_SECONDS` wait. For qBittorrent (*Run
+external program on torrent finished*), use
+[`examples/qbittorrent-hook.sh`](examples/qbittorrent-hook.sh):
 
 ```sh
-curl -s -X POST -H "Authorization: Bearer $API_TOKEN" \
-  -d "{\"path\":\"%N\"}" http://media-maid:8080/api/v1/organize
+/scripts/qbittorrent-hook.sh "%F"
 ```
+
+It passes the content path (`%F`, which works with categories and subfolders)
+JSON-encoded with `jq`. Mount the downloads folder at the same path in both
+containers. Never paste the torrent name into a JSON template by hand: the API
+rejects duplicate keys and trailing data, so a crafted name cannot add fields
+such as `overwrite`, but it would still break the request.
 
 ## How titles are resolved
 
@@ -116,6 +128,19 @@ disabled, the previous decision stands.
    libraries.
 
 Each organize result reports `resolved_by` (`parser`, `tmdb` or `llm`).
+
+Release shapes the parser understands besides plain names:
+
+- **Season packs** whose files only carry the episode (`Show.S01.COMPLETE/Show.E05.mkv`).
+- **Multi-file movies** (`CD1`, `Disc 2`, or `Part1` after the year): one
+  folder, files named `Title (Year) - part1.mkv`.
+- **Editions** (Extended, Director's Cut, Unrated, Theatrical, IMAX, …): the
+  title is searched without them; Plex gets `{edition-Extended Cut}`, Jellyfin
+  and Emby a ` - Extended Cut` version file in the movie's folder.
+- **Anime absolute numbering** (`[Group] Show - 1080`): with TMDB, the number
+  is mapped onto the series' seasons; without, it stays `S01E1080`.
+- **Origin markers** (`The Office US`): TMDB is searched for `The Office` and
+  the series from that country is preferred.
 
 What the LLM receives: the file name and at most two parent folders, the
 parser's reading and the TMDB candidates. Nothing else leaves the container.
@@ -156,12 +181,47 @@ result is `replaced`. This needs a filesystem with `renameat2`
 overwrite fails with an error instead of risking a race. Preview with `overwrite` reports
 `planned` with `"replaces": true`. The watcher and scans never overwrite.
 
+Without TMDB, two releases of equal quality that map to the same name may be
+different works (remakes sharing title and year); the second is reported as
+`conflict` instead of `duplicate`.
+
+## Watcher, restarts and persistence
+
+The watcher groups files by **release folder**, not by the first folder under
+`DOWNLOADS_DIR`: with torrent client categories (`downloads/movies/<release>`),
+each release is organized as soon as it is complete, whatever else is still
+downloading in the category. Loose files in a category folder are organized one
+by one.
+
+Every placed video is recorded in an **organize ledger** (by device and inode,
+so renames keep their entry). Automatic runs (watcher, scans) skip
+identification for files already placed, and leave alone a file whose library
+copy you deleted (it is `skipped`, quietly). An explicit `POST /api/v1/organize`
+ignores the ledger and links it again.
+
+With `STATE_DIR`, the ledger, the TMDB and LLM caches, the history and the last
+orphan report survive restarts, so a restart costs no TMDB or LLM calls for
+work already done. Empty TMDB results expire after a day, so a title added to
+TMDB later is found. The folder is created if missing; it must be writable
+and inside a mounted volume (the image runs with a read-only root), e.g.
+`STATE_DIR: /data/media-maid-state` as in the examples.
+
+After organizing, only the touched folders are refreshed on the server
+(`Library/Media/Updated` on Jellyfin/Emby, `sections/{id}/refresh?path=` on
+Plex); a full refresh is used for more than 50 folders or when that fails.
+
 ## Orphans
 
 - `server_item_missing_file`: the server lists an item whose files are all gone
   (only when every path is inside the managed libraries). Removal calls the
   server's delete endpoint.
+  The servers usually drop these on their own library scan (Plex with *Empty
+  trash automatically*); this report is a cross-check.
 - `orphan_directory`: a library folder with no video left. Removal deletes it.
+- `unlinked_download`: a video in `DOWNLOADS_DIR` with no other hard link, so
+  it is not in the library (deleted there, or never organized) and still uses
+  disk space. Report-only (`not_removable`): remove it in the torrent client.
+  Files copied across filesystems are recognized through the ledger.
 
 Nothing is removed automatically. Each ID is revalidated on removal and
 returns `stale` if it is no longer an orphan.
@@ -174,6 +234,8 @@ returns `stale` if it is no longer an orphan.
 - Source files are opened with `O_NOFOLLOW` and verified with `fstat`; library
   writes go through `os.Root`; existing files are only replaced on an explicit
   `"overwrite": true` request, atomically and never through a symlink.
+- Request bodies are strict JSON: unknown fields, duplicate keys and trailing
+  data are rejected, so values interpolated by hooks cannot inject fields.
 - Names from parsing, TMDB and the LLM are sanitized; server item IDs are
   validated. LLM answers are schema-checked and cross-checked against the
   file name and TMDB; `LLM_API_KEY` never appears in logs or errors.

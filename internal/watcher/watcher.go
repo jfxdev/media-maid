@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -94,14 +95,46 @@ func (w *Watcher) touch(p string) {
 	w.pending[p] = &pending{size: -1, lastEvent: now}
 }
 
-// topLevel returns the first path component under root (the "release").
-func (w *Watcher) topLevel(p string) string {
+// supportDir matches folders that belong to the release around them: seasons,
+// subtitles, samples and extras.
+var supportDir = regexp.MustCompile(`(?i)^(?:season[ ._-]?\d{1,4}|s\d{1,2}|temporada[ ._-]?\d{1,2}|specials|subs?|subtitles|legendas|samples?|extras|featurettes|trailers)$`)
+
+// unitOf returns the path organized for p: its release folder (the folder
+// holding it, above any season, subtitle or extras folder), or p itself when
+// that folder is the downloads root or a container of other releases, such as
+// a torrent client category ("downloads/movies/<release>"). A release is
+// therefore never held back by unrelated downloads that share a category.
+func (w *Watcher) unitOf(p string, containers map[string]bool) string {
 	r, err := filepath.Rel(w.root, p)
 	if err != nil || r == "." || strings.HasPrefix(r, "..") {
 		return ""
 	}
-	first, _, _ := strings.Cut(r, string(filepath.Separator))
-	return filepath.Join(w.root, first)
+	dir := filepath.Dir(p)
+	for dir != w.root && supportDir.MatchString(filepath.Base(dir)) {
+		dir = filepath.Dir(dir)
+	}
+	if dir == w.root || w.isContainer(dir, containers) {
+		return p
+	}
+	return dir
+}
+
+// isContainer reports whether dir holds other release folders (any
+// subfolder that is not a support folder). Results are memoized per flush.
+func (w *Watcher) isContainer(dir string, memo map[string]bool) bool {
+	if v, ok := memo[dir]; ok {
+		return v
+	}
+	entries, _ := os.ReadDir(dir)
+	v := false
+	for _, e := range entries {
+		if e.IsDir() && !supportDir.MatchString(e.Name()) && !strings.HasPrefix(e.Name(), ".") {
+			v = true
+			break
+		}
+	}
+	memo[dir] = v
+	return v
 }
 
 // worker organizes releases one at a time, off the event loop, so long copies
@@ -173,8 +206,11 @@ func (w *Watcher) handle(ev fsnotify.Event) {
 func (w *Watcher) flush() {
 	now := time.Now()
 	ready := map[string]bool{}
+	units := map[string]string{}
+	containers := map[string]bool{}
 	for p, e := range w.pending {
-		top := w.topLevel(p)
+		top := w.unitOf(p, containers)
+		units[p] = top
 		if top == "" {
 			delete(w.pending, p)
 			continue
@@ -206,7 +242,7 @@ func (w *Watcher) flush() {
 		}
 		w.queued[top] = true
 		for p := range w.pending {
-			if w.topLevel(p) == top {
+			if units[p] == top {
 				delete(w.pending, p)
 			}
 		}

@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jfxdev/media-maid/internal/integration"
 	"github.com/jfxdev/media-maid/internal/jobs"
@@ -48,7 +49,7 @@ func (f *fakeOrphans) Remove(_ context.Context, ids []string) []orphans.RemoveRe
 
 type disabledSyncer struct{}
 
-func (disabledSyncer) Request()                      {}
+func (disabledSyncer) Request(...string)             {}
 func (disabledSyncer) SyncNow(context.Context) error { return integration.ErrSyncDisabled }
 
 const token = "0123456789abcdef0123456789abcdef"
@@ -82,6 +83,7 @@ func TestAPI(t *testing.T) {
 		{"basic auth", "POST", "/api/v1/scan", "Basic " + token, "", 401, "unauthorized"},
 		{"token prefix", "POST", "/api/v1/scan", "Bearer " + token[:31], "", 401, "unauthorized"},
 		{"scan", "POST", "/api/v1/scan", bearer, "", 200, `"results":[]`},
+		{"scan bad async", "POST", "/api/v1/scan?async=maybe", bearer, "", 400, "invalid_request"},
 		{"organize", "POST", "/api/v1/organize", bearer, `{"path":"Movie.2010"}`, 200, "planned"},
 		{"traversal", "POST", "/api/v1/organize", bearer, `{"path":"../etc"}`, 400, "invalid_path"},
 		{"unauthorized volume", "POST", "/api/v1/organize", bearer, `{"path":"evil-link"}`, 403, "unauthorized_volume"},
@@ -90,6 +92,11 @@ func TestAPI(t *testing.T) {
 		{"overwrite not bool", "POST", "/api/v1/organize", bearer, `{"path":"a","overwrite":"yes"}`, 400, "invalid_request"},
 		{"unknown field", "POST", "/api/v1/organize", bearer, `{"path":"a","x":1}`, 400, "invalid_request"},
 		{"bad json", "POST", "/api/v1/organize", bearer, `{`, 400, "invalid_request"},
+		// A torrent name interpolated into {"path":"%N"} must not inject fields.
+		{"injected duplicate key", "POST", "/api/v1/organize", bearer, `{"path":"x","overwrite":true,"path":"y"}`, 400, "invalid_request"},
+		{"injected trailing data", "POST", "/api/v1/organize", bearer, `{"path":"x","overwrite":true}"}`, 400, "invalid_request"},
+		{"two objects", "POST", "/api/v1/organize", bearer, `{"path":"x"}{"path":"y"}`, 400, "invalid_request"},
+		{"nested duplicate", "POST", "/api/v1/orphans/remove", bearer, `{"ids":["a"],"ids":["b"]}`, 400, "invalid_request"},
 		{"too large", "POST", "/api/v1/organize", bearer, `{"path":"` + strings.Repeat("a", 70<<10) + `"}`, 400, "invalid_request"},
 		{"wrong method", "GET", "/api/v1/organize", bearer, "", 405, ""},
 		{"history", "GET", "/api/v1/history", bearer, "", 200, `"entries"`},
@@ -114,9 +121,46 @@ func TestAPI(t *testing.T) {
 		t.Errorf("preview options = %+v, want preview and overwrite", org.last)
 	}
 	do(t, h, "POST", "/api/v1/organize", bearer, `{"path":"x"}`)
-	if org.last.Preview || org.last.Overwrite {
-		t.Errorf("organize options = %+v, want neither preview nor overwrite", org.last)
+	if org.last.Preview || org.last.Overwrite || !org.last.Explicit {
+		t.Errorf("organize options = %+v, want explicit without preview or overwrite", org.last)
 	}
+}
+
+// blockingOrg holds Scan until release is closed.
+type blockingOrg struct {
+	fakeOrg
+	started chan struct{}
+	release chan struct{}
+}
+
+func (b *blockingOrg) Scan(ctx context.Context) ([]organizer.Result, error) {
+	b.started <- struct{}{}
+	<-b.release
+	return nil, nil
+}
+
+func TestAsyncScan(t *testing.T) {
+	org := &blockingOrg{started: make(chan struct{}, 1), release: make(chan struct{})}
+	h := New(token, org, &fakeOrphans{}, disabledSyncer{}, jobs.NewHistory(10), slog.New(slog.NewTextHandler(io.Discard, nil))).Handler()
+	bearer := "Bearer " + token
+	if code, body := do(t, h, "POST", "/api/v1/scan?async=true", bearer, ""); code != 202 || !strings.Contains(body, "started") {
+		t.Fatalf("async scan = %d %s", code, body)
+	}
+	<-org.started
+	if code, body := do(t, h, "POST", "/api/v1/scan?async=true", bearer, ""); code != 409 || !strings.Contains(body, "scan_running") {
+		t.Errorf("second scan = %d %s", code, body)
+	}
+	if code, _ := do(t, h, "POST", "/api/v1/scan", bearer, ""); code != 409 {
+		t.Errorf("sync scan during async = %d", code)
+	}
+	close(org.release)
+	for i := 0; i < 100; i++ {
+		if code, _ := do(t, h, "POST", "/api/v1/scan", bearer, ""); code == 200 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Error("scan never became available again")
 }
 
 func TestDocs(t *testing.T) {

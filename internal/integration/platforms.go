@@ -11,8 +11,12 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"path"
 	"sort"
 	"strconv"
+	"strings"
+
+	"github.com/jfxdev/media-maid/internal/naming"
 )
 
 // Endpoint is an HTTP method and path on the media server. A path may contain
@@ -34,6 +38,8 @@ type ServerItem struct {
 // and returns the response body. It is implemented by Client.
 type Requester interface {
 	Request(ctx context.Context, method, path string, query url.Values) ([]byte, error)
+	// Send is Request with a JSON body.
+	Send(ctx context.Context, method, path string, query url.Values, body []byte) ([]byte, error)
 }
 
 // PlatformSpec declares how to talk to one kind of media server.
@@ -42,8 +48,14 @@ type PlatformSpec struct {
 	AuthHeader string
 	// IDTagFormat renders a TMDB id into the folder tag the server understands.
 	IDTagFormat string
-	Sync        Endpoint
-	DeleteItem  Endpoint
+	// EditionTagFormat renders an edition label into a folder/file tag; empty
+	// when the server reads editions as " - Label" versions instead.
+	EditionTagFormat string
+	Sync             Endpoint
+	// SyncPaths refreshes only some folders (server paths); nil means the
+	// platform only supports a full refresh.
+	SyncPaths  func(ctx context.Context, r Requester, paths []string) error
+	DeleteItem Endpoint
 	// ListItems pages through the server library using the generic requester and
 	// decodes the platform response into ServerItems.
 	ListItems func(ctx context.Context, r Requester) ([]ServerItem, error)
@@ -57,6 +69,16 @@ func (s PlatformSpec) IDTag(tmdbID int) string {
 	return fmt.Sprintf(s.IDTagFormat, tmdbID)
 }
 
+// EditionTag returns the tag for an edition label, or "" when the server has no
+// edition tag or label is empty. The label is sanitized by the caller's
+// naming rules first, so only the tag's own braces are added.
+func (s PlatformSpec) EditionTag(label string) string {
+	if s.EditionTagFormat == "" || label == "" {
+		return ""
+	}
+	return fmt.Sprintf(s.EditionTagFormat, naming.Sanitize(label))
+}
+
 const pageSize = 500
 
 var platforms = map[string]PlatformSpec{
@@ -65,6 +87,7 @@ var platforms = map[string]PlatformSpec{
 		AuthHeader:  "X-Emby-Token",
 		IDTagFormat: "[tmdbid-%d]",
 		Sync:        Endpoint{http.MethodPost, "/Library/Refresh"},
+		SyncPaths:   mediaUpdated("/Library/Media/Updated"),
 		DeleteItem:  Endpoint{http.MethodDelete, "/Items/{id}"},
 		ListItems:   listEmbyStyle("/Items"),
 	},
@@ -73,6 +96,7 @@ var platforms = map[string]PlatformSpec{
 		AuthHeader:  "X-Emby-Token",
 		IDTagFormat: "[tmdbid=%d]",
 		Sync:        Endpoint{http.MethodPost, "/emby/Library/Refresh"},
+		SyncPaths:   mediaUpdated("/emby/Library/Media/Updated"),
 		DeleteItem:  Endpoint{http.MethodDelete, "/emby/Items/{id}"},
 		ListItems:   listEmbyStyle("/emby/Items"),
 	},
@@ -80,9 +104,12 @@ var platforms = map[string]PlatformSpec{
 		Name:        "plex",
 		AuthHeader:  "X-Plex-Token",
 		IDTagFormat: "{tmdb-%d}",
-		Sync:        Endpoint{http.MethodGet, "/library/sections/all/refresh"},
-		DeleteItem:  Endpoint{http.MethodDelete, "/library/metadata/{id}"},
-		ListItems:   listPlex,
+		// https://support.plex.tv/articles/multiple-editions/
+		EditionTagFormat: "{edition-%s}",
+		Sync:             Endpoint{http.MethodGet, "/library/sections/all/refresh"},
+		SyncPaths:        plexRefreshPaths,
+		DeleteItem:       Endpoint{http.MethodDelete, "/library/metadata/{id}"},
+		ListItems:        listPlex,
 	},
 }
 
@@ -100,6 +127,76 @@ func Modes() []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// mediaUpdated reports changed folders to Jellyfin/Emby, which then scan
+// only those ("Library/Media/Updated").
+func mediaUpdated(endpoint string) func(context.Context, Requester, []string) error {
+	return func(ctx context.Context, r Requester, paths []string) error {
+		type update struct {
+			Path       string `json:"Path"`
+			UpdateType string `json:"UpdateType"`
+		}
+		var body struct {
+			Updates []update `json:"Updates"`
+		}
+		for _, p := range paths {
+			body.Updates = append(body.Updates, update{Path: p, UpdateType: "Created"})
+		}
+		data, err := json.Marshal(body)
+		if err != nil {
+			return err
+		}
+		_, err = r.Send(ctx, http.MethodPost, endpoint, nil, data)
+		return err
+	}
+}
+
+// plexRefreshPaths refreshes each folder in the Plex section whose location
+// contains it ("sections/{id}/refresh?path=").
+func plexRefreshPaths(ctx context.Context, r Requester, paths []string) error {
+	body, err := r.Request(ctx, http.MethodGet, "/library/sections", nil)
+	if err != nil {
+		return err
+	}
+	var sections struct {
+		MediaContainer struct {
+			Directory []struct {
+				Key      string `json:"key"`
+				Location []struct {
+					Path string `json:"path"`
+				} `json:"Location"`
+			} `json:"Directory"`
+		} `json:"MediaContainer"`
+	}
+	if err := json.Unmarshal(body, &sections); err != nil {
+		return fmt.Errorf("decode sections: %w", err)
+	}
+	keys := make([]string, len(paths))
+	for i, p := range paths {
+		for _, d := range sections.MediaContainer.Directory {
+			for _, loc := range d.Location {
+				if loc.Path != "" && within(path.Clean(loc.Path), path.Clean(p)) {
+					keys[i] = d.Key
+				}
+			}
+		}
+		if keys[i] == "" {
+			return ErrNoTargetedSync
+		}
+	}
+	for i, p := range paths {
+		q := url.Values{"path": {p}}
+		if _, err := r.Request(ctx, http.MethodGet, "/library/sections/"+url.PathEscape(keys[i])+"/refresh", q); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// within reports whether p is root or inside it (slash-separated paths).
+func within(root, p string) bool {
+	return p == root || strings.HasPrefix(p, strings.TrimSuffix(root, "/")+"/")
 }
 
 // listEmbyStyle lists movies and episodes from Jellyfin/Emby's /Items endpoint.

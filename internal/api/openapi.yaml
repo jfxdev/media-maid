@@ -44,10 +44,39 @@ paths:
     post:
       tags: [organize]
       summary: Organize the whole downloads directory
+      description: |
+        Files already organized (recorded in the ledger) are not identified
+        again, and a file whose library copy was deleted is left alone
+        (`skipped`, not recorded in the history). One scan runs at a time.
       operationId: scan
+      parameters:
+        - name: async
+          in: query
+          required: false
+          description: |
+            `true` answers `202` at once; the outcome goes to the history
+            (`GET /api/v1/history`).
+          schema:
+            type: string
+            enum: ["true", "false"]
       responses:
         "200": { $ref: "#/components/responses/Results" }
+        "202":
+          description: The scan started in the background.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, const: started }
+                required: [status]
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "409":
+          description: "`scan_running`: another scan is in progress."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "500": { $ref: "#/components/responses/InternalError" }
   /api/v1/organize:
     post:
@@ -55,7 +84,9 @@ paths:
       summary: Organize one file or folder
       description: |
         `path` is relative to `DOWNLOADS_DIR` or absolute inside it.
-        Handy as a qBittorrent "run external program" hook.
+        Handy as a qBittorrent "run external program" hook. An explicit
+        request ignores the ledger: the files are identified again and
+        re-linked even if their library copy was deleted.
       operationId: organize
       requestBody: { $ref: "#/components/requestBodies/PathRequest" }
       responses:
@@ -85,7 +116,7 @@ paths:
       operationId: history
       responses:
         "200":
-          description: In-memory history.
+          description: Recent history (kept across restarts with `STATE_DIR`).
           content:
             application/json:
               schema:
@@ -233,7 +264,7 @@ components:
         application/json:
           schema: { $ref: "#/components/schemas/Report" }
     BadRequest:
-      description: "`invalid_request` (malformed JSON, unknown fields, body over 64 KiB) or `invalid_path`."
+      description: "`invalid_request` (malformed JSON, unknown fields, duplicate keys, trailing data, body over 64 KiB) or `invalid_path`."
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
@@ -272,6 +303,7 @@ components:
             - no_report
             - sync_disabled
             - sync_failed
+            - scan_running
             - internal_error
       required: [error]
     Result:
@@ -296,8 +328,10 @@ components:
             `exists` already in place; `conflict` destination holds different content
             (not overwritten without `overwrite`); `duplicate` another release of the
             same title in the same request has better quality (see `error`);
-            `planned` preview/dry run; `skipped` not identified or no matching video;
-            `error` see `error`.
+            `planned` preview/dry run; `skipped` not identified, no matching video,
+            or previously organized and since removed from the library; `error`
+            see `error`. Two unidentified releases of equal quality under the same
+            name are `conflict` rather than `duplicate`: they may be different titles.
         error: { type: string }
         replaces:
           type: boolean
@@ -352,11 +386,19 @@ components:
         id: { type: string }
         type:
           type: string
-          enum: [server_item_missing_file, orphan_directory]
+          enum: [server_item_missing_file, orphan_directory, unlinked_download]
           description: |
             `server_item_missing_file`: the media server lists the item but none of its
             files exist. `orphan_directory`: a library folder with no video in it.
-        path: { type: string }
+            `unlinked_download`: a downloaded video with no other hard link, so it is
+            not in the library but still uses disk space; report-only (removal
+            returns `error` / `not_removable`), the torrent client owns it.
+        path:
+          type: string
+          description: Library path (`movies/...`, `tv/...`) or `downloads/...`.
+        size:
+          type: integer
+          description: File size in bytes (`unlinked_download`).
         server_item_id: { type: string }
         title: { type: string }
         detected_at: { type: string, format: date-time }
@@ -375,5 +417,7 @@ components:
         status:
           type: string
           enum: [removed, stale, dry_run, error]
-        error: { type: string }
+        error:
+          type: string
+          description: "`not_removable` for report-only types, `sync_disabled`, or the failure."
       required: [id, status]

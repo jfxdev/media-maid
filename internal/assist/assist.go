@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -89,7 +90,7 @@ const (
 	maxOptions       = 30
 	maxPathRunes     = 300
 	maxTitleRunes    = 200
-	cacheSize        = 1024
+	cacheSize        = 4096
 	breakerThreshold = 5
 	breakerCooldown  = 5 * time.Minute
 )
@@ -107,6 +108,10 @@ type Client struct {
 	cache     map[[32]byte][]byte
 	failures  int
 	openUntil time.Time
+
+	// OnChange, when set, is called (without locks held) after the cache
+	// gains an entry, so the caller can persist Export.
+	OnChange func()
 }
 
 // New builds a Client.
@@ -288,6 +293,40 @@ func (c *Client) ask(ctx context.Context, t task, in, out any) error {
 		}
 		c.cache[key] = cached
 		c.mu.Unlock()
+		if c.OnChange != nil {
+			c.OnChange()
+		}
+	}
+	return nil
+}
+
+// Export returns the answer cache as JSON. Keys are hashes that include the
+// prompt version and model, so a changed prompt or model never reuses an old
+// answer; answers are validated again whenever they are used.
+func (c *Client) Export() ([]byte, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	m := make(map[string][]byte, len(c.cache))
+	for k, v := range c.cache {
+		m[hex.EncodeToString(k[:])] = v
+	}
+	return json.Marshal(m)
+}
+
+// Import loads a cache saved by Export.
+func (c *Client) Import(data []byte) error {
+	var m map[string][]byte
+	if err := json.Unmarshal(data, &m); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for k, v := range m {
+		var key [32]byte
+		if b, err := hex.DecodeString(k); err == nil && len(b) == len(key) && len(c.cache) < cacheSize {
+			copy(key[:], b)
+			c.cache[key] = v
+		}
 	}
 	return nil
 }

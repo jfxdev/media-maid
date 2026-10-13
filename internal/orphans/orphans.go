@@ -1,12 +1,14 @@
 // Package orphans detects library entries that no longer match the
-// filesystem: server items whose files are gone and directories without any
-// video. Removal only ever happens on explicit request, after revalidation.
+// filesystem: server items whose files are gone, directories without any
+// video, and downloads no longer linked into the library. Removal only ever
+// happens on explicit request, after revalidation, and never for downloads.
 package orphans
 
 import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io/fs"
 	"log/slog"
@@ -16,6 +18,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/jfxdev/media-maid/internal/config"
@@ -29,7 +32,14 @@ import (
 const (
 	TypeServerItemMissingFile = "server_item_missing_file"
 	TypeOrphanDirectory       = "orphan_directory"
+	// TypeUnlinkedDownload is a downloaded video with no other hard link: it
+	// is not (or no longer) in the library but still uses disk space. It is
+	// report-only; the torrent client owns those files.
+	TypeUnlinkedDownload = "unlinked_download"
 )
+
+// errNotRemovable is returned when removal of a report-only type is asked.
+const errNotRemovable = "not_removable"
 
 // Orphan is one detected inconsistency.
 type Orphan struct {
@@ -39,6 +49,9 @@ type Orphan struct {
 	ServerItemID string    `json:"server_item_id,omitempty"`
 	Title        string    `json:"title,omitempty"`
 	DetectedAt   time.Time `json:"detected_at"`
+
+	// Size is the file size of an unlinked download, in bytes.
+	Size int64 `json:"size,omitempty"`
 
 	library string   // library name ("movies"/"tv") for directories
 	rel     string   // path relative to the library root, for directories
@@ -83,6 +96,11 @@ type Detector struct {
 	history   *jobs.History
 	log       *slog.Logger
 	dryRun    bool
+	downloads string
+	ledger    *organizer.Ledger
+
+	// OnChange, when set, is called after the report changes (see Export).
+	OnChange func()
 
 	mu     sync.Mutex
 	report *Report
@@ -99,6 +117,10 @@ type Options struct {
 	History   *jobs.History
 	Log       *slog.Logger
 	DryRun    bool
+	// Downloads, when set, enables the unlinked download report. Ledger tells
+	// copies (one link by design) apart from files missing from the library.
+	Downloads string
+	Ledger    *organizer.Ledger
 }
 
 // New builds a Detector.
@@ -106,6 +128,7 @@ func New(o Options) *Detector {
 	return &Detector{
 		server: o.Server, pathMap: o.PathMap, libraries: o.Libraries, filter: o.Filter,
 		guard: o.Guard, history: o.History, log: o.Log, dryRun: o.DryRun,
+		downloads: o.Downloads, ledger: o.Ledger,
 		byID: map[string]Orphan{},
 	}
 }
@@ -172,6 +195,20 @@ func (d *Detector) Scan(ctx context.Context) (*Report, error) {
 		}
 	}
 
+	if d.downloads != "" {
+		unlinked, err := d.unlinkedDownloads(ctx, now)
+		if err != nil {
+			rep.Errors = append(rep.Errors, ReportError{Error: "downloads: " + err.Error()})
+		}
+		rep.Orphans = append(rep.Orphans, unlinked...)
+	}
+
+	d.setReport(rep)
+	d.log.Info("orphan scan finished", "orphans", len(rep.Orphans), "errors", len(rep.Errors), "server_check", rep.ServerCheck)
+	return d.Report(), nil
+}
+
+func (d *Detector) setReport(rep *Report) {
 	byID := make(map[string]Orphan, len(rep.Orphans))
 	for _, o := range rep.Orphans {
 		byID[o.ID] = o
@@ -179,8 +216,133 @@ func (d *Detector) Scan(ctx context.Context) (*Report, error) {
 	d.mu.Lock()
 	d.report, d.byID = rep, byID
 	d.mu.Unlock()
-	d.log.Info("orphan scan finished", "orphans", len(rep.Orphans), "errors", len(rep.Errors), "server_check", rep.ServerCheck)
-	return d.Report(), nil
+	if d.OnChange != nil {
+		d.OnChange()
+	}
+}
+
+// unlinkedDownloads lists videos in the downloads folder whose only hard link
+// is the download itself. Copies made across filesystems (recorded in the
+// ledger, with their library file still present) are not reported.
+func (d *Detector) unlinkedDownloads(ctx context.Context, now time.Time) ([]Orphan, error) {
+	var out []Orphan
+	err := filepath.WalkDir(d.downloads, func(p string, e fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if e.IsDir() {
+			if p != d.downloads && strings.HasPrefix(e.Name(), ".") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		rel, err := filepath.Rel(d.downloads, p)
+		if err != nil || !e.Type().IsRegular() || !d.filter.IsVideo(rel) {
+			return nil
+		}
+		fi, err := e.Info()
+		if err != nil {
+			return nil
+		}
+		st, ok := fi.Sys().(*syscall.Stat_t)
+		if !ok || st.Nlink != 1 {
+			return nil
+		}
+		if d.isCopy(fi) {
+			return nil
+		}
+		rel = filepath.ToSlash(rel)
+		out = append(out, Orphan{
+			ID:         makeID(TypeUnlinkedDownload, rel),
+			Type:       TypeUnlinkedDownload,
+			Path:       "downloads/" + rel,
+			Size:       fi.Size(),
+			DetectedAt: now,
+		})
+		return nil
+	})
+	return out, err
+}
+
+// isCopy reports whether fi was copied into the library and that copy is
+// still there.
+func (d *Detector) isCopy(fi os.FileInfo) bool {
+	e, ok := d.ledger.Lookup(fi)
+	if !ok || e.Status != jobs.StatusCopied {
+		return false
+	}
+	for _, lib := range d.libraries {
+		if lib.Name == e.Lib {
+			ok, err := exists(lib, e.Dest)
+			return ok || err != nil
+		}
+	}
+	return false
+}
+
+// persisted is the saved form of a report, including what removal needs.
+type persisted struct {
+	Report  *Report `json:"report"`
+	Details []struct {
+		ID      string   `json:"id"`
+		Library string   `json:"library,omitempty"`
+		Rel     string   `json:"rel,omitempty"`
+		Paths   []string `json:"paths,omitempty"`
+	} `json:"details"`
+}
+
+// Export returns the latest report as JSON (null before the first scan).
+func (d *Detector) Export() ([]byte, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	p := persisted{Report: d.report}
+	if d.report != nil {
+		for _, o := range d.report.Orphans {
+			p.Details = append(p.Details, struct {
+				ID      string   `json:"id"`
+				Library string   `json:"library,omitempty"`
+				Rel     string   `json:"rel,omitempty"`
+				Paths   []string `json:"paths,omitempty"`
+			}{o.ID, o.library, o.rel, o.paths})
+		}
+	}
+	return json.Marshal(p)
+}
+
+// Import restores a report saved by Export. Removal still revalidates each
+// entry, so a report from before a restart is as safe as a fresh one.
+func (d *Detector) Import(data []byte) error {
+	var p persisted
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	if p.Report == nil {
+		return nil
+	}
+	if p.Report.Orphans == nil {
+		p.Report.Orphans = []Orphan{}
+	}
+	byID := map[string]int{}
+	for i, o := range p.Report.Orphans {
+		byID[o.ID] = i
+	}
+	for _, det := range p.Details {
+		if i, ok := byID[det.ID]; ok {
+			o := &p.Report.Orphans[i]
+			o.library, o.rel, o.paths = det.Library, det.Rel, det.Paths
+		}
+	}
+	m := make(map[string]Orphan, len(p.Report.Orphans))
+	for _, o := range p.Report.Orphans {
+		m[o.ID] = o
+	}
+	d.mu.Lock()
+	d.report, d.byID = p.Report, m
+	d.mu.Unlock()
+	return nil
 }
 
 // locate maps a local absolute path to the managed library containing it.
@@ -333,6 +495,9 @@ func (d *Detector) Remove(ctx context.Context, ids []string) []RemoveResult {
 				d.report.Orphans = kept
 			}
 			d.mu.Unlock()
+			if d.OnChange != nil {
+				d.OnChange()
+			}
 		}
 		d.history.Add(jobs.Entry{Action: jobs.ActionOrphanRm, Source: o.Path, Status: res.Status, Error: res.Error})
 		out = append(out, res)
@@ -404,6 +569,10 @@ func (d *Detector) removeOne(ctx context.Context, o Orphan) RemoveResult {
 			return res
 		}
 		res.Status = jobs.StatusRemoved
+		return res
+
+	case TypeUnlinkedDownload:
+		res.Status, res.Error = jobs.StatusError, errNotRemovable
 		return res
 	}
 	res.Status, res.Error = jobs.StatusError, "unknown orphan type"

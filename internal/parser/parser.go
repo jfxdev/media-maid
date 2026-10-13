@@ -29,6 +29,13 @@ type Media struct {
 	Episodes []int  `json:"episodes,omitempty"`
 	// AirDate (YYYY-MM-DD) identifies date-based episodes; Season is then the year.
 	AirDate string `json:"air_date,omitempty"`
+	// Absolute is the absolute episode number of an anime-style release
+	// ("Show - 123"); Season and Episodes then hold the provisional S01E123.
+	Absolute int `json:"absolute,omitempty"`
+	// Part is the file part of a movie split across files (CD1, Part2).
+	Part int `json:"part,omitempty"`
+	// Edition is a cut or edition label ("Extended Cut", "Director's Cut").
+	Edition string `json:"edition,omitempty"`
 }
 
 // Analysis is a parse result plus how much it can be trusted.
@@ -41,6 +48,9 @@ type Analysis struct {
 	Signals []string `json:"signals,omitempty"`
 	// Alternatives are competing interpretations of the same name.
 	Alternatives []Media `json:"alternatives,omitempty"`
+	// Country is an origin marker at the end of the title ("US" in
+	// "The Office US"); see SplitCountry.
+	Country string `json:"country,omitempty"`
 }
 
 // Signals recorded in Analysis.Signals.
@@ -85,7 +95,7 @@ var (
 	reAirDate   = regexp.MustCompile(`\b((?:19|20)\d{2})[ -](\d{2})[ -](\d{2})\b`)
 	rePartOf    = regexp.MustCompile(`(?i)\b(?:(?:Part|Pt) ?(\d{1,2}) ?of ?(\d{1,2})|(\d{1,2}) ?of ?(\d{1,2}))\b`)
 	reAbsolute  = regexp.MustCompile(`^(.+?) - (\d{1,4})(?:v\d)?(?: |$)`)
-	reEpOnly    = regexp.MustCompile(`(?i)^(?:E|Ep|Episode|Episodio|Epis[oó]dio)\s?(\d{1,3})\b`)
+	reEpOnly    = regexp.MustCompile(`(?i)(?:^|\s)(?:E|Ep|Episode|Episodio|Epis[oó]dio)\s?(\d{1,3})\b`)
 	reSeasonDir = regexp.MustCompile(`(?i)^(?:Season|Temporada|Series|S)\s?(\d{1,2})$`)
 	reSeasonIn  = regexp.MustCompile(`(?i)\b(?:Season|Temporada|S)\s?(\d{1,2})\b`)
 	reSeasonTag = regexp.MustCompile(`(?i)\b(?:Complete\s)?(?:S\d{1,2}|Season\s?\d{1,2}|Temporada\s?\d{1,2})\b.*$`)
@@ -143,7 +153,11 @@ func Analyze(path string) (Analysis, bool) {
 	}
 
 	// Episode number only in the file name, season in the parent folder.
-	if em := reEpOnly.FindStringSubmatch(name); em != nil {
+	// "Show.Name.S01.COMPLETE/Show.Name.E05.mkv" works too: the title then
+	// comes from the folder, or from the file name before the marker.
+	if loc := reEpOnly.FindStringSubmatchIndex(name); loc != nil {
+		em := []string{"", name[loc[2]:loc[3]]}
+		prefix := name[:loc[0]]
 		np := normalize(parent)
 		sm := reSeasonDir.FindStringSubmatch(np)
 		if sm == nil {
@@ -152,17 +166,28 @@ func Analyze(path string) (Analysis, bool) {
 		}
 		if sm != nil {
 			title, year := showFromDirs(parent, grand)
-			if title != "" {
+			sig := SigTitleFromDir
+			if title == "" || isGeneric(title) {
+				title, year = cleanTitleYear(prefix)
+				sig = ""
+			}
+			if title != "" && !isGeneric(title) {
 				a.Media = Media{Kind: Episode, Title: title, Year: year, Season: atoi(sm[1]), Episodes: []int{atoi(em[1])}}
-				a.add(SigSeasonDir, SigTitleFromDir)
+				a.add(SigSeasonDir, sig)
 				return a.finish(), true
 			}
 		}
 	}
 
+	name, part := splitPart(name)
+	name, ed := splitEdition(name)
 	m, parens := parseMovie(name)
 	if m.Title == "" || isGeneric(m.Title) {
-		pm, pparens := parseMovie(normalize(parent))
+		pname, pped := splitEdition(normalize(parent))
+		if ed == "" {
+			ed = pped
+		}
+		pm, pparens := parseMovie(pname)
 		if pm.Title != "" && !isGeneric(pm.Title) {
 			if m.Year != 0 && pm.Year == 0 {
 				pm.Year = m.Year
@@ -174,6 +199,7 @@ func Analyze(path string) (Analysis, bool) {
 	if m.Title == "" {
 		return Analysis{}, false
 	}
+	m.Part, m.Edition = part, ed
 	a.Media = m
 	if parens {
 		a.add(SigYearInParens)
@@ -191,6 +217,7 @@ func (a *Analysis) add(sigs ...string) {
 
 // finish adds signals derived from the final media and computes Confidence.
 func (a *Analysis) finish() Analysis {
+	_, a.Country = SplitCountry(a.Title)
 	if a.Year > 0 {
 		a.add(SigYear)
 	} else if a.Kind == Movie {
@@ -270,7 +297,7 @@ func parseEpisode(name string, groupPrefix bool) (Media, string, bool) {
 			n := atoi(m[2])
 			if !(len(m[2]) == 4 && validYear(n)) && n > 0 {
 				title, year := cleanTitleYear(m[1])
-				return Media{Kind: Episode, Title: title, Year: year, Season: 1, Episodes: []int{n}}, SigAbsolute, true
+				return Media{Kind: Episode, Title: title, Year: year, Season: 1, Episodes: []int{n}, Absolute: n}, SigAbsolute, true
 			}
 		}
 	}

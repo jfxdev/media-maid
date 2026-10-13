@@ -2,13 +2,16 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/jfxdev/media-maid/internal/integration"
@@ -41,12 +44,20 @@ type Server struct {
 	syncer    integration.LibrarySyncer
 	history   *jobs.History
 	log       *slog.Logger
+
+	// bg bounds background work (async scans); it is cancelled at shutdown.
+	bg       context.Context
+	scanning atomic.Bool
 }
 
 // New builds the API server. token must already be validated.
 func New(token string, org Organizer, orph Orphans, syncer integration.LibrarySyncer, history *jobs.History, log *slog.Logger) *Server {
-	return &Server{token: []byte(token), organizer: org, orphans: orph, syncer: syncer, history: history, log: log}
+	return &Server{token: []byte(token), organizer: org, orphans: orph, syncer: syncer, history: history, log: log, bg: context.Background()}
 }
+
+// SetContext sets the context background work runs under (cancelled at
+// shutdown). Call it before serving.
+func (s *Server) SetContext(ctx context.Context) { s.bg = ctx }
 
 // Handler returns the HTTP handler.
 func (s *Server) Handler() http.Handler {
@@ -96,18 +107,106 @@ func (s *Server) auth(next http.Handler) http.Handler {
 	})
 }
 
+// decode reads exactly one JSON object into v. Unknown fields, duplicate keys
+// and trailing data are rejected, so a value interpolated into a JSON template
+// (e.g. a torrent name in a client hook) cannot smuggle in extra fields.
 func decode(w http.ResponseWriter, r *http.Request, v any) bool {
 	r.Body = http.MaxBytesReader(w, r.Body, maxBody)
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(v); err != nil {
+	body, err := io.ReadAll(r.Body)
+	if err == nil {
+		err = strictJSON(body)
+	}
+	if err == nil {
+		dec := json.NewDecoder(bytes.NewReader(body))
+		dec.DisallowUnknownFields()
+		err = dec.Decode(v)
+	}
+	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request")
 		return false
 	}
 	return true
 }
 
+var errDuplicateKey = errors.New("duplicate key")
+
+// strictJSON checks that data is a single JSON value without duplicate object
+// keys at any depth and without trailing data.
+func strictJSON(data []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := strictValue(dec); err != nil {
+		return err
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return errors.New("trailing data")
+	}
+	return nil
+}
+
+func strictValue(dec *json.Decoder) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	switch tok {
+	case json.Delim('{'):
+		seen := map[string]bool{}
+		for dec.More() {
+			k, err := dec.Token()
+			if err != nil {
+				return err
+			}
+			key, _ := k.(string)
+			if seen[key] {
+				return errDuplicateKey
+			}
+			seen[key] = true
+			if err := strictValue(dec); err != nil {
+				return err
+			}
+		}
+		_, err = dec.Token() // '}'
+		return err
+	case json.Delim('['):
+		for dec.More() {
+			if err := strictValue(dec); err != nil {
+				return err
+			}
+		}
+		_, err = dec.Token() // ']'
+		return err
+	}
+	return nil
+}
+
+// scan organizes the whole downloads folder. With ?async=true it answers 202
+// at once and the outcome goes to the history; one scan runs at a time.
 func (s *Server) scan(w http.ResponseWriter, r *http.Request) {
+	async := false
+	switch r.URL.Query().Get("async") {
+	case "", "false":
+	case "true":
+		async = true
+	default:
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	if !s.scanning.CompareAndSwap(false, true) {
+		writeError(w, http.StatusConflict, "scan_running")
+		return
+	}
+	if async {
+		go func() {
+			defer s.scanning.Store(false)
+			if _, err := s.organizer.Scan(s.bg); err != nil && s.bg.Err() == nil {
+				s.log.Error("background scan failed", "err", err)
+			}
+		}()
+		writeJSON(w, http.StatusAccepted, map[string]string{"status": "started"})
+		return
+	}
+	defer s.scanning.Store(false)
 	res, err := s.organizer.Scan(r.Context())
 	if err != nil {
 		s.fail(w, err)
@@ -125,7 +224,8 @@ func (s *Server) organize(preview bool) http.HandlerFunc {
 		if !decode(w, r, &req) {
 			return
 		}
-		res, err := s.organizer.Organize(r.Context(), req.Path, organizer.OrganizeOptions{Preview: preview, Overwrite: req.Overwrite})
+		opts := organizer.OrganizeOptions{Preview: preview, Overwrite: req.Overwrite, Explicit: true}
+		res, err := s.organizer.Organize(r.Context(), req.Path, opts)
 		if err != nil {
 			s.fail(w, err)
 			return

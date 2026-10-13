@@ -27,6 +27,7 @@ services:
       MEDIA_SERVER_URL: http://jellyfin:8096
       MEDIA_SERVER_TOKEN: ${MEDIA_SERVER_TOKEN:?}   # API key from Dashboard → API Keys
       API_TOKEN: ${MEDIA_MAID_API_TOKEN:?}          # >= 32 characters (openssl rand -hex 32)
+      STATE_DIR: /data/media-maid-state             # caches, history and ledger across restarts
       DOWNLOADS_DIR: /data/downloads
       MOVIES_DIR: /data/media/movies
       TV_DIR: /data/media/tv
@@ -38,6 +39,7 @@ services:
       # LLM_API_KEY: ${LLM_API_KEY}
       # LLM_MODEL: claude-opus-5-5
       # ORPHAN_SCAN_INTERVAL: 24h
+      # SCAN_INTERVAL: 15m                           # fallback when inotify misses events (NFS/SMB)
     ports:
       - "127.0.0.1:8080:8080"
     depends_on: [jellyfin]

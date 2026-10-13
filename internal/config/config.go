@@ -36,14 +36,30 @@ const (
 
 var reLanguage = regexp.MustCompile(`^[a-z]{2,3}(-[A-Z]{2}|-[0-9]{3})?$`)
 
-// foreignPrefixes are variables of specific servers. Media Maid is single
-// tenant and only accepts the generic MEDIA_SERVER_* variables.
-var foreignPrefixes = []string{"JELLYFIN_", "EMBY_", "PLEX_"}
+// serverPrefixes are variables of specific servers, by integration mode.
+// Media Maid is single tenant and only reads the generic MEDIA_SERVER_*
+// variables: a variable of the configured server (often from an env file
+// shared with that server, such as PLEX_CLAIM) is only a warning, one of
+// another server is an error.
+var serverPrefixes = map[string]string{"jellyfin": "JELLYFIN_", "emby": "EMBY_", "plex": "PLEX_"}
 
 // PathMap translates the server's view of a path to the local one.
 type PathMap struct {
 	Server string
 	Local  string
+}
+
+// ToServer maps a local path to the server's view of it, the inverse of
+// Translate. Paths outside the local prefix are returned unchanged.
+func (m *PathMap) ToServer(p string) string {
+	p = filepath.Clean(p)
+	if m == nil {
+		return p
+	}
+	if safepath.Within(m.Local, p) {
+		return filepath.Join(m.Server, strings.TrimPrefix(p, m.Local))
+	}
+	return p
 }
 
 // Translate maps a server path to a local path. Paths outside the server
@@ -61,14 +77,17 @@ func (m *PathMap) Translate(p string) string {
 
 // Config is the validated runtime configuration.
 type Config struct {
-	Mode               string
-	Platform           integration.PlatformSpec
-	ServerURL          string
-	ServerToken        string
-	APIToken           string
-	DownloadsDir       string
-	MoviesDir          string
-	TVDir              string
+	Mode         string
+	Platform     integration.PlatformSpec
+	ServerURL    string
+	ServerToken  string
+	APIToken     string
+	DownloadsDir string
+	MoviesDir    string
+	TVDir        string
+	// StateDir keeps caches, history and the organize ledger across
+	// restarts; empty keeps everything in memory.
+	StateDir           string
 	VideoExts          map[string]bool
 	SubtitleExts       map[string]bool
 	TMDBKey            string
@@ -76,10 +95,15 @@ type Config struct {
 	PreferredLanguage  string
 	PathMap            *PathMap
 	OrphanScanInterval time.Duration
-	SyncDebounce       time.Duration
-	StableDuration     time.Duration
-	ListenAddr         string
-	DryRun             bool
+	// ScanInterval runs a periodic downloads scan as a fallback for missed
+	// filesystem events (network filesystems); zero disables it.
+	ScanInterval   time.Duration
+	SyncDebounce   time.Duration
+	StableDuration time.Duration
+	ListenAddr     string
+	DryRun         bool
+	// Warnings are non-fatal configuration notes to log at startup.
+	Warnings []string
 }
 
 // LLMConfig configures the optional LLM decision layer. Provider is empty
@@ -93,6 +117,15 @@ type LLMConfig struct {
 	Timeout       time.Duration
 }
 
+// Roots returns the configured directories that must not overlap, by name.
+func (c *Config) Roots() map[string]string {
+	r := map[string]string{"DOWNLOADS_DIR": c.DownloadsDir, "MOVIES_DIR": c.MoviesDir, "TV_DIR": c.TVDir}
+	if c.StateDir != "" {
+		r["STATE_DIR"] = c.StateDir
+	}
+	return r
+}
+
 // SyncEnabled reports whether a media server is configured.
 func (c *Config) SyncEnabled() bool { return c.ServerURL != "" }
 
@@ -102,18 +135,24 @@ func Load(getenv func(string) string, environ []string) (*Config, error) {
 	var errs []error
 	fail := func(format string, a ...any) { errs = append(errs, fmt.Errorf(format, a...)) }
 
+	c := &Config{}
+
+	mode := strings.ToLower(strings.TrimSpace(getenv("INTEGRATION_MODE")))
 	for _, kv := range environ {
 		name, _, _ := strings.Cut(kv, "=")
-		for _, p := range foreignPrefixes {
-			if strings.HasPrefix(name, p) {
-				fail("%s is not supported: Media Maid is single tenant and uses INTEGRATION_MODE + MEDIA_SERVER_URL/MEDIA_SERVER_TOKEN; run one sidecar per media server", name)
+		for m, p := range serverPrefixes {
+			if !strings.HasPrefix(name, p) {
+				continue
+			}
+			if m == mode {
+				c.Warnings = append(c.Warnings, name+" is ignored: Media Maid reads MEDIA_SERVER_URL and MEDIA_SERVER_TOKEN")
+			} else {
+				fail("%s is not supported: Media Maid is single tenant (INTEGRATION_MODE=%s) and uses MEDIA_SERVER_URL/MEDIA_SERVER_TOKEN; run one sidecar per media server", name, mode)
 			}
 		}
 	}
 
-	c := &Config{}
-
-	c.Mode = strings.ToLower(strings.TrimSpace(getenv("INTEGRATION_MODE")))
+	c.Mode = mode
 	switch {
 	case c.Mode == "":
 		fail("INTEGRATION_MODE is required (one of %s)", strings.Join(integration.Modes(), ", "))
@@ -151,8 +190,11 @@ func Load(getenv func(string) string, environ []string) (*Config, error) {
 	c.DownloadsDir = requireAbs("DOWNLOADS_DIR", getenv, fail)
 	c.MoviesDir = requireAbs("MOVIES_DIR", getenv, fail)
 	c.TVDir = requireAbs("TV_DIR", getenv, fail)
+	if v := strings.TrimSpace(getenv("STATE_DIR")); v != "" {
+		c.StateDir = requireAbs("STATE_DIR", getenv, fail)
+	}
 	if c.DownloadsDir != "" && c.MoviesDir != "" && c.TVDir != "" {
-		if err := DistinctRoots(map[string]string{"DOWNLOADS_DIR": c.DownloadsDir, "MOVIES_DIR": c.MoviesDir, "TV_DIR": c.TVDir}); err != nil {
+		if err := DistinctRoots(c.Roots()); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -192,6 +234,10 @@ func Load(getenv func(string) string, environ []string) (*Config, error) {
 	c.OrphanScanInterval = parseDuration("ORPHAN_SCAN_INTERVAL", getenv, 0, fail)
 	if c.OrphanScanInterval < 0 || (c.OrphanScanInterval > 0 && c.OrphanScanInterval < time.Minute) {
 		fail("ORPHAN_SCAN_INTERVAL must be empty or at least 1m")
+	}
+	c.ScanInterval = parseDuration("SCAN_INTERVAL", getenv, 0, fail)
+	if c.ScanInterval < 0 || (c.ScanInterval > 0 && c.ScanInterval < time.Minute) {
+		fail("SCAN_INTERVAL must be empty or at least 1m")
 	}
 	c.SyncDebounce = parseDuration("SYNC_DEBOUNCE", getenv, defaultSyncDebounce, fail)
 	if c.SyncDebounce < 0 {

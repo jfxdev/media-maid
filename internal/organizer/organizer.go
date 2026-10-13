@@ -8,12 +8,14 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/jfxdev/media-maid/internal/assist"
 	"github.com/jfxdev/media-maid/internal/integration"
@@ -29,6 +31,9 @@ var ErrNotFound = errors.New("not found")
 
 // errUnauthorizedMsg is what callers see; the real target is never exposed.
 const errUnauthorizedMsg = "unauthorized_volume"
+
+// errRemovedMsg explains a skipped file whose library copy was deleted.
+const errRemovedMsg = "previously organized; removed from the library"
 
 // Library is a destination root (movies or tv).
 type Library struct {
@@ -54,7 +59,10 @@ type Organizer struct {
 	history   *jobs.History
 	log       *slog.Logger
 	dryRun    bool
+	ledger    *Ledger
 
+	// mu serializes placement (dedupe and writes). Identification, which
+	// may wait on TMDB or the LLM, runs outside it.
 	mu sync.Mutex
 }
 
@@ -78,6 +86,8 @@ type Options struct {
 	History  *jobs.History
 	Log      *slog.Logger
 	DryRun   bool
+	// Ledger remembers placed files across runs; nil uses a fresh one.
+	Ledger *Ledger
 }
 
 // New builds an Organizer.
@@ -86,11 +96,14 @@ func New(o Options) *Organizer {
 	if !hasMeta {
 		o.Meta = metadata.Noop{}
 	}
+	if o.Ledger == nil {
+		o.Ledger = NewLedger()
+	}
 	return &Organizer{
 		hasMeta: hasMeta, assist: o.Assist, minConf: o.MinConfidence, language: o.Language,
 		downloads: o.DownloadsDir, movies: o.Movies, tv: o.TV, filter: o.Filter,
 		guard: o.Guard, meta: o.Meta, platform: o.Platform, syncer: o.Syncer,
-		history: o.History, log: o.Log, dryRun: o.DryRun,
+		history: o.History, log: o.Log, dryRun: o.DryRun, ledger: o.Ledger,
 	}
 }
 
@@ -118,10 +131,20 @@ type OrganizeOptions struct {
 	// destination instead of reporting a conflict. Automatic runs (watcher,
 	// scan) never set it.
 	Overwrite bool
+	// Explicit marks a request for specific files (the organize API). It
+	// ignores the ledger: files are identified again, and re-linked even if
+	// their library copy was deleted. Automatic runs leave such files alone.
+	Explicit bool
+	// MinAge skips files modified more recently than this, so a periodic
+	// scan never picks up a download still being written.
+	MinAge time.Duration
 }
 
 // DownloadsDir returns the resolved downloads root.
 func (o *Organizer) DownloadsDir() string { return o.downloads }
+
+// Ledger returns the organize ledger.
+func (o *Organizer) Ledger() *Ledger { return o.ledger }
 
 // Scan organizes the whole downloads directory.
 func (o *Organizer) Scan(ctx context.Context) ([]Result, error) {
@@ -140,10 +163,6 @@ func (o *Organizer) Organize(ctx context.Context, input string, opts OrganizeOpt
 		return nil, err
 	}
 	dry := opts.Preview || o.dryRun
-	if !dry {
-		o.mu.Lock()
-		defer o.mu.Unlock()
-	}
 
 	lst, err := os.Lstat(p)
 	if err != nil {
@@ -169,26 +188,69 @@ func (o *Organizer) Organize(ctx context.Context, input string, opts OrganizeOpt
 		if err != nil {
 			return nil, err
 		}
+		if p == o.downloads && !dry && ctx.Err() == nil {
+			o.pruneLedger(files)
+		}
 	} else {
 		files = []string{p}
 	}
+	if opts.MinAge > 0 {
+		files = settled(files, opts.MinAge)
+	}
 
-	results := o.process(ctx, files, dry, opts.Overwrite)
-	changed := false
+	results := o.process(ctx, files, dry, opts)
+	var changed []string
 	for _, r := range results {
 		o.record(dry, r)
 		if r.Status == jobs.StatusLinked || r.Status == jobs.StatusCopied || r.Status == jobs.StatusReplaced {
-			changed = true
+			changed = append(changed, o.libraryDir(r.Dest))
 		}
 	}
-	if changed && o.syncer != nil {
-		o.syncer.Request()
+	if len(changed) > 0 && o.syncer != nil {
+		o.syncer.Request(changed...)
 	}
 	return results, nil
 }
 
+// libraryDir turns a result destination ("movies/A (2000)/A (2000).mkv") into
+// the absolute folder holding it, for a targeted library refresh.
+func (o *Organizer) libraryDir(dest string) string {
+	name, rel, _ := strings.Cut(dest, "/")
+	lib := o.movies
+	if name == o.tv.Name {
+		lib = o.tv
+	}
+	return filepath.Join(lib.Path, filepath.FromSlash(path.Dir(rel)))
+}
+
+// settled drops files modified within the last minAge.
+func settled(files []string, minAge time.Duration) []string {
+	cutoff := time.Now().Add(-minAge)
+	out := files[:0:0]
+	for _, f := range files {
+		if fi, err := os.Stat(f); err == nil && fi.ModTime().Before(cutoff) {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// pruneLedger drops entries for files no longer in the downloads folder.
+func (o *Organizer) pruneLedger(files []string) {
+	keep := map[string]bool{}
+	for _, f := range files {
+		if fi, err := os.Stat(f); err == nil {
+			if k, ok := fileKey(fi); ok {
+				keep[k] = true
+			}
+		}
+	}
+	o.ledger.Prune(keep)
+}
+
 func (o *Organizer) record(dry bool, r Result) {
-	if dry || r.Status == jobs.StatusExists {
+	// Unchanged outcomes would flood the history on every scan.
+	if dry || r.Status == jobs.StatusExists || r.Error == errRemovedMsg {
 		return
 	}
 	o.history.Add(jobs.Entry{Action: jobs.ActionOrganize, Source: r.Source, Dest: r.Dest, Status: r.Status, Error: r.Error})
@@ -238,13 +300,16 @@ type videoPlan struct {
 	lib     Library
 	dest    string // relative to lib root
 	result  Result // set when planning already decided the outcome
+	// identified is set when a TMDB entry backs the destination.
+	identified bool
 	// resolvedBy and titleSource explain the decision (see Result).
 	resolvedBy, titleSource string
 }
 
 var subsDirs = map[string]bool{"subs": true, "subtitles": true, "legendas": true, "sub": true}
 
-func (o *Organizer) process(ctx context.Context, files []string, dry, overwrite bool) []Result {
+func (o *Organizer) process(ctx context.Context, files []string, dry bool, opts OrganizeOptions) []Result {
+	overwrite := opts.Overwrite
 	type group struct {
 		videos []*videoPlan
 		subs   []string
@@ -283,13 +348,18 @@ func (o *Organizer) process(ctx context.Context, files []string, dry, overwrite 
 			if ctx.Err() != nil {
 				return results
 			}
-			v.result = o.planVideo(ctx, v)
+			v.result = o.planVideo(ctx, v, opts.Explicit)
 			if v.result.Status == "" {
 				planned = append(planned, v)
 			}
 		}
 	}
 	o.dedupe(planned)
+
+	if !dry {
+		o.mu.Lock()
+		defer o.mu.Unlock()
+	}
 
 	for _, k := range keys {
 		g := groups[k]
@@ -302,8 +372,13 @@ func (o *Organizer) process(ctx context.Context, files []string, dry, overwrite 
 				r = o.apply(v.src, v.lib, v.dest, dry, overwrite)
 				r.Kind = string(v.media.Kind)
 				r.ResolvedBy, r.TitleSource = v.resolvedBy, v.titleSource
+				if !dry {
+					o.remember(v, r)
+				}
 			}
-			if r.Status == jobs.StatusError || r.Status == jobs.StatusDuplicate {
+			// Subtitles never follow a video that was not placed by this run's
+			// decision (an error, or a release that lost the dedupe).
+			if r.Status == jobs.StatusError || r.Status == jobs.StatusDuplicate || r.Status == jobs.StatusSkipped || v.result.Status == jobs.StatusConflict {
 				v.dest = ""
 			}
 			results = append(results, r)
@@ -326,11 +401,20 @@ func (o *Organizer) dedupe(videos []*videoPlan) {
 		}
 	}
 	for _, v := range videos {
-		if w := best[v.lib.Name+"/"+v.dest]; w != v {
-			v.result = Result{
-				Source: o.rel(v.src), Dest: v.lib.Name + "/" + v.dest, Kind: string(v.media.Kind),
-				Status: jobs.StatusDuplicate, Error: "superseded by " + o.rel(w.src),
-			}
+		w := best[v.lib.Name+"/"+v.dest]
+		if w == v {
+			continue
+		}
+		v.result = Result{
+			Source: o.rel(v.src), Dest: v.lib.Name + "/" + v.dest, Kind: string(v.media.Kind),
+			Status: jobs.StatusDuplicate, Error: "superseded by " + o.rel(w.src),
+		}
+		// Without a TMDB entry, two releases of equal quality under the same
+		// name may be different works (remakes sharing title and year): that
+		// is not a quality decision to make silently.
+		if !v.identified && !w.identified && v.quality.Rank() == w.quality.Rank() {
+			v.result.Status = jobs.StatusConflict
+			v.result.Error = "same name as " + o.rel(w.src) + " and not identified by TMDB; may be a different title"
 		}
 	}
 }
@@ -363,10 +447,72 @@ func subtitleGroup(p string) string {
 	return dir
 }
 
-func (o *Organizer) planVideo(ctx context.Context, v *videoPlan) Result {
+// remember records a placed video in the ledger.
+func (o *Organizer) remember(v *videoPlan, r Result) {
+	switch r.Status {
+	case jobs.StatusLinked, jobs.StatusCopied, jobs.StatusReplaced, jobs.StatusExists:
+	default:
+		return
+	}
+	fi, err := os.Stat(v.src)
+	if err != nil {
+		return
+	}
+	status := r.Status
+	if status == jobs.StatusExists {
+		// Keep how it was first placed: a copy stays a copy.
+		if old, ok := o.ledger.Lookup(fi); ok {
+			status = old.Status
+		} else if dfi, err := v.lib.Root.Stat(v.dest); err == nil && os.SameFile(fi, dfi) {
+			status = jobs.StatusLinked
+		} else {
+			status = jobs.StatusCopied
+		}
+	}
+	o.ledger.Put(fi, LedgerEntry{
+		Lib: v.lib.Name, Dest: v.dest, Status: status, Kind: string(v.media.Kind),
+		ResolvedBy: v.resolvedBy, TitleSource: v.titleSource,
+	})
+}
+
+// fromLedger reuses the recorded placement of v, if any. A file whose library
+// copy is gone was removed on purpose: automatic runs leave it alone.
+func (o *Organizer) fromLedger(v *videoPlan) (Result, bool) {
+	fi, err := os.Stat(v.src)
+	if err != nil {
+		return Result{}, false
+	}
+	e, ok := o.ledger.Lookup(fi)
+	if !ok {
+		return Result{}, false
+	}
+	lib := o.movies
+	if e.Lib == o.tv.Name {
+		lib = o.tv
+	}
+	if _, err := lib.Root.Lstat(e.Dest); err != nil {
+		return Result{
+			Source: o.rel(v.src), Dest: lib.Name + "/" + e.Dest, Kind: e.Kind, Status: jobs.StatusSkipped,
+			Error: errRemovedMsg,
+		}, true
+	}
+	v.lib, v.dest, v.resolvedBy, v.titleSource = lib, e.Dest, e.ResolvedBy, e.TitleSource
+	v.media.Kind = parser.Kind(e.Kind)
+	v.identified = true // the decision was already made; never re-deduped as unidentified
+	return Result{}, true
+}
+
+func (o *Organizer) planVideo(ctx context.Context, v *videoPlan, explicit bool) Result {
 	rel := o.rel(v.src)
 	a, ok := parser.Analyze(rel)
-	v.quality = a.Quality
+	// The parser's reading is kept for subtitle matching even when the
+	// ledger supplies the destination.
+	v.quality, v.media = a.Quality, a.Media
+	if !explicit {
+		if r, ok := o.fromLedger(v); ok {
+			return r
+		}
+	}
 	id, ok := o.identify(ctx, rel, a, ok)
 	if !ok {
 		return Result{Source: rel, Status: jobs.StatusSkipped, Error: "could not identify title"}
@@ -382,9 +528,9 @@ func (o *Organizer) planVideo(ctx context.Context, v *videoPlan) Result {
 		v.dest = naming.EpisodePath(m, tag, filepath.Ext(v.src))
 	default:
 		v.lib = o.movies
-		v.dest = naming.MoviePath(m, tag, filepath.Ext(v.src))
+		v.dest = naming.MoviePath(m, tag, o.platform.EditionTag(m.Edition), filepath.Ext(v.src))
 	}
-	v.media, v.resolvedBy, v.titleSource = m, id.by, id.titleSource
+	v.media, v.resolvedBy, v.titleSource, v.identified = m, id.by, id.titleSource, id.match != nil
 	return Result{}
 }
 

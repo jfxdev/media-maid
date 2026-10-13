@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,6 +29,14 @@ type Result struct {
 	OriginalTitle string `json:"original_title,omitempty"`
 	Year          int    `json:"year,omitempty"`
 	TMDBID        int    `json:"tmdb_id"`
+	// OriginCountry is the first ISO 3166-1 origin country of a series.
+	OriginCountry string `json:"origin_country,omitempty"`
+}
+
+// Season is the episode count of one season of a series.
+type Season struct {
+	Number   int `json:"number"`
+	Episodes int `json:"episodes"`
 }
 
 // Title is an official title of an entry in some language or country.
@@ -45,6 +54,8 @@ type Provider interface {
 	Search(ctx context.Context, kind Kind, title string, year int) ([]Result, error)
 	// Titles returns the translations and alternative titles of an entry.
 	Titles(ctx context.Context, kind Kind, id int) ([]Title, error)
+	// Seasons returns the regular seasons (no specials) of a series in order.
+	Seasons(ctx context.Context, id int) ([]Season, error)
 }
 
 // MaxCandidates bounds how many search results are considered.
@@ -55,16 +66,63 @@ type Noop struct{}
 
 func (Noop) Search(context.Context, Kind, string, int) ([]Result, error) { return nil, nil }
 func (Noop) Titles(context.Context, Kind, int) ([]Title, error)          { return nil, nil }
+func (Noop) Seasons(context.Context, int) ([]Season, error)              { return nil, nil }
+
+// Cache lifetimes. An empty search result expires quickly so that a title
+// added to TMDB after a release came out is found on a later run.
+const (
+	searchTTL   = 30 * 24 * time.Hour
+	negativeTTL = 24 * time.Hour
+	titlesTTL   = 30 * 24 * time.Hour
+	seasonsTTL  = 24 * time.Hour
+	// maxCacheEntries bounds each cache; the oldest entries go first.
+	maxCacheEntries = 20000
+)
+
+type cached[T any] struct {
+	V  T         `json:"v"`
+	At time.Time `json:"at"`
+}
+
+// cache is a small TTL map. It is not safe for concurrent use: TMDB guards it.
+type cache[T any] map[string]cached[T]
+
+func (c cache[T]) get(key string, ttl time.Duration, now time.Time) (T, bool) {
+	e, ok := c[key]
+	if !ok || now.Sub(e.At) >= ttl {
+		var zero T
+		return zero, false
+	}
+	return e.V, true
+}
+
+func (c cache[T]) put(key string, v T, now time.Time) {
+	if len(c) >= maxCacheEntries {
+		oldest, at := "", now
+		for k, e := range c {
+			if e.At.Before(at) {
+				oldest, at = k, e.At
+			}
+		}
+		delete(c, oldest)
+	}
+	c[key] = cached[T]{V: v, At: now}
+}
 
 // TMDB queries The Movie Database API.
 type TMDB struct {
 	key     string
 	baseURL string
 	http    *http.Client
+	now     func() time.Time
 
-	mu     sync.Mutex
-	cache  map[string][]Result
-	titles map[string][]Title
+	mu       sync.Mutex
+	searches cache[[]Result]
+	titles   cache[[]Title]
+	seasons  cache[[]Season]
+	// OnChange, when set, is called (without locks held) after a cache update,
+	// so the caller can persist Export.
+	OnChange func()
 }
 
 // DefaultTMDBURL is the TMDB v3 API base.
@@ -76,22 +134,80 @@ func NewTMDB(key, baseURL string) *TMDB {
 		baseURL = DefaultTMDBURL
 	}
 	return &TMDB{
-		key:     key,
-		baseURL: strings.TrimRight(baseURL, "/"),
-		http:    &http.Client{Timeout: 10 * time.Second},
-		cache:   map[string][]Result{},
-		titles:  map[string][]Title{},
+		key:      key,
+		baseURL:  strings.TrimRight(baseURL, "/"),
+		http:     &http.Client{Timeout: 10 * time.Second},
+		now:      time.Now,
+		searches: cache[[]Result]{},
+		titles:   cache[[]Title]{},
+		seasons:  cache[[]Season]{},
+	}
+}
+
+// cacheFile is the persisted form of the caches (see Export and Import).
+type cacheFile struct {
+	Searches cache[[]Result] `json:"searches"`
+	Titles   cache[[]Title]  `json:"titles"`
+	Seasons  cache[[]Season] `json:"seasons"`
+}
+
+// Export returns the caches as JSON. It never contains the API key.
+func (t *TMDB) Export() ([]byte, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return json.Marshal(cacheFile{Searches: t.searches, Titles: t.titles, Seasons: t.seasons})
+}
+
+// Import loads caches saved by Export; expired entries are dropped.
+func (t *TMDB) Import(data []byte) error {
+	var f cacheFile
+	if err := json.Unmarshal(data, &f); err != nil {
+		return err
+	}
+	now := t.now()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for k, e := range f.Searches {
+		if now.Sub(e.At) < searchTTLFor(e.V) {
+			t.searches[k] = e
+		}
+	}
+	for k, e := range f.Titles {
+		if now.Sub(e.At) < titlesTTL {
+			t.titles[k] = e
+		}
+	}
+	for k, e := range f.Seasons {
+		if now.Sub(e.At) < seasonsTTL {
+			t.seasons[k] = e
+		}
+	}
+	return nil
+}
+
+func searchTTLFor(res []Result) time.Duration {
+	if len(res) == 0 {
+		return negativeTTL
+	}
+	return searchTTL
+}
+
+func (t *TMDB) changed() {
+	if t.OnChange != nil {
+		t.OnChange()
 	}
 }
 
 // Search queries /search/{movie,tv}. Transient failures are returned as
-// errors and not cached; the caller falls back to the parser result.
+// errors and not cached; the caller falls back to the parser result. An empty
+// result is cached for a day only.
 func (t *TMDB) Search(ctx context.Context, kind Kind, title string, year int) ([]Result, error) {
 	key := string(kind) + "|" + strings.ToLower(title) + "|" + strconv.Itoa(year)
+	now := t.now()
 	t.mu.Lock()
-	if c, ok := t.cache[key]; ok {
+	if e, ok := t.searches[key]; ok && now.Sub(e.At) < searchTTLFor(e.V) {
 		t.mu.Unlock()
-		return c, nil
+		return e.V, nil
 	}
 	t.mu.Unlock()
 
@@ -100,8 +216,9 @@ func (t *TMDB) Search(ctx context.Context, kind Kind, title string, year int) ([
 		return nil, err
 	}
 	t.mu.Lock()
-	t.cache[key] = res
+	t.searches.put(key, res, now)
 	t.mu.Unlock()
+	t.changed()
 	return res, nil
 }
 
@@ -116,13 +233,14 @@ func (t *TMDB) search(ctx context.Context, kind Kind, title string, year int) ([
 	}
 	var body struct {
 		Results []struct {
-			ID            int    `json:"id"`
-			Title         string `json:"title"`
-			Name          string `json:"name"`
-			OriginalTitle string `json:"original_title"`
-			OriginalName  string `json:"original_name"`
-			ReleaseDate   string `json:"release_date"`
-			FirstAirDate  string `json:"first_air_date"`
+			ID            int      `json:"id"`
+			Title         string   `json:"title"`
+			Name          string   `json:"name"`
+			OriginalTitle string   `json:"original_title"`
+			OriginalName  string   `json:"original_name"`
+			ReleaseDate   string   `json:"release_date"`
+			FirstAirDate  string   `json:"first_air_date"`
+			OriginCountry []string `json:"origin_country"`
 		} `json:"results"`
 	}
 	if err := t.get(ctx, "/search/"+string(kind), q, &body); err != nil {
@@ -138,6 +256,9 @@ func (t *TMDB) search(ctx context.Context, kind Kind, title string, year int) ([
 			continue
 		}
 		res := Result{Title: name, OriginalTitle: orig, TMDBID: r.ID}
+		if len(r.OriginCountry) > 0 {
+			res.OriginCountry = r.OriginCountry[0]
+		}
 		if len(date) >= 4 {
 			res.Year, _ = strconv.Atoi(date[:4])
 		}
@@ -152,8 +273,9 @@ func (t *TMDB) search(ctx context.Context, kind Kind, title string, year int) ([
 // Titles fetches translations and alternative titles in a single request.
 func (t *TMDB) Titles(ctx context.Context, kind Kind, id int) ([]Title, error) {
 	key := string(kind) + "|" + strconv.Itoa(id)
+	now := t.now()
 	t.mu.Lock()
-	if c, ok := t.titles[key]; ok {
+	if c, ok := t.titles.get(key, titlesTTL, now); ok {
 		t.mu.Unlock()
 		return c, nil
 	}
@@ -199,9 +321,60 @@ func (t *TMDB) Titles(ctx context.Context, kind Kind, id int) ([]Title, error) {
 		}
 	}
 	t.mu.Lock()
-	t.titles[key] = out
+	t.titles.put(key, out, now)
 	t.mu.Unlock()
+	t.changed()
 	return out, nil
+}
+
+// Seasons fetches the season list of a series (season 0, specials, excluded).
+func (t *TMDB) Seasons(ctx context.Context, id int) ([]Season, error) {
+	key := strconv.Itoa(id)
+	now := t.now()
+	t.mu.Lock()
+	if c, ok := t.seasons.get(key, seasonsTTL, now); ok {
+		t.mu.Unlock()
+		return c, nil
+	}
+	t.mu.Unlock()
+
+	var body struct {
+		Seasons []struct {
+			Number   int `json:"season_number"`
+			Episodes int `json:"episode_count"`
+		} `json:"seasons"`
+	}
+	if err := t.get(ctx, "/tv/"+key, url.Values{}, &body); err != nil {
+		return nil, err
+	}
+	var out []Season
+	for _, s := range body.Seasons {
+		if s.Number > 0 && s.Episodes > 0 {
+			out = append(out, Season{Number: s.Number, Episodes: s.Episodes})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Number < out[j].Number })
+	t.mu.Lock()
+	t.seasons.put(key, out, now)
+	t.mu.Unlock()
+	t.changed()
+	return out, nil
+}
+
+// AbsoluteToSeason maps an absolute episode number onto regular seasons. ok is
+// false when the number lies beyond the known episodes.
+func AbsoluteToSeason(seasons []Season, abs int) (season, episode int, ok bool) {
+	if abs < 1 {
+		return 0, 0, false
+	}
+	n := abs
+	for _, s := range seasons {
+		if n <= s.Episodes {
+			return s.Number, n, true
+		}
+		n -= s.Episodes
+	}
+	return 0, 0, false
 }
 
 func (t *TMDB) get(ctx context.Context, path string, q url.Values, into any) error {

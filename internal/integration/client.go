@@ -1,6 +1,7 @@
 package integration
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -47,6 +48,11 @@ func (c *Client) Spec() PlatformSpec { return c.spec }
 
 // Request performs an authenticated request. Errors never include the token.
 func (c *Client) Request(ctx context.Context, method, path string, query url.Values) ([]byte, error) {
+	return c.Send(ctx, method, path, query, nil)
+}
+
+// Send is Request with an optional JSON body.
+func (c *Client) Send(ctx context.Context, method, path string, query url.Values, body []byte) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
 	u, err := url.Parse(c.baseURL.String() + path)
@@ -54,12 +60,19 @@ func (c *Client) Request(ctx context.Context, method, path string, query url.Val
 		return nil, fmt.Errorf("invalid request path: %w", err)
 	}
 	u.RawQuery = query.Encode()
-	req, err := http.NewRequestWithContext(ctx, method, u.String(), nil)
+	var rd io.Reader
+	if body != nil {
+		rd = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, u.String(), rd)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set(c.spec.AuthHeader, c.token)
 	req.Header.Set("Accept", "application/json")
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	resp, err := c.http.Do(req)
 	if err != nil {
 		var uerr *url.Error
@@ -69,7 +82,7 @@ func (c *Client) Request(ctx context.Context, method, path string, query url.Val
 		return nil, fmt.Errorf("%s %s: request failed", method, path)
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize))
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize))
 	if err != nil {
 		return nil, fmt.Errorf("%s %s: read body: %w", method, path, err)
 	}
@@ -79,13 +92,26 @@ func (c *Client) Request(ctx context.Context, method, path string, query url.Val
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return nil, fmt.Errorf("%s %s: unexpected status %d", method, path, resp.StatusCode)
 	}
-	return body, nil
+	return respBody, nil
 }
 
 // Sync asks the server to rescan its libraries.
 func (c *Client) Sync(ctx context.Context) error {
 	_, err := c.Request(ctx, c.spec.Sync.Method, c.spec.Sync.Path, nil)
 	return err
+}
+
+// ErrNoTargetedSync is returned by SyncPaths when the platform (or the
+// server's library layout) cannot refresh just those paths.
+var ErrNoTargetedSync = errors.New("targeted refresh not available")
+
+// SyncPaths asks the server to rescan only the given folders (as the server
+// sees them).
+func (c *Client) SyncPaths(ctx context.Context, paths []string) error {
+	if c.spec.SyncPaths == nil {
+		return ErrNoTargetedSync
+	}
+	return c.spec.SyncPaths(ctx, c, paths)
 }
 
 // ListItems returns every movie/episode the server knows about.

@@ -343,3 +343,27 @@ func TestLocalize(t *testing.T) {
 }
 
 func slogTo(w io.Writer) *slog.Logger { return slog.New(slog.NewTextHandler(w, nil)) }
+
+func TestCachePersistence(t *testing.T) {
+	srv, reqs := server(t, func(int, captured) (int, string) { return 200, openAIReply(duneAnswer) })
+	c := newClient(t, ProviderOpenAI, srv.URL)
+	changes := 0
+	c.OnChange = func() { changes++ }
+	if _, err := c.Resolve(context.Background(), duneReq); err != nil {
+		t.Fatal(err)
+	}
+	data, err := c.Export()
+	if err != nil || changes != 1 || strings.Contains(string(data), secret) {
+		t.Fatalf("export = %s, changes %d, %v", data, changes, err)
+	}
+	restored := newClient(t, ProviderOpenAI, srv.URL)
+	if err := restored.Import(data); err != nil {
+		t.Fatal(err)
+	}
+	if d, err := restored.Resolve(context.Background(), duneReq); err != nil || d.Choice != 1 {
+		t.Fatalf("Resolve after import = %+v %v", d, err)
+	}
+	if len(*reqs) != 1 {
+		t.Errorf("requests = %d, want 1 (served from the imported cache)", len(*reqs))
+	}
+}

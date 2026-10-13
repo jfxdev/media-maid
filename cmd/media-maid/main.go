@@ -22,6 +22,7 @@ import (
 	"github.com/jfxdev/media-maid/internal/organizer"
 	"github.com/jfxdev/media-maid/internal/orphans"
 	"github.com/jfxdev/media-maid/internal/safepath"
+	"github.com/jfxdev/media-maid/internal/state"
 	"github.com/jfxdev/media-maid/internal/watcher"
 )
 
@@ -37,6 +38,9 @@ func run(log *slog.Logger) error {
 	cfg, err := config.Load(os.Getenv, os.Environ())
 	if err != nil {
 		return fmt.Errorf("invalid configuration:\n%w", err)
+	}
+	for _, w := range cfg.Warnings {
+		log.Warn("configuration", "warning", w)
 	}
 
 	mi, err := os.Open("/proc/self/mountinfo")
@@ -66,9 +70,49 @@ func run(log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	if err := config.DistinctRoots(map[string]string{"DOWNLOADS_DIR": downloads, "MOVIES_DIR": moviesDir, "TV_DIR": tvDir}); err != nil {
+	roots := map[string]string{"DOWNLOADS_DIR": downloads, "MOVIES_DIR": moviesDir, "TV_DIR": tvDir}
+	if cfg.StateDir != "" {
+		// Created on first start; it must still lie in a mounted volume.
+		if err := os.MkdirAll(cfg.StateDir, 0o700); err != nil {
+			return fmt.Errorf("STATE_DIR: %w", err)
+		}
+		stateDir, err := guard.ResolveRoot("STATE_DIR", cfg.StateDir)
+		if err != nil {
+			return err
+		}
+		roots["STATE_DIR"] = stateDir
+	}
+	if err := config.DistinctRoots(roots); err != nil {
 		return err
 	}
+	var store *state.Store // nil keeps everything in memory
+	if dir := roots["STATE_DIR"]; dir != "" {
+		if store, err = state.Open(dir); err != nil {
+			return err
+		}
+		defer store.Close()
+		log.Info("persistent state enabled", "dir", dir)
+	}
+	// Each persisted document is loaded now and saved a few seconds after it
+	// changes; everything is flushed at shutdown.
+	var savers []*state.Saver
+	persist := func(name string, imp func([]byte) error, exp func() ([]byte, error)) func() {
+		if data, err := store.Load(name); err != nil {
+			log.Warn("state load failed", "document", name, "err", err)
+		} else if data != nil {
+			if err := imp(data); err != nil {
+				log.Warn("state document ignored", "document", name, "err", err)
+			}
+		}
+		sv := store.Saver(name, 5*time.Second, exp, log)
+		savers = append(savers, sv)
+		return sv.Touch
+	}
+	defer func() {
+		for _, sv := range savers {
+			sv.Flush()
+		}
+	}()
 	moviesRoot, err := os.OpenRoot(moviesDir)
 	if err != nil {
 		return err
@@ -83,6 +127,9 @@ func run(log *slog.Logger) error {
 	tv := organizer.Library{Name: "tv", Path: tvDir, Root: tvRoot}
 
 	history := jobs.NewHistory(0)
+	history.OnChange = persist("history", history.Import, history.Export)
+	ledger := organizer.NewLedger()
+	ledger.OnChange = persist("ledger", ledger.Import, ledger.Export)
 
 	var client *integration.Client
 	if cfg.SyncEnabled() {
@@ -99,11 +146,14 @@ func run(log *slog.Logger) error {
 		log.Info("media server integration", "mode", cfg.Mode, "sync", "disabled")
 	}
 	syncer := integration.NewSyncer(client, cfg.SyncDebounce, history, log)
+	syncer.ToServer = cfg.PathMap.ToServer
 	defer syncer.Stop()
 
 	var meta metadata.Provider // nil disables the TMDB layer
 	if cfg.TMDBKey != "" {
-		meta = metadata.NewTMDB(cfg.TMDBKey, "")
+		tmdb := metadata.NewTMDB(cfg.TMDBKey, "")
+		tmdb.OnChange = persist("tmdb-cache", tmdb.Import, tmdb.Export)
+		meta = tmdb
 		log.Info("tmdb enrichment enabled")
 	}
 
@@ -116,6 +166,7 @@ func run(log *slog.Logger) error {
 		if err != nil {
 			return err
 		}
+		c.OnChange = persist("llm-cache", c.Import, c.Export)
 		resolver = c
 		log.Info("llm decision layer enabled", "provider", cfg.LLM.Provider, "model", c.Model(), "min_confidence", cfg.LLM.MinConfidence)
 	}
@@ -128,6 +179,7 @@ func run(log *slog.Logger) error {
 		DownloadsDir: downloads, Movies: movies, TV: tv, Filter: filter, Guard: guard,
 		Meta: meta, Assist: resolver, MinConfidence: cfg.LLM.MinConfidence, Language: cfg.PreferredLanguage,
 		Platform: cfg.Platform, Syncer: syncer, History: history, Log: log, DryRun: cfg.DryRun,
+		Ledger: ledger,
 	})
 
 	var server orphans.Server
@@ -137,7 +189,9 @@ func run(log *slog.Logger) error {
 	det := orphans.New(orphans.Options{
 		Server: server, PathMap: cfg.PathMap, Libraries: []organizer.Library{movies, tv},
 		Filter: filter, Guard: guard, History: history, Log: log, DryRun: cfg.DryRun,
+		Downloads: downloads, Ledger: ledger,
 	})
+	det.OnChange = persist("orphans", det.Import, det.Export)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -154,6 +208,25 @@ func run(log *slog.Logger) error {
 	}
 	go w.Run(ctx)
 
+	if cfg.ScanInterval > 0 {
+		// Fallback for missed filesystem events (network filesystems). Files
+		// still changing within STABLE_SECONDS are left for the next run.
+		go func() {
+			t := time.NewTicker(cfg.ScanInterval)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					if _, err := org.Organize(ctx, downloads, organizer.OrganizeOptions{MinAge: cfg.StableDuration}); err != nil && ctx.Err() == nil {
+						log.Warn("periodic scan failed", "err", err)
+					}
+				}
+			}
+		}()
+	}
+
 	if cfg.OrphanScanInterval > 0 {
 		go func() {
 			t := time.NewTicker(cfg.OrphanScanInterval)
@@ -169,7 +242,9 @@ func run(log *slog.Logger) error {
 		}()
 	}
 
-	srv := api.NewHTTPServer(cfg.ListenAddr, api.New(cfg.APIToken, org, det, syncer, history, log).Handler())
+	apiServer := api.New(cfg.APIToken, org, det, syncer, history, log)
+	apiServer.SetContext(ctx)
+	srv := api.NewHTTPServer(cfg.ListenAddr, apiServer.Handler())
 	errCh := make(chan error, 1)
 	go func() {
 		log.Info("listening", "addr", cfg.ListenAddr, "dry_run", cfg.DryRun)

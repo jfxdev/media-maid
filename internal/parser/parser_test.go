@@ -37,7 +37,7 @@ func TestParse(t *testing.T) {
 		// Years.
 		{"1917.2019.1080p.mkv", Media{Kind: Movie, Title: "1917", Year: 2019}},
 		{"1917.mkv", Media{Kind: Movie, Title: "1917"}},
-		{"Alien (1979) 2003 Director's Cut.mkv", Media{Kind: Movie, Title: "Alien", Year: 1979}},
+		{"Alien (1979) 2003 Director's Cut.mkv", Media{Kind: Movie, Title: "Alien", Year: 1979, Edition: "Director's Cut"}},
 		{"Future.Movie.2099.mkv", Media{Kind: Movie, Title: "Future Movie 2099"}},
 		// Episode formats.
 		{"Show.S01.E02.mkv", Media{Kind: Episode, Title: "Show", Season: 1, Episodes: []int{2}}},
@@ -51,8 +51,23 @@ func TestParse(t *testing.T) {
 		{"Lost.T02E07.mkv", Media{Kind: Episode, Title: "Lost", Season: 2, Episodes: []int{7}}},
 		{"Show - 1x02-03.mkv", Media{Kind: Episode, Title: "Show", Season: 1, Episodes: []int{2, 3}}},
 		{"The.Daily.Show.2024.03.15.Guest.720p.mkv", Media{Kind: Episode, Title: "The Daily Show", Season: 2024, AirDate: "2024-03-15"}},
-		{"[SubsPlease] Frieren - 12 (1080p) [ABCD1234].mkv", Media{Kind: Episode, Title: "Frieren", Season: 1, Episodes: []int{12}}},
+		{"[SubsPlease] Frieren - 12 (1080p) [ABCD1234].mkv", Media{Kind: Episode, Title: "Frieren", Season: 1, Episodes: []int{12}, Absolute: 12}},
+		// Season packs whose files only carry the episode number.
+		{"Show.Name.S01.COMPLETE/Show.Name.E05.mkv", Media{Kind: Episode, Title: "Show Name", Season: 1, Episodes: []int{5}}},
+		{"Season 2/Show.Name.E05.mkv", Media{Kind: Episode, Title: "Show Name", Season: 2, Episodes: []int{5}}},
+		// Multi-file movies.
+		{"Movie.Title.CD1.avi", Media{Kind: Movie, Title: "Movie Title", Part: 1}},
+		{"Movie.Title.2001.DVDRip.CD2.avi", Media{Kind: Movie, Title: "Movie Title", Year: 2001, Part: 2}},
+		{"Movie.Title.2001.1080p.Part2.mkv", Media{Kind: Movie, Title: "Movie Title", Year: 2001, Part: 2}},
+		{"Movie.Title.2001.pt1.mkv", Media{Kind: Movie, Title: "Movie Title", Year: 2001, Part: 1}},
+		// Editions.
+		{"Avatar.Extended.Cut.2009.mkv", Media{Kind: Movie, Title: "Avatar", Year: 2009, Edition: "Extended Cut"}},
+		{"Blade.Runner.1982.Final.Cut.1080p.mkv", Media{Kind: Movie, Title: "Blade Runner", Year: 1982, Edition: "Final Cut"}},
+		{"The.Final.Cut.2004.mkv", Media{Kind: Movie, Title: "The Final Cut", Year: 2004}},
+		{"Kingdom.of.Heaven.2005.Directors.Cut.mkv", Media{Kind: Movie, Title: "Kingdom of Heaven", Year: 2005, Edition: "Director's Cut"}},
+		{"Avatar (2009) Extended/movie.mkv", Media{Kind: Movie, Title: "Avatar", Year: 2009, Edition: "Extended Cut"}},
 		{"Planet.Earth.II.Part.2.of.6.mkv", Media{Kind: Episode, Title: "Planet Earth II", Season: 1, Episodes: []int{2}}},
+		{"Cosmos.A.Spacetime.Odyssey.Part.2.of.13.mkv", Media{Kind: Episode, Title: "Cosmos A Spacetime Odyssey", Season: 1, Episodes: []int{2}}},
 		{"Chernobyl.3of5.mkv", Media{Kind: Episode, Title: "Chernobyl", Season: 1, Episodes: []int{3}}},
 		{"Dune.Part.Two.2024.mkv", Media{Kind: Movie, Title: "Dune Part Two", Year: 2024}},
 		{"Harry.Potter.and.the.Deathly.Hallows.Part.1.2010.mkv", Media{Kind: Movie, Title: "Harry Potter and the Deathly Hallows Part 1", Year: 2010}},
@@ -132,5 +147,24 @@ func TestQuality(t *testing.T) {
 	high, _ := Analyze("The.Matrix.1999.1080p.HDTV.mkv")
 	if low.Quality.Rank() >= high.Quality.Rank() {
 		t.Error("resolution must outrank source")
+	}
+}
+
+func TestCountry(t *testing.T) {
+	tests := map[string]string{
+		"The.Office.US.S02E03.720p.mkv": "US",
+		"Shameless (UK) S01E01.mkv":     "UK",
+		"Us.2019.1080p.mkv":             "",
+		"Breaking.Bad.S01E02.720p.mkv":  "",
+		"Queer.as.Folk.US.S01E01.mkv":   "US",
+	}
+	for path, want := range tests {
+		a, ok := Analyze(path)
+		if !ok || a.Country != want {
+			t.Errorf("Analyze(%q).Country = %q, want %q", path, a.Country, want)
+		}
+	}
+	if title, c := SplitCountry("The Office US"); title != "The Office" || c != "US" {
+		t.Errorf("SplitCountry = %q, %q", title, c)
 	}
 }

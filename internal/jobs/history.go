@@ -2,6 +2,7 @@
 package jobs
 
 import (
+	"encoding/json"
 	"sync"
 	"time"
 )
@@ -52,6 +53,8 @@ type History struct {
 	next     int
 	full     bool
 	lastSync *SyncStatus
+	// OnChange, when set, is called (without locks held) after each change.
+	OnChange func()
 }
 
 // NewHistory returns a history holding at most capacity entries.
@@ -68,11 +71,14 @@ func (h *History) Add(e Entry) {
 		e.Time = time.Now().UTC()
 	}
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	h.entries[h.next] = e
 	h.next = (h.next + 1) % len(h.entries)
 	if h.next == 0 {
 		h.full = true
+	}
+	h.mu.Unlock()
+	if h.OnChange != nil {
+		h.OnChange()
 	}
 }
 
@@ -106,4 +112,39 @@ func (h *History) Snapshot() ([]Entry, *SyncStatus) {
 		last = &s
 	}
 	return out, last
+}
+
+type saved struct {
+	Entries  []Entry     `json:"entries"` // newest first
+	LastSync *SyncStatus `json:"last_sync,omitempty"`
+}
+
+// Export returns the history as JSON.
+func (h *History) Export() ([]byte, error) {
+	entries, last := h.Snapshot()
+	return json.Marshal(saved{Entries: entries, LastSync: last})
+}
+
+// Import restores a history saved by Export, keeping the newest entries that
+// fit. Call it before the history is used.
+func (h *History) Import(data []byte) error {
+	var s saved
+	if err := json.Unmarshal(data, &s); err != nil {
+		return err
+	}
+	if len(s.Entries) > len(h.entries) {
+		s.Entries = s.Entries[:len(h.entries)]
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.next, h.full = 0, false
+	for i := len(s.Entries) - 1; i >= 0; i-- {
+		h.entries[h.next] = s.Entries[i]
+		h.next = (h.next + 1) % len(h.entries)
+		if h.next == 0 {
+			h.full = true
+		}
+	}
+	h.lastSync = s.LastSync
+	return nil
 }

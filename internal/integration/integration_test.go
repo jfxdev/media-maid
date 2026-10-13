@@ -16,7 +16,7 @@ import (
 )
 
 type recorded struct {
-	method, path, query, token string
+	method, path, query, token, body string
 }
 
 type fakeServer struct {
@@ -28,8 +28,9 @@ type fakeServer struct {
 func newFake(t *testing.T, header string, routes map[string]string) *fakeServer {
 	f := &fakeServer{}
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
 		f.mu.Lock()
-		f.reqs = append(f.reqs, recorded{r.Method, r.URL.Path, r.URL.RawQuery, r.Header.Get(header)})
+		f.reqs = append(f.reqs, recorded{r.Method, r.URL.Path, r.URL.RawQuery, r.Header.Get(header), string(body)})
 		f.mu.Unlock()
 		if body, ok := routes[r.Method+" "+r.URL.Path]; ok {
 			io.WriteString(w, body)
@@ -51,11 +52,11 @@ var discard = slog.New(slog.NewTextHandler(io.Discard, nil))
 
 func TestSyncPerPlatform(t *testing.T) {
 	tests := []struct {
-		mode, method, path, header, tag string
+		mode, method, path, header, tag, edition string
 	}{
-		{"jellyfin", "POST", "/Library/Refresh", "X-Emby-Token", "[tmdbid-42]"},
-		{"emby", "POST", "/emby/Library/Refresh", "X-Emby-Token", "[tmdbid=42]"},
-		{"plex", "GET", "/library/sections/all/refresh", "X-Plex-Token", "{tmdb-42}"},
+		{"jellyfin", "POST", "/Library/Refresh", "X-Emby-Token", "[tmdbid-42]", ""},
+		{"emby", "POST", "/emby/Library/Refresh", "X-Emby-Token", "[tmdbid=42]", ""},
+		{"plex", "GET", "/library/sections/all/refresh", "X-Plex-Token", "{tmdb-42}", "{edition-Director's Cut}"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.mode, func(t *testing.T) {
@@ -68,6 +69,12 @@ func TestSyncPerPlatform(t *testing.T) {
 			}
 			if spec.IDTag(0) != "" {
 				t.Error("IDTag(0) should be empty")
+			}
+			if got := spec.EditionTag("Director's Cut"); got != tt.edition {
+				t.Errorf("EditionTag = %q, want %q", got, tt.edition)
+			}
+			if spec.EditionTag("") != "" {
+				t.Error("EditionTag(\"\") should be empty")
 			}
 			f := newFake(t, tt.header, map[string]string{tt.method + " " + tt.path: ""})
 			c, _ := NewClient(spec, f.srv.URL+"/", "secret")
@@ -177,5 +184,74 @@ func TestListAndDelete(t *testing.T) {
 				t.Error("invalid ids must not reach the server")
 			}
 		})
+	}
+}
+
+func TestTargetedSync(t *testing.T) {
+	plexSections := `{"MediaContainer":{"Directory":[{"key":"1","type":"movie","Location":[{"path":"/media/movies"}]},{"key":"2","type":"show","Location":[{"path":"/media/tv"}]}]}}`
+	tests := []struct {
+		mode, header string
+		routes       map[string]string
+		paths        []string
+		want         []recorded // method, path, query (token not compared)
+	}{
+		{"jellyfin", "X-Emby-Token", map[string]string{"POST /Library/Media/Updated": ""}, []string{"/data/media/movies/A (2000)"},
+			[]recorded{{method: "POST", path: "/Library/Media/Updated"}}},
+		{"emby", "X-Emby-Token", map[string]string{"POST /emby/Library/Media/Updated": ""}, []string{"/data/media/movies/A (2000)"},
+			[]recorded{{method: "POST", path: "/emby/Library/Media/Updated"}}},
+		{"plex", "X-Plex-Token", map[string]string{"GET /library/sections": plexSections, "GET /library/sections/2/refresh": ""}, []string{"/data/media/tv/Show/Season 01"},
+			[]recorded{{method: "GET", path: "/library/sections"}, {method: "GET", path: "/library/sections/2/refresh", query: "path=%2Fmedia%2Ftv%2FShow%2FSeason+01"}}},
+		// A folder outside every Plex section falls back to a full refresh.
+		{"plex", "X-Plex-Token", map[string]string{"GET /library/sections": plexSections, "GET /library/sections/all/refresh": ""}, []string{"/data/elsewhere"},
+			[]recorded{{method: "GET", path: "/library/sections"}, {method: "GET", path: "/library/sections/all/refresh"}}},
+		// A failing targeted refresh also falls back.
+		{"jellyfin", "X-Emby-Token", map[string]string{"POST /Library/Refresh": ""}, []string{"/data/media/movies/A (2000)"},
+			[]recorded{{method: "POST", path: "/Library/Media/Updated"}, {method: "POST", path: "/Library/Refresh"}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.mode, func(t *testing.T) {
+			spec, _ := Lookup(tt.mode)
+			f := newFake(t, tt.header, tt.routes)
+			c, _ := NewClient(spec, f.srv.URL, "tok")
+			h := jobs.NewHistory(10)
+			s := NewSyncer(c, 10*time.Millisecond, h, discard)
+			s.ToServer = func(p string) string { return strings.Replace(p, "/data/media", "/media", 1) }
+			s.Request(tt.paths...)
+			time.Sleep(150 * time.Millisecond)
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			if len(f.reqs) != len(tt.want) {
+				t.Fatalf("requests = %+v, want %+v", f.reqs, tt.want)
+			}
+			for i, w := range tt.want {
+				r := f.reqs[i]
+				if r.method != w.method || r.path != w.path || (w.query != "" && r.query != w.query) || r.token != "tok" {
+					t.Errorf("request %d = %+v, want %+v", i, r, w)
+				}
+			}
+			if tt.mode != "plex" && !strings.Contains(f.reqs[0].body, `"Path":"/media/movies/A (2000)"`) {
+				t.Errorf("body = %s", f.reqs[0].body)
+			}
+		})
+	}
+}
+
+func TestSyncMaxWait(t *testing.T) {
+	spec, _ := Lookup("jellyfin")
+	f := newFake(t, "X-Emby-Token", map[string]string{"POST /Library/Media/Updated": ""})
+	c, _ := NewClient(spec, f.srv.URL, "tok")
+	s := NewSyncer(c, 40*time.Millisecond, jobs.NewHistory(10), discard)
+	defer s.Stop()
+	// Requests every 20ms would postpone a plain debounce forever.
+	deadline := time.Now().Add(400 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		s.Request("/data/media/movies/A")
+		time.Sleep(20 * time.Millisecond)
+	}
+	f.mu.Lock()
+	n := len(f.reqs)
+	f.mu.Unlock()
+	if n < 1 {
+		t.Error("a steady stream of requests postponed the refresh indefinitely")
 	}
 }
