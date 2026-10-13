@@ -574,7 +574,8 @@ func (o *Organizer) archive(src string) (Result, bool) {
 func stem(dest string) string { return strings.TrimSuffix(dest, path.Ext(dest)) }
 
 // dedupe keeps a single video per destination: the best quality, then the
-// largest file. The others are reported as duplicates and left untouched.
+// largest file (placeVideo ranks a release already in the library the same
+// way). The others are reported as duplicates and left untouched.
 func (o *Organizer) dedupe(videos []*videoPlan) {
 	best := map[string]*videoPlan{}
 	for _, v := range videos {
@@ -685,13 +686,16 @@ func (o *Organizer) placeVideo(v *videoPlan, dry bool, opts OrganizeOptions) Res
 	overwrite, upgrade := false, false
 	if p != nil {
 		inLib := v.lib.Name + "/" + p.rel
+		// The same ranking as dedupe within a run (see better): quality,
+		// then file size.
 		rank, known := v.quality.Rank(), p.tracked && p.entry.Quality > 0
+		wins := known && (rank > p.entry.Quality || (rank == p.entry.Quality && srcFi.Size() > p.fi.Size()))
 		switch {
 		case opts.Overwrite:
 			overwrite = true
-		case known && rank > p.entry.Quality && o.upgrade:
+		case wins && o.upgrade:
 			overwrite, upgrade = true, true
-		case known && rank <= p.entry.Quality:
+		case known && !wins:
 			base.Status, base.Error = jobs.StatusDuplicate, "the library already has "+inLib+" at the same or better quality"
 			return base
 		case known:
