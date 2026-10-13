@@ -94,6 +94,23 @@ func TestArchiveFailsExplicitly(t *testing.T) {
 	}
 }
 
+// Once the archive is extracted next to itself, the video is organized and
+// the archive leaves the pending list.
+func TestArchiveExtractedLater(t *testing.T) {
+	e := newEnv(t, "jellyfin")
+	dir := filepath.Join(e.downloads, "Heat.1995.1080p.BluRay.x264-GRP")
+	write(t, filepath.Join(dir, "grp-heat.rar"))
+	e.org.Scan(context.Background())
+	if items := e.org.Pending(); len(items) != 1 || items[0].Error != errArchiveMsg {
+		t.Fatalf("pending = %+v", items)
+	}
+	write(t, filepath.Join(dir, "Heat.1995.1080p.BluRay.x264-GRP.mkv"))
+	e.org.Scan(context.Background())
+	if items := e.org.Pending(); len(items) != 0 {
+		t.Errorf("pending after extraction = %+v", items)
+	}
+}
+
 // Previews report the archive without recording it.
 func TestArchivePreview(t *testing.T) {
 	e := newEnv(t, "jellyfin")

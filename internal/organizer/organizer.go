@@ -526,6 +526,9 @@ func (o *Organizer) process(ctx context.Context, files []string, dry bool, opts 
 		}
 		if r, ok := o.archive(a); ok {
 			results = append(results, r)
+		} else if !dry {
+			// Extracted since it was reported: no longer pending.
+			o.pending.Resolve(o.rel(a))
 		}
 	}
 	return results
