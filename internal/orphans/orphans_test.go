@@ -27,6 +27,17 @@ func (f *fakeServer) ListItems(context.Context) ([]integration.ServerItem, error
 	return f.items, nil
 }
 
+func (f *fakeServer) GetItem(_ context.Context, id string) (integration.ServerItem, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, it := range f.items {
+		if it.ID == id {
+			return it, nil
+		}
+	}
+	return integration.ServerItem{}, integration.ErrNotFound
+}
+
 func (f *fakeServer) DeleteItem(_ context.Context, id string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -432,5 +443,49 @@ func TestOrphanDirsKeepContent(t *testing.T) {
 	}
 	if locked != 1 {
 		t.Errorf("exclusive lock taken %d times, want 1", locked)
+	}
+}
+
+// Removal checks the item as the server has it now, not the report's paths:
+// an item that moved outside the managed libraries, got its file back, or
+// disappeared is stale and never deleted.
+func TestRemoveServerItemRefetches(t *testing.T) {
+	e := newEnv(t, false, true)
+	e.server.items = []integration.ServerItem{
+		{ID: "1", Title: "Moved", Paths: []string{"/media/movies/Moved (2000)/Moved (2000).mkv"}},
+		{ID: "2", Title: "Back", Paths: []string{"/media/movies/Back (2001)/Back (2001).mkv"}},
+		{ID: "3", Title: "Gone", Paths: []string{"/media/movies/Gone (2002)/Gone (2002).mkv"}},
+		{ID: "4", Title: "Still", Paths: []string{"/media/movies/Still (2003)/Still (2003).mkv"}},
+	}
+	rep, err := e.det.Scan(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := map[string]string{}
+	for _, o := range byType(rep)[TypeServerItemMissingFile] {
+		ids[o.ServerItemID] = o.ID
+	}
+	if len(ids) != 4 {
+		t.Fatalf("orphans = %+v", rep.Orphans)
+	}
+
+	e.server.mu.Lock()
+	e.server.items = []integration.ServerItem{
+		{ID: "1", Title: "Moved", Paths: []string{"/elsewhere/Moved (2000).mkv"}},
+		{ID: "2", Title: "Back", Paths: []string{"/media/movies/Back (2001)/Back (2001).mkv"}},
+		{ID: "4", Title: "Still", Paths: []string{"/media/movies/Still (2003)/Still (2003).mkv"}},
+	}
+	e.server.mu.Unlock()
+	write(t, filepath.Join(e.movies, "Back (2001)", "Back (2001).mkv"))
+
+	res := e.det.Remove(context.Background(), []string{ids["1"], ids["2"], ids["3"], ids["4"]})
+	want := []string{jobs.StatusStale, jobs.StatusStale, jobs.StatusStale, jobs.StatusRemoved}
+	for i, r := range res {
+		if r.Status != want[i] {
+			t.Errorf("result %d = %+v, want %s", i, r, want[i])
+		}
+	}
+	if len(e.server.deleted) != 1 || e.server.deleted[0] != "4" {
+		t.Errorf("deleted = %v, want [4]", e.server.deleted)
 	}
 }

@@ -83,6 +83,9 @@ type RemoveResult struct {
 // Server is the subset of the integration client used here.
 type Server interface {
 	ListItems(ctx context.Context) ([]integration.ServerItem, error)
+	// GetItem returns the item as the server knows it now (removal checks
+	// the current paths, not the report's), or integration.ErrNotFound.
+	GetItem(ctx context.Context, id string) (integration.ServerItem, error)
 	DeleteItem(ctx context.Context, id string) error
 }
 
@@ -551,15 +554,21 @@ func (d *Detector) removeOne(ctx context.Context, o Orphan) RemoveResult {
 			res.Status, res.Error = jobs.StatusError, "sync_disabled"
 			return res
 		}
-		for _, p := range o.paths {
-			lib, rel, ok := d.locate(p)
-			if !ok {
-				continue
-			}
-			if ok, err := exists(lib, rel); err != nil || ok {
-				res.Status = jobs.StatusStale
-				return res
-			}
+		// The report may be old: check the item as the server has it now.
+		// Gone, moved, given a file, or with any path outside the managed
+		// libraries, it is no longer the orphan that was reported.
+		it, err := d.server.GetItem(ctx, o.ServerItemID)
+		if errors.Is(err, integration.ErrNotFound) {
+			res.Status = jobs.StatusStale
+			return res
+		}
+		if err != nil {
+			res.Status, res.Error = jobs.StatusError, err.Error()
+			return res
+		}
+		if cur, rerr := d.checkItem(it); rerr != nil || cur == nil {
+			res.Status = jobs.StatusStale
+			return res
 		}
 		if d.dryRun {
 			res.Status = jobs.StatusDryRun
