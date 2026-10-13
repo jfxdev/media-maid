@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 
@@ -340,6 +341,23 @@ func TestUnlinkedDownloads(t *testing.T) {
 	lfi, _ := os.Stat(libSwap)
 	ledger.Put(sfi, organizer.LedgerEntry{Lib: "movies", Dest: "Swapped (2005)/Swapped (2005).mkv", Status: jobs.StatusCopied, DestIno: organizer.Inode(lfi) + 1})
 
+	// Linked elsewhere too (a cross-seed folder), but its library link was
+	// deleted: still not in the library.
+	seeded := filepath.Join(downloads, "Seeded.2006.mkv")
+	write(t, seeded)
+	os.MkdirAll(filepath.Join(vol, "cross-seed"), 0o755)
+	if err := os.Link(seeded, filepath.Join(vol, "cross-seed", "Seeded.2006.mkv")); err != nil {
+		t.Fatal(err)
+	}
+	seededFi, _ := os.Stat(seeded)
+	ledger.Put(seededFi, organizer.LedgerEntry{Lib: "movies", Dest: "Seeded (2006)/Seeded (2006).mkv", Status: jobs.StatusLinked})
+	// Linked elsewhere and never organized by Media Maid: doubt, not reported.
+	foreign := filepath.Join(downloads, "Foreign.2007.mkv")
+	write(t, foreign)
+	if err := os.Link(foreign, filepath.Join(vol, "cross-seed", "Foreign.2007.mkv")); err != nil {
+		t.Fatal(err)
+	}
+
 	mr, _ := os.OpenRoot(movies)
 	defer mr.Close()
 	g, _ := safepath.NewGuard([]string{vol})
@@ -364,7 +382,8 @@ func TestUnlinkedDownloads(t *testing.T) {
 		}
 	}
 	sort.Strings(got)
-	if len(got) != 3 || got[0] != "downloads/Gone.2002/Gone.2002.mkv" || got[1] != "downloads/Replaced.2004.mkv" || got[2] != "downloads/Swapped.2005.mkv" {
+	want := []string{"downloads/Gone.2002/Gone.2002.mkv", "downloads/Replaced.2004.mkv", "downloads/Seeded.2006.mkv", "downloads/Swapped.2005.mkv"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("unlinked = %v (report %+v)", got, rep)
 	}
 	if res := det.Remove(context.Background(), []string{id}); res[0].Status != jobs.StatusError || res[0].Error != errNotRemovable {

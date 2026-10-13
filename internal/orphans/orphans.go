@@ -277,10 +277,17 @@ func (d *Detector) unlinkedDownloads(ctx context.Context, now time.Time) ([]Orph
 			return nil
 		}
 		st, ok := fi.Sys().(*syscall.Stat_t)
-		if !ok || st.Nlink != 1 {
+		if !ok {
 			return nil
 		}
-		if d.isCopy(fi) {
+		// Another hard link only proves the file is linked somewhere (a
+		// cross-seed folder, say), not in the library: a download whose
+		// recorded placement was deleted or replaced is reported anyway.
+		// Without a record, doubt keeps it out of the report.
+		if st.Nlink != 1 && !d.placementGone(fi) {
+			return nil
+		}
+		if st.Nlink == 1 && d.isCopy(fi) {
 			return nil
 		}
 		rel = filepath.ToSlash(rel)
@@ -320,6 +327,29 @@ func (d *Detector) isCopy(fi os.FileInfo) bool {
 		// no longer in use.
 		return cur.Mode().IsRegular() && cur.Size() == fi.Size() && cur.ModTime().Equal(fi.ModTime()) &&
 			(e.DestIno == 0 || e.DestIno == organizer.Inode(cur))
+	}
+	return false
+}
+
+// placementGone reports whether the ledger placed fi in a library and that
+// placement is no longer there: deleted, or replaced by another file.
+func (d *Detector) placementGone(fi os.FileInfo) bool {
+	e, ok := d.ledger.Lookup(fi)
+	if !ok {
+		return false
+	}
+	for _, lib := range d.libraries {
+		if lib.Name != e.Lib {
+			continue
+		}
+		cur, err := lib.Root.Lstat(e.Dest)
+		if errors.Is(err, fs.ErrNotExist) {
+			return true
+		}
+		if err != nil || os.SameFile(cur, fi) {
+			return false
+		}
+		return !(e.Status == jobs.StatusCopied && d.isCopy(fi))
 	}
 	return false
 }
