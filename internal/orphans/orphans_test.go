@@ -321,14 +321,34 @@ func TestUnlinkedDownloads(t *testing.T) {
 	data, _ := os.ReadFile(copied)
 	os.WriteFile(libCopy, data, 0o644)
 	os.Chtimes(libCopy, fi.ModTime(), fi.ModTime())
+	cfi, _ := os.Stat(libCopy)
 	ledger := organizer.NewLedger()
-	ledger.Put(fi, organizer.LedgerEntry{Lib: "movies", Dest: "Copied (2003)/Copied (2003).mkv", Status: jobs.StatusCopied})
-	// A copy since replaced by another release (an upgrade) no longer counts.
+	ledger.Put(fi, organizer.LedgerEntry{Lib: "movies", Dest: "Copied (2003)/Copied (2003).mkv", Status: jobs.StatusCopied, DestIno: organizer.Inode(cfi)})
+	// A copy since replaced by another release (an upgrade) no longer counts,
+	// even with the same size and mtime. The recorded copy is kept aside so
+	// the new file cannot reuse its inode.
 	replaced := filepath.Join(downloads, "Replaced.2004.mkv")
 	write(t, replaced)
-	write(t, filepath.Join(movies, "Replaced (2004)", "Replaced (2004).mkv"))
 	rfi, _ := os.Stat(replaced)
-	ledger.Put(rfi, organizer.LedgerEntry{Lib: "movies", Dest: "Replaced (2004)/Replaced (2004).mkv", Status: jobs.StatusCopied})
+	libReplaced := filepath.Join(movies, "Replaced (2004)", "Replaced (2004).mkv")
+	write(t, libReplaced)
+	os.Chtimes(libReplaced, rfi.ModTime(), rfi.ModTime())
+	ofi, _ := os.Stat(libReplaced)
+	if err := os.Rename(libReplaced, filepath.Join(vol, "replaced-copy.mkv")); err != nil {
+		t.Fatal(err)
+	}
+	write(t, libReplaced)
+	os.Chtimes(libReplaced, rfi.ModTime(), rfi.ModTime())
+	ledger.Put(rfi, organizer.LedgerEntry{Lib: "movies", Dest: "Replaced (2004)/Replaced (2004).mkv", Status: jobs.StatusCopied, DestIno: organizer.Inode(ofi)})
+	// A copy recorded without the library file's inode is never trusted on
+	// size and mtime alone.
+	unknown := filepath.Join(downloads, "Unknown.2008.mkv")
+	write(t, unknown)
+	ufi, _ := os.Stat(unknown)
+	libUnknown := filepath.Join(movies, "Unknown (2008)", "Unknown (2008).mkv")
+	write(t, libUnknown)
+	os.Chtimes(libUnknown, ufi.ModTime(), ufi.ModTime())
+	ledger.Put(ufi, organizer.LedgerEntry{Lib: "movies", Dest: "Unknown (2008)/Unknown (2008).mkv", Status: jobs.StatusCopied})
 	// Same size and mtime, but not the library file recorded for the copy.
 	swapped := filepath.Join(downloads, "Swapped.2005.mkv")
 	write(t, swapped)
@@ -382,7 +402,7 @@ func TestUnlinkedDownloads(t *testing.T) {
 		}
 	}
 	sort.Strings(got)
-	want := []string{"downloads/Gone.2002/Gone.2002.mkv", "downloads/Replaced.2004.mkv", "downloads/Seeded.2006.mkv", "downloads/Swapped.2005.mkv"}
+	want := []string{"downloads/Gone.2002/Gone.2002.mkv", "downloads/Replaced.2004.mkv", "downloads/Seeded.2006.mkv", "downloads/Swapped.2005.mkv", "downloads/Unknown.2008.mkv"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("unlinked = %v (report %+v)", got, rep)
 	}

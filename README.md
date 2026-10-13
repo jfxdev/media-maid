@@ -22,6 +22,28 @@ tv/Dark (2017) [tmdbid-70523]/Season 01/Dark S01E01-E02.mkv
 The ID tag only appears when `TMDB_API_KEY` is set, in the server's format:
 `[tmdbid-1]` (Jellyfin), `[tmdbid=1]` (Emby), `{tmdb-1}` (Plex).
 
+## When to use it (and when not)
+
+Media Maid is the import step of a media stack, alone: for downloads you
+start yourself (a torrent client, by hand) rather than through indexers.
+
+- **Already on Sonarr/Radarr?** They import, rename, hardlink and refresh
+  the server themselves; you do not need Media Maid. Use it for what you
+  download outside them.
+- **[FileBot](https://www.filebot.net/)** (the AMC script with
+  `--action hardlink`) covers the renaming too, with far more naming options,
+  as a paid desktop/CLI tool run per download. Media Maid is a free,
+  always-on sidecar bound to one server: it watches, refreshes only the
+  touched folders, keeps a ledger of what it placed (deletions are
+  respected, upgrades are tracked) and lists what needs a decision.
+- **Library cleanup tools** (Maintainerr and similar) delete by rules such
+  as "watched 30 days ago". Media Maid's orphan report only lists broken
+  entries (server items without files, folders with only metadata,
+  downloads not in the library) and never removes anything by itself.
+- **Not for you** if the library is not on the same filesystem as the
+  downloads and disk space matters (hardlinks are the point), or if you need
+  quality profiles, indexers or release monitoring.
+
 ## Quick start
 
 Pick a ready-made compose file from [`examples/`](examples/) (one per server),
@@ -29,7 +51,10 @@ set `MEDIA_SERVER_TOKEN` and `MEDIA_MAID_API_TOKEN`, and run
 `docker compose up -d`. Keep downloads and library on the **same filesystem**
 so hardlinks work: otherwise organizing fails with an error (a startup warning
 names the folders on different mounts), unless `COPY_FALLBACK=true` lets Media
-Maid copy the files, using as much disk space again.
+Maid copy the files, using as much disk space again. Run it as the user that
+owns the downloads (`user:` in compose): with `fs.protected_hardlinks`, the
+default on most distributions, a process may only hardlink files it owns or
+can write to, and the error says so (`hardlink not permitted (EPERM)`).
 
 Images for `linux/amd64` and `linux/arm64` are published to
 `ghcr.io/jfxdev/media-maid` for every version tag (`1.2.3`, `1.2`, `1` and
@@ -102,7 +127,7 @@ Every `/api/v1/*` route requires `Authorization: Bearer $API_TOKEN`.
 |---|---|---|
 | `GET` | `/healthz` | liveness: `503` when the downloads watcher stopped or stalled |
 | `POST` | `/api/v1/scan` | organize the whole downloads folder; `?async=true` answers `202` and logs to the history |
-| `POST` | `/api/v1/organize` | `{"path": "...", "overwrite": false}` organize one file/folder; `kind`, `tmdb_id`, `title`, `year` identify it manually |
+| `POST` | `/api/v1/organize` | `{"path": "...", "overwrite": false}` organize one file/folder; `kind`, `tmdb_id`, `title`, `year` identify it manually; `"automatic": true` behaves like the watcher (for hooks) |
 | `POST` | `/api/v1/preview` | same as organize, without touching disk |
 | `GET` | `/api/v1/pending` | downloads that need a decision: conflicts, duplicates, unidentified titles, errors |
 | `GET` | `/api/v1/history` | recent actions and last sync |
@@ -117,9 +142,12 @@ without peers, stops changing too, and its partial file would be linked (a
 hardlink then keeps showing whatever is written later). The torrent client
 knows when a download is complete, so with `ORGANIZE_TRIGGER=hook` only API
 requests organize, sent by the client's completion hook; the watcher and
-periodic scans are off. (Keeping incomplete downloads in a separate folder,
-qBittorrent's *Keep incomplete torrents in*, also helps in `watch` mode.) For
-qBittorrent (*Run external program on torrent finished*), use
+periodic scans are off. **Use `hook` with clients built on libtorrent 2.x
+(qBittorrent 4.4 and later, the default build)**: they may create a file at
+its full size up front and write it through memory maps, which raise no
+change events, so a download in progress can look finished to the watcher.
+(Keeping incomplete downloads in a separate folder, qBittorrent's *Keep
+incomplete torrents in*, also helps in `watch` mode.) For qBittorrent (*Run external program on torrent finished*), use
 [`examples/qbittorrent-hook.sh`](examples/qbittorrent-hook.sh):
 
 ```sh
@@ -127,7 +155,9 @@ qBittorrent (*Run external program on torrent finished*), use
 ```
 
 It passes the content path (`%F`, which works with categories and subfolders)
-JSON-encoded with `jq`. Mount the downloads folder at the same path in both
+JSON-encoded with `jq`, with `"automatic": true`: the request then behaves
+like the watcher, so a hook fired again for the same torrent (after a
+recheck) never links again a file you deleted from the library. Mount the downloads folder at the same path in both
 containers. Never paste the torrent name into a JSON template by hand: the API
 rejects duplicate keys and trailing data, so a crafted name cannot add fields
 such as `overwrite`, but it would still break the request.
@@ -152,7 +182,12 @@ disabled, the previous decision stands.
    the candidates, and waits in `/api/v1/pending` for a manual
    identification, instead of getting a possibly wrong ID
    (`AMBIGUOUS_MATCH=best` takes the best candidate anyway). When TMDB finds
-   nothing or is unreachable, the parser's reading is used without an ID.
+   nothing, the parser's reading is used without an ID. A tie is settled by
+   popularity only when it is clear-cut: a candidate with at least 100 TMDB
+   votes and ten times the votes of every other tied one. When TMDB cannot be
+   reached, the file is `skipped` (`metadata unavailable: ...`, pending) and
+   organized again every 10 minutes until TMDB answers, so a short outage
+   never leaves an episode in a folder without the ID next to the tagged one.
 3. **LLM** (optional, `LLM_PROVIDER`, off by default). Consulted only when
    the parser's confidence is below `LLM_MIN_CONFIDENCE`, TMDB found nothing,
    or the candidates are too close to call. It acts as a tie-breaker: it picks
@@ -183,6 +218,13 @@ the wrong name before, that entry is removed once the new one is in place
 (`previous` names it; only while it still is the same file), and the ledger
 remembers the correction, so scans keep it. Subtitles linked next to the
 wrong entry stay behind; the orphan report lists the emptied folder.
+
+A placed manual identification is also remembered for the name's reading
+(kind, title, year and origin marker as parsed): once `Shameless.S01E01` was
+identified as the US series, `Shameless.S01E02` and the next episodes get the
+same entry without asking again (`resolved_by: manual`). A reading with a
+year or a country marker is a different one. A new manual identification of
+the same reading replaces the remembered one; previews remember nothing.
 
 Release shapes the parser understands besides plain names:
 
@@ -324,8 +366,9 @@ identification for files already placed, and leave alone a file whose library
 copy you deleted (it is `skipped`, quietly). An explicit `POST /api/v1/organize`
 ignores the ledger and links it again.
 
-`STATE_DIR` keeps the ledger, the pending list, the TMDB and LLM caches, the
-history and the last orphan report across restarts, so a restart costs no
+`STATE_DIR` keeps the ledger, the pending list, the remembered manual
+identifications, the TMDB and LLM caches, the history and the last orphan
+report across restarts, so a restart costs no
 TMDB or LLM calls for work already done and never links again a file you
 deleted from the library. Empty TMDB results expire after a day, so a title
 added to TMDB later is found. The folder is created if missing; it must be

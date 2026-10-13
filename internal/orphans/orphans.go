@@ -326,7 +326,7 @@ func (d *Detector) isCopy(fi os.FileInfo) bool {
 		// it, even one with the same size and mtime) means this download is
 		// no longer in use.
 		return cur.Mode().IsRegular() && cur.Size() == fi.Size() && cur.ModTime().Equal(fi.ModTime()) &&
-			(e.DestIno == 0 || e.DestIno == organizer.Inode(cur))
+			e.DestIno != 0 && e.DestIno == organizer.Inode(cur)
 	}
 	return false
 }

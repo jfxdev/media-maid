@@ -40,32 +40,36 @@ func metaKind(k parser.Kind) metadata.Kind {
 }
 
 // identify runs the layers in order: parser (always), TMDB (optional), then
-// the LLM (optional) only when the first two are unsure. Any failure of an
-// optional layer falls back to what the previous layers decided, except a
-// TMDB pick that is itself unsure (a tie or a weak score): that is not a
-// decision, so the file waits for a manual identification (why says so)
-// unless AMBIGUOUS_MATCH=best. why is set when nothing was identified.
+// the LLM (optional) only when the first two are unsure. A failure of the LLM
+// falls back to what the previous layers decided. Two outcomes are not
+// decisions: a TMDB pick that is itself unsure (a tie or a weak score) waits
+// for a manual identification unless AMBIGUOUS_MATCH=best, and a TMDB that
+// cannot be reached leaves the file pending until RetryUnavailable succeeds.
+// why is set when nothing was identified.
 func (o *Organizer) identify(ctx context.Context, rel string, a parser.Analysis, parsed bool) (identity, string) {
 	id := identity{media: a.Media, by: ByParser}
 
 	var cands []metadata.Result
 	var best metadata.Result
 	var score, margin float64
-	var found, tmdbFailed bool
+	var found bool
 	if parsed && o.hasMeta {
 		// "The Office US" is searched as "The Office", preferring US entries.
 		query, _ := parser.SplitCountry(a.Title)
 		var err error
-		cands, err = o.meta.Search(ctx, metaKind(a.Kind), query, a.Year)
-		tmdbFailed = err != nil
+		if cands, err = o.meta.Search(ctx, metaKind(a.Kind), query, a.Year); err != nil {
+			// Placing it without the ID now would leave it in a folder of
+			// its own once TMDB answers again: it waits and is retried.
+			return identity{}, errMetadataUnavailableMsg
+		}
 		best, score, margin, found = metadata.PickIn(query, a.Year, a.Country, cands)
 	}
 
 	// unsure: TMDB answered, but its best candidate is weak or tied.
-	unsure := o.hasMeta && parsed && !tmdbFailed && found &&
+	unsure := o.hasMeta && parsed && found &&
 		(score < metadata.GoodScore || (len(cands) > 1 && margin < metadata.MinMargin))
 	ambiguous := !parsed || a.Confidence < o.minConf || unsure
-	if o.hasMeta && parsed && !tmdbFailed {
+	if o.hasMeta && parsed {
 		ambiguous = ambiguous || !found
 	}
 
@@ -134,6 +138,8 @@ type manual struct {
 	match *metadata.Result
 	// fixed is set when the user typed the title: it is not localized.
 	fixed bool
+	// ov is the identification as requested, remembered as an Alias.
+	ov Override
 }
 
 // resolveOverride checks an Override against TMDB (when enabled) once for the
@@ -145,7 +151,7 @@ func (o *Organizer) resolveOverride(ctx context.Context, ov *Override) (*manual,
 	if ov.Kind != parser.Movie && ov.Kind != parser.Episode {
 		return nil, ErrInvalidOverride
 	}
-	m := &manual{kind: ov.Kind, title: strings.TrimSpace(ov.Title), year: ov.Year}
+	m := &manual{kind: ov.Kind, title: strings.TrimSpace(ov.Title), year: ov.Year, ov: *ov}
 	m.fixed = m.title != ""
 	kind := metaKind(ov.Kind)
 	switch {

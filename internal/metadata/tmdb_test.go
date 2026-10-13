@@ -19,7 +19,7 @@ func TestTMDB(t *testing.T) {
 		q := r.URL.Query()
 		switch {
 		case r.URL.Path == "/search/movie" && q.Get("query") == "inception" && q.Get("api_key") == "k" && q.Get("year") == "2010":
-			io.WriteString(w, `{"results":[{"id":27205,"title":"Inception","original_title":"Inception","release_date":"2010-07-15"},{"id":1,"title":"Inception: The Cobol Job","release_date":"2010-12-07"},{"id":0,"title":"no id"}]}`)
+			io.WriteString(w, `{"results":[{"id":27205,"title":"Inception","original_title":"Inception","release_date":"2010-07-15","vote_count":37000},{"id":1,"title":"Inception: The Cobol Job","release_date":"2010-12-07"},{"id":0,"title":"no id"}]}`)
 		case r.URL.Path == "/search/tv" && r.Header.Get("Authorization") == "Bearer eyJtoken":
 			io.WriteString(w, `{"results":[{"id":1396,"name":"Breaking Bad","original_name":"Breaking Bad","first_air_date":"2008-01-20"}]}`)
 		case r.URL.Path == "/movie/129" && q.Get("append_to_response") == "translations,alternative_titles":
@@ -39,7 +39,7 @@ func TestTMDB(t *testing.T) {
 
 	m := NewTMDB("k", srv.URL)
 	res, err := m.Search(ctx, Movie, "inception", 2010)
-	if err != nil || len(res) != 2 || res[0] != (Result{Title: "Inception", OriginalTitle: "Inception", Year: 2010, TMDBID: 27205}) {
+	if err != nil || len(res) != 2 || res[0] != (Result{Title: "Inception", OriginalTitle: "Inception", Year: 2010, TMDBID: 27205, VoteCount: 37000}) {
 		t.Errorf("movie = %+v %v", res, err)
 	}
 	m.Search(ctx, Movie, "inception", 2010)
@@ -148,6 +148,36 @@ func TestPickIn(t *testing.T) {
 	}
 	if _, _, margin, _ := Pick("The Office", 0, cands); margin >= MinMargin {
 		t.Errorf("without a country the pick must stay a tie, margin %.2f", margin)
+	}
+}
+
+// A tie is settled by popularity only when one candidate clearly dominates.
+func TestPickPopularity(t *testing.T) {
+	tests := []struct {
+		name   string
+		votes  [2]int
+		wantID int
+		tie    bool
+	}{
+		{"dominant namesake", [2]int{40, 2500}, 2, false},
+		{"comparable entries stay a tie", [2]int{3000, 12000}, 1, true},
+		{"too few votes stay a tie", [2]int{0, 90}, 1, true},
+		{"exactly ten times", [2]int{100, 1000}, 2, false},
+	}
+	for _, tt := range tests {
+		cands := []Result{
+			{Title: "Shameless", Year: 2004, TMDBID: 1, VoteCount: tt.votes[0]},
+			{Title: "Shameless", Year: 2011, TMDBID: 2, VoteCount: tt.votes[1]},
+		}
+		best, score, margin, ok := Pick("Shameless", 0, cands)
+		if !ok || best.TMDBID != tt.wantID || score != 1 || (margin < MinMargin) != tt.tie {
+			t.Errorf("%s: picked %d score %.2f margin %.2f", tt.name, best.TMDBID, score, margin)
+		}
+	}
+	// A clear score lead is never overturned by votes.
+	cands := []Result{{Title: "Dune", Year: 1984, TMDBID: 1, VoteCount: 10}, {Title: "Dune", Year: 2021, TMDBID: 2, VoteCount: 12000}}
+	if best, _, _, _ := Pick("Dune", 1984, cands); best.TMDBID != 1 {
+		t.Errorf("year match lost to votes: %d", best.TMDBID)
 	}
 }
 

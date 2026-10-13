@@ -224,6 +224,40 @@ func TestSwapInNoExchange(t *testing.T) {
 
 // With COPY_FALLBACK=false a file that cannot be hardlinked is an error, for
 // a new destination and for an overwrite alike, and nothing is written.
+// EPERM on the same filesystem is a permission problem: the error says so
+// instead of pointing at copies, and nothing is written.
+func TestPlaceHardlinkDenied(t *testing.T) {
+	linkat = func(int, string, int, string, int) error { return unix.EPERM }
+	defer func() { linkat = unix.Linkat }()
+
+	src := filepath.Join(t.TempDir(), "a.mkv")
+	os.WriteFile(src, []byte("payload"), 0o644)
+	f, _ := os.Open(src)
+	defer f.Close()
+	fi, _ := f.Stat()
+	dst := t.TempDir()
+	root, _ := os.OpenRoot(dst)
+	defer root.Close()
+
+	st, err := place(root, "New (2000)/New (2000).mkv", f, fi, false, true, nil)
+	if st != jobs.StatusError || !errors.Is(err, errHardlinkDenied) || !errors.Is(err, unix.EPERM) {
+		t.Errorf("denied = %s, %v; want %v", st, err, errHardlinkDenied)
+	}
+	if entries, _ := os.ReadDir(filepath.Join(dst, "New (2000)")); len(entries) != 0 {
+		t.Errorf("something was written: %v", entries)
+	}
+	old := filepath.Join(dst, "Old (2000)", "Old (2000).mkv")
+	os.MkdirAll(filepath.Dir(old), 0o755)
+	os.WriteFile(old, []byte("720p"), 0o644)
+	if st, err := place(root, "Old (2000)/Old (2000).mkv", f, fi, true, true, nil); st != jobs.StatusError || !errors.Is(err, errHardlinkDenied) {
+		t.Errorf("overwrite denied = %s, %v", st, err)
+	}
+	// With COPY_FALLBACK the file is still copied.
+	if st, err := place(root, "Copy (2000)/Copy (2000).mkv", f, fi, false, false, nil); st != jobs.StatusCopied || err != nil {
+		t.Errorf("copy fallback = %s, %v", st, err)
+	}
+}
+
 func TestPlaceNoCopy(t *testing.T) {
 	linkat = func(int, string, int, string, int) error { return unix.EXDEV }
 	defer func() { linkat = unix.Linkat }()
@@ -334,5 +368,22 @@ func TestSameSizeAndMTimeIsNotSameFile(t *testing.T) {
 	os.Rename(other, dest)
 	if res, _ := e.org.Organize(context.Background(), "Heat.1995.1080p.mkv", OrganizeOptions{Explicit: true}); len(res) != 1 || res[0].Status != jobs.StatusConflict {
 		t.Fatalf("swapped copy = %+v", res)
+	}
+}
+
+// A ledger copy entry without the library file's inode does not make a file
+// with the source's size and mtime "already placed".
+func TestCopyWithoutDestInoIsNotPlaced(t *testing.T) {
+	e := newEnv(t, "jellyfin")
+	src := filepath.Join(e.downloads, "Ronin.1998.1080p.mkv")
+	dest := filepath.Join(e.movies, "Ronin (1998)", "Ronin (1998).mkv")
+	os.MkdirAll(filepath.Dir(dest), 0o755)
+	os.WriteFile(src, []byte("AAAA"), 0o644)
+	os.WriteFile(dest, []byte("BBBB"), 0o644)
+	fi, _ := os.Stat(src)
+	os.Chtimes(dest, fi.ModTime(), fi.ModTime())
+	e.org.ledger.Put(fi, LedgerEntry{Lib: "movies", Dest: "Ronin (1998)/Ronin (1998).mkv", Status: jobs.StatusCopied})
+	if res, _ := e.org.Organize(context.Background(), "Ronin.1998.1080p.mkv", OrganizeOptions{Explicit: true}); len(res) != 1 || res[0].Status != jobs.StatusConflict {
+		t.Fatalf("copy without DestIno = %+v", res)
 	}
 }

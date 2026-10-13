@@ -32,6 +32,9 @@ type Result struct {
 	TMDBID        int    `json:"tmdb_id"`
 	// OriginCountry is the first ISO 3166-1 origin country of a series.
 	OriginCountry string `json:"origin_country,omitempty"`
+	// VoteCount is the number of TMDB votes, a popularity hint that settles
+	// clear-cut ties (see PickIn).
+	VoteCount int `json:"vote_count,omitempty"`
 }
 
 // Season is the episode count of one season of a series.
@@ -271,6 +274,7 @@ func (t *TMDB) search(ctx context.Context, kind Kind, title string, year int) ([
 			ReleaseDate   string   `json:"release_date"`
 			FirstAirDate  string   `json:"first_air_date"`
 			OriginCountry []string `json:"origin_country"`
+			VoteCount     int      `json:"vote_count"`
 		} `json:"results"`
 	}
 	if err := t.get(ctx, "/search/"+string(kind), q, &body); err != nil {
@@ -285,7 +289,7 @@ func (t *TMDB) search(ctx context.Context, kind Kind, title string, year int) ([
 		if name == "" || r.ID <= 0 {
 			continue
 		}
-		res := Result{Title: name, OriginalTitle: orig, TMDBID: r.ID}
+		res := Result{Title: name, OriginalTitle: orig, TMDBID: r.ID, VoteCount: max(r.VoteCount, 0)}
 		if len(r.OriginCountry) > 0 {
 			res.OriginCountry = r.OriginCountry[0]
 		}

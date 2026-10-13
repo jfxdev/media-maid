@@ -54,6 +54,10 @@ const (
 	errSupersededMsg = "previously organized; replaced in the library by another release"
 )
 
+// errMetadataUnavailableMsg explains a file left pending because TMDB could
+// not be reached; RetryUnavailable organizes it again later.
+const errMetadataUnavailableMsg = "metadata unavailable: TMDB could not be reached; retried automatically"
+
 // errArchiveMsg reports a compressed release, which Media Maid does not
 // extract: it needs attention instead of being ignored silently.
 const errArchiveMsg = "archive: extract it first (compressed releases are not supported)"
@@ -91,6 +95,7 @@ type Organizer struct {
 	noCopy    bool
 	ledger    *Ledger
 	pending   *Pending
+	aliases   *Aliases
 	notify    func(Result)
 	upgrade   bool
 	extras    bool
@@ -129,6 +134,9 @@ type Options struct {
 	Ledger *Ledger
 	// Pending tracks downloads that need attention; nil uses a fresh one.
 	Pending *Pending
+	// Aliases remembers manual identifications for files whose name reads
+	// the same way; nil uses a fresh one.
+	Aliases *Aliases
 	// Notify, when set, receives results worth telling the user about: new
 	// or changed pending items and successful placements (not "exists").
 	Notify func(Result)
@@ -155,8 +163,11 @@ func New(o Options) *Organizer {
 	if o.Pending == nil {
 		o.Pending = NewPending()
 	}
+	if o.Aliases == nil {
+		o.Aliases = NewAliases()
+	}
 	return &Organizer{
-		pending: o.Pending, notify: o.Notify, upgrade: o.AutoUpgrade, extras: o.LinkExtras, ambiguousBest: o.AmbiguousBest,
+		pending: o.Pending, aliases: o.Aliases, notify: o.Notify, upgrade: o.AutoUpgrade, extras: o.LinkExtras, ambiguousBest: o.AmbiguousBest,
 		hasMeta: hasMeta, assist: o.Assist, minConf: o.MinConfidence, language: o.Language,
 		downloads: o.DownloadsDir, movies: o.Movies, tv: o.TV, filter: o.Filter,
 		guard: o.Guard, meta: o.Meta, platform: o.Platform, syncer: o.Syncer,
@@ -312,6 +323,26 @@ func (o *Organizer) Organize(ctx context.Context, input string, opts OrganizeOpt
 	return results, nil
 }
 
+// RetryUnavailable organizes again the pending downloads that were left
+// alone because TMDB could not be reached, as an automatic run, and returns
+// how many it retried.
+func (o *Organizer) RetryUnavailable(ctx context.Context) int {
+	n := 0
+	for _, it := range o.pending.List() {
+		if it.Status != jobs.StatusSkipped || it.Error != errMetadataUnavailableMsg {
+			continue
+		}
+		if ctx.Err() != nil {
+			break
+		}
+		if _, err := o.Organize(ctx, it.Source, OrganizeOptions{}); err != nil && !errors.Is(err, ErrNotFound) {
+			o.log.Warn("retry failed", "source", it.Source, "err", err)
+		}
+		n++
+	}
+	return n
+}
+
 // lib returns the library named name ("movies" or "tv").
 func (o *Organizer) lib(name string) Library {
 	if name == o.tv.Name {
@@ -431,6 +462,9 @@ type videoPlan struct {
 	// upgraded is set when this video replaced a lower-quality release; its
 	// subtitles then replace the old release's ones.
 	upgraded bool
+	// aliasKey is the parsed reading a manual identification of this video
+	// is remembered under (see Aliases).
+	aliasKey string
 }
 
 // extraFile is a video from a release's extras folder.
@@ -516,6 +550,9 @@ func (o *Organizer) process(ctx context.Context, files []string, dry bool, opts 
 				r = o.placeVideo(v, dry, opts)
 				if !dry {
 					o.remember(v, r)
+					if man != nil && placed(r.Status) {
+						o.aliases.Put(v.aliasKey, remembered(man))
+					}
 				}
 			}
 			// Subtitles and extras never follow a video that was not placed
@@ -663,7 +700,7 @@ func (o *Organizer) findPeer(v *videoPlan, src os.FileInfo) *peer {
 		if le, ok := o.ledger.Lookup(fi); ok && le.Lib == v.lib.Name && le.Dest == rel {
 			p.entry, p.tracked = le, true // a hardlink: same inode as its source
 		} else if le, ok := o.ledger.ByDest(v.lib.Name, rel); ok && le.Status == jobs.StatusCopied &&
-			le.Size == fi.Size() && le.MTime.Equal(fi.ModTime()) && (le.DestIno == 0 || le.DestIno == Inode(fi)) {
+			le.Size == fi.Size() && le.MTime.Equal(fi.ModTime()) && le.DestIno != 0 && le.DestIno == Inode(fi) {
 			p.entry, p.tracked = le, true // our copy: the recorded file, same size and mtime
 		}
 		return p
@@ -864,9 +901,9 @@ func (o *Organizer) placementGone(lib Library, e LedgerEntry, src os.FileInfo) s
 
 // copyOf reports whether cur, the file at dest in lib, is the copy of src
 // Media Maid made: the ledger records a copy of src at dest, cur still has
-// src's size and mtime, and it is the library file recorded then (entries
-// from before DestIno existed are trusted on the ledger record alone). An
-// inode number reused by a later file with the same size and mtime is not
+// src's size and mtime, and it is the library file recorded then (an entry
+// without DestIno never vouches for a file: size and mtime alone prove
+// nothing). An inode number reused by a later file with the same size and mtime is not
 // told apart: that needs a content check, which costs a full read.
 func (o *Organizer) copyOf(lib Library, dest string, cur, src os.FileInfo) bool {
 	if !cur.Mode().IsRegular() || cur.Size() != src.Size() || !cur.ModTime().Equal(src.ModTime()) {
@@ -876,7 +913,7 @@ func (o *Organizer) copyOf(lib Library, dest string, cur, src os.FileInfo) bool 
 	if !ok || e.Status != jobs.StatusCopied || e.Lib != lib.Name || e.Dest != dest {
 		return false
 	}
-	return e.DestIno == 0 || e.DestIno == Inode(cur)
+	return e.DestIno != 0 && e.DestIno == Inode(cur)
 }
 
 func (o *Organizer) planVideo(ctx context.Context, v *videoPlan, opts OrganizeOptions, man *manual, anchors map[string]anchorIndex) Result {
@@ -885,27 +922,44 @@ func (o *Organizer) planVideo(ctx context.Context, v *videoPlan, opts OrganizeOp
 	// The parser's reading is kept for subtitle matching even when the
 	// ledger supplies the destination.
 	v.quality, v.media = a.Quality, a.Media
+	if ok {
+		v.aliasKey = aliasKey(a)
+	}
 	if !opts.Explicit {
 		if r, ok := o.fromLedger(v); ok {
 			return r
 		}
 	}
 	var id identity
-	if man != nil {
+	var why string
+	switch {
+	case man != nil:
+		// A manual identification may move the earlier placement.
 		if fi, err := os.Stat(v.src); err == nil {
 			if e, ok := o.ledger.Lookup(fi); ok {
 				v.prev = &e
 			}
 		}
-		var why string
-		if id, why = o.manualIdentity(ctx, a, ok, man); why != "" {
-			return Result{Source: rel, Status: jobs.StatusSkipped, Error: why}
+		id, why = o.manualIdentity(ctx, a, ok, man)
+	default:
+		// A name read like one identified by hand before gets the same
+		// identification; one that does not fit is identified as usual.
+		var remembered *manual
+		if ok {
+			remembered, why = o.alias(ctx, v.aliasKey)
 		}
-	} else {
-		var why string
-		if id, why = o.identify(ctx, rel, a, ok); why != "" {
-			return Result{Source: rel, Status: jobs.StatusSkipped, Error: why}
+		if remembered != nil {
+			id, why = o.manualIdentity(ctx, a, ok, remembered)
 		}
+		if why == errMetadataUnavailableMsg {
+			break
+		}
+		if remembered == nil || why != "" {
+			id, why = o.identify(ctx, rel, a, ok)
+		}
+	}
+	if why != "" {
+		return Result{Source: rel, Status: jobs.StatusSkipped, Error: why}
 	}
 	m := id.media
 	var tag string
@@ -925,6 +979,25 @@ func (o *Organizer) planVideo(ctx context.Context, v *videoPlan, opts OrganizeOp
 	}
 	v.media, v.resolvedBy, v.titleSource, v.identified = m, id.by, id.titleSource, id.match != nil
 	return Result{}
+}
+
+// alias resolves the identification remembered for key, if any. TMDB being
+// unreachable leaves the file pending (why); an identification TMDB no
+// longer accepts is ignored, and the file is identified automatically.
+func (o *Organizer) alias(ctx context.Context, key string) (*manual, string) {
+	ov, ok := o.aliases.Get(key)
+	if !ok {
+		return nil, ""
+	}
+	man, err := o.resolveOverride(ctx, &ov)
+	if errors.Is(err, ErrMetadataUnavailable) {
+		return nil, errMetadataUnavailableMsg
+	}
+	if err != nil {
+		o.log.Warn("remembered identification ignored", "kind", ov.Kind, "tmdb_id", ov.TMDBID, "err", err)
+		return nil, ""
+	}
+	return man, ""
 }
 
 var (

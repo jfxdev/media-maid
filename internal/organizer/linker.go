@@ -68,7 +68,7 @@ func place(root *os.Root, rel string, src *os.File, srcInfo os.FileInfo, overwri
 		return jobs.StatusConflict, nil
 	case noHardlink(err):
 		if noCopy {
-			return jobs.StatusError, fmt.Errorf("%w: %w", errNoCopy, err)
+			return jobs.StatusError, noCopyErr(err)
 		}
 		return copyInto(root, rel, src, srcInfo)
 	default:
@@ -78,6 +78,21 @@ func place(root *os.Root, rel string, src *os.File, srcInfo os.FileInfo, overwri
 
 // errNoCopy is returned when a hardlink is impossible and COPY_FALLBACK is off.
 var errNoCopy = errors.New("cannot hardlink and COPY_FALLBACK=false")
+
+// errHardlinkDenied is errNoCopy for EPERM, which on the same filesystem is a
+// permission problem rather than a reason to copy: with fs.protected_hardlinks
+// (the default on most distributions) only the owner of a file, or a process
+// that may write to it, can hardlink it.
+var errHardlinkDenied = errors.New("hardlink not permitted (EPERM): the download belongs to another user and fs.protected_hardlinks is on; " +
+	"run Media Maid as the owner of the downloads (compose user:) or let it write to them, or set COPY_FALLBACK=true")
+
+// noCopyErr explains why link(2) failed with COPY_FALLBACK off.
+func noCopyErr(err error) error {
+	if errors.Is(err, unix.EPERM) {
+		return fmt.Errorf("%w (%w)", errHardlinkDenied, err)
+	}
+	return fmt.Errorf("%w: %w", errNoCopy, err)
+}
 
 // noHardlink reports a link(2) error that a copy can work around: another
 // mount (EXDEV), hardlinks not permitted (EPERM) or too many links (EMLINK).
@@ -160,7 +175,7 @@ func replaceWith(root *os.Root, rel string, src *os.File, srcInfo, checked os.Fi
 	case err == nil:
 	case noHardlink(err):
 		if noCopy {
-			return jobs.StatusError, fmt.Errorf("%w: %w", errNoCopy, err)
+			return jobs.StatusError, noCopyErr(err)
 		}
 		if err := copyTemp(root, tmp, src, srcInfo); err != nil {
 			return jobs.StatusError, err

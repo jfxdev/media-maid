@@ -537,8 +537,10 @@ func TestDecisionLayers(t *testing.T) {
 			"movies/Some Obscure Film/Some Obscure Film.mkv", ByParser, true},
 		{"llm free title without tmdb", "Some.Obscure.Film.mkv", &fakeAssist{decision: assist.Decision{Kind: "movie", Title: "Some Obscure Film", Year: 0, Choice: -1, Confidence: 0.9}}, true,
 			"movies/Some Obscure Film/Some Obscure Film.mkv", ByLLM, true},
-		{"tmdb outage keeps parser", "Boom.2010.1080p.mkv", &fakeAssist{}, false,
-			"movies/Boom (2010)/Boom (2010).mkv", ByParser, false},
+		// A TMDB outage is not "not found": the file waits for a retry
+		// instead of landing in a folder without the ID tag.
+		{"tmdb outage waits", "Boom.2010.1080p.mkv", &fakeAssist{}, false,
+			"", "", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -770,6 +772,11 @@ func TestLedger(t *testing.T) {
 	if _, err := os.Stat(dest); err == nil {
 		t.Error("a deleted library entry was linked again by a scan")
 	}
+	// So does an automatic request for that path (a re-fired completion hook).
+	res, _ = e2.org.Organize(context.Background(), src, OrganizeOptions{})
+	if len(res) != 1 || res[0].Status != jobs.StatusSkipped || res[0].Error != errRemovedMsg {
+		t.Errorf("automatic organize after deletion: %+v", res)
+	}
 	// An explicit request links it again.
 	res, _ = e2.org.Organize(context.Background(), src, OrganizeOptions{Explicit: true})
 	if len(res) != 1 || res[0].Status != jobs.StatusLinked || !sameInode(t, src, dest) {
@@ -844,5 +851,53 @@ func TestFilterSkipsExtras(t *testing.T) {
 		if got := f.IsVideo(filepath.FromSlash(p)); got != want {
 			t.Errorf("IsVideo(%s) = %v, want %v", p, got, want)
 		}
+	}
+}
+
+// downMeta is fakeMeta with searches failing while down is set.
+type downMeta struct {
+	fakeMeta
+	down *bool
+}
+
+func (m downMeta) Search(ctx context.Context, kind metadata.Kind, title string, year int) ([]metadata.Result, error) {
+	if *m.down {
+		return nil, errors.New("tmdb status 503")
+	}
+	return m.fakeMeta.Search(ctx, kind, title, year)
+}
+
+// A download seen while TMDB is unreachable stays pending and out of the
+// library; RetryUnavailable places it with its ID once TMDB answers again.
+func TestTMDBOutageRetried(t *testing.T) {
+	down := true
+	e := newEnv(t, "jellyfin", func(o *Options) { o.Meta = downMeta{down: &down} })
+	write(t, filepath.Join(e.downloads, "Inception.2010.1080p.mkv"))
+	res, err := e.org.Scan(context.Background())
+	if err != nil || len(res) != 1 || res[0].Status != jobs.StatusSkipped || res[0].Error != errMetadataUnavailableMsg {
+		t.Fatalf("outage = %+v, %v", res, err)
+	}
+	if entries, _ := os.ReadDir(e.movies); len(entries) != 0 {
+		t.Fatalf("library written during the outage: %v", entries)
+	}
+	if items := e.org.Pending(); len(items) != 1 || items[0].Error != errMetadataUnavailableMsg {
+		t.Fatalf("pending = %+v", items)
+	}
+	if n := e.org.RetryUnavailable(context.Background()); n != 1 {
+		t.Fatalf("retried %d while down", n)
+	}
+	down = false
+	if n := e.org.RetryUnavailable(context.Background()); n != 1 {
+		t.Fatalf("retried %d", n)
+	}
+	want := filepath.Join(e.movies, "Inception (2010) [tmdbid-27205]", "Inception (2010) [tmdbid-27205].mkv")
+	if _, err := os.Stat(want); err != nil {
+		t.Fatalf("not placed after retry: %v", err)
+	}
+	if items := e.org.Pending(); len(items) != 0 {
+		t.Errorf("pending after retry = %+v", items)
+	}
+	if n := e.org.RetryUnavailable(context.Background()); n != 0 {
+		t.Errorf("retried %d with nothing pending", n)
 	}
 }

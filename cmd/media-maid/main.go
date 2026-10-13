@@ -143,6 +143,8 @@ func run(log *slog.Logger) error {
 	ledger.OnChange = persist("ledger", ledger.Import, ledger.Export)
 	pending := organizer.NewPending()
 	pending.OnChange = persist("pending", pending.Import, pending.Export)
+	aliases := organizer.NewAliases()
+	aliases.OnChange = persist("aliases", aliases.Import, aliases.Export)
 
 	var notifier *notify.Notifier // nil disables notifications
 	var notifyFn func(organizer.Result)
@@ -212,7 +214,7 @@ func run(log *slog.Logger) error {
 		DownloadsDir: downloads, Movies: movies, TV: tv, Filter: filter, Guard: guard,
 		Meta: meta, Assist: resolver, MinConfidence: cfg.LLM.MinConfidence, Language: cfg.PreferredLanguage,
 		Platform: cfg.Platform, Syncer: syncer, History: history, Log: log, DryRun: cfg.DryRun,
-		Ledger: ledger, NoCopy: !cfg.CopyFallback, Pending: pending, Notify: notifyFn,
+		Ledger: ledger, NoCopy: !cfg.CopyFallback, Pending: pending, Aliases: aliases, Notify: notifyFn,
 		AutoUpgrade: cfg.AutoUpgrade, LinkExtras: cfg.LinkExtras, AmbiguousBest: cfg.AmbiguousBest,
 	})
 	log.Info("organizer", "auto_upgrade", cfg.AutoUpgrade, "link_extras", cfg.LinkExtras, "copy_fallback", cfg.CopyFallback,
@@ -251,6 +253,25 @@ func run(log *slog.Logger) error {
 		go periodicScan(ctx, log, org, downloads, cfg, w)
 	} else {
 		log.Info("downloads are organized only through the API (ORGANIZE_TRIGGER=hook)")
+	}
+
+	// A download seen while TMDB was unreachable waits in the pending list;
+	// it is organized again once TMDB answers, in either trigger mode.
+	if meta != nil {
+		go func() {
+			t := time.NewTicker(metadataRetryInterval)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					if n := org.RetryUnavailable(ctx); n > 0 {
+						log.Info("retried downloads waiting for TMDB", "count", n)
+					}
+				}
+			}
+		}()
 	}
 
 	if cfg.OrphanScanInterval > 0 {
@@ -292,6 +313,10 @@ func run(log *slog.Logger) error {
 	defer cancel()
 	return srv.Shutdown(shutdownCtx)
 }
+
+// metadataRetryInterval is how often downloads left pending because TMDB
+// could not be reached are organized again.
+const metadataRetryInterval = 10 * time.Minute
 
 // degradedScanInterval is how often the downloads folder is scanned when
 // SCAN_INTERVAL is off but some folders could not be watched.

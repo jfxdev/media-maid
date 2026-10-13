@@ -43,8 +43,8 @@ use the peeled `^{}` commit of annotated tags).
    (`Guard`); resolves the roots (plus `STATE_DIR`); `config.DistinctRoots`
    re-checks them. `internal/state` then opens `STATE_DIR` (a nil
    `*state.Store`, used by tests, keeps everything in memory) and each
-   persisted document (history, ledger, pending list, TMDB/LLM caches, orphan
-   report) is loaded and saved by a debounced `state.Saver` through its
+   persisted document (history, ledger, pending list, aliases, TMDB/LLM
+   caches, orphan report) is loaded and saved by a debounced `state.Saver` through its
    `Export`/`Import`/`OnChange`.
 3. Library roots are opened with `os.OpenRoot` and passed as
    `organizer.Library`.
@@ -131,14 +131,22 @@ All platform-specific data lives in `internal/integration/platforms.go`
   mtime alone never make two files the same.
 - **Doubt is not a decision**: a weak or tied TMDB pick that no layer settles
   is `skipped` (`ambiguous title: ...`, pending) unless `AMBIGUOUS_MATCH=best`;
-  it never gets an ID tag by default.
+  it never gets an ID tag by default. The only automatic tie-break is
+  popularity, when one tied candidate has ≥ 100 TMDB votes and ≥ 10× every
+  other's (`metadata.PickIn`). A TMDB that cannot be reached is not
+  "not found" either: the file is `skipped` (`metadata unavailable: ...`,
+  pending) and `Organizer.RetryUnavailable` organizes it again later.
 - **Manual identification** (`kind`/`tmdb_id`/`title`/`year` on organize or
   preview) only comes from an explicit API request, is validated in
   `api.override`, and its title is sanitized like any other. The earlier
   placement of the same file is removed only while it is provably that file.
+  A placed one is remembered (`Aliases`, keyed by the parsed kind, folded
+  title, year and country) and applied to later files with the same reading;
+  imported aliases are validated again, and one TMDB rejects is ignored.
 - **Respect deletions**: automatic runs never re-link a file (video or extra)
   the ledger says was placed and whose library copy is gone or was replaced
-  by another release; only an explicit organize does.
+  by another release; only an explicit organize does. An organize request
+  with `"automatic": true` (the completion hook) is an automatic run.
 - **Sanitize names**: anything from the parser or TMDB goes through
   `naming.Sanitize` before becoming a path component.
 - **Strict request JSON**: `api.decode` rejects unknown fields, duplicate keys
