@@ -484,13 +484,14 @@ func (o *Organizer) process(ctx context.Context, files []string, dry bool, opts 
 
 	// Plan every video before touching the disk, so releases of the same title
 	// in different qualities can be compared first.
+	anchors := map[string]anchorIndex{}
 	var planned, all []*videoPlan
 	for _, k := range keys {
 		for _, v := range groups[k].videos {
 			if ctx.Err() != nil {
 				return results
 			}
-			v.result = o.planVideo(ctx, v, opts, man)
+			v.result = o.planVideo(ctx, v, opts, man, anchors)
 			if v.result.Status == "" {
 				planned = append(planned, v)
 			}
@@ -878,7 +879,7 @@ func (o *Organizer) copyOf(lib Library, dest string, cur, src os.FileInfo) bool 
 	return e.DestIno == 0 || e.DestIno == Inode(cur)
 }
 
-func (o *Organizer) planVideo(ctx context.Context, v *videoPlan, opts OrganizeOptions, man *manual) Result {
+func (o *Organizer) planVideo(ctx context.Context, v *videoPlan, opts OrganizeOptions, man *manual, anchors map[string]anchorIndex) Result {
 	rel := o.rel(v.src)
 	a, ok := parser.Analyze(rel)
 	// The parser's reading is kept for subtitle matching even when the
@@ -919,8 +920,71 @@ func (o *Organizer) planVideo(ctx context.Context, v *videoPlan, opts OrganizeOp
 		v.lib = o.movies
 		v.dest = naming.MoviePath(m, tag, o.platform.EditionTag(m.Edition), filepath.Ext(v.src))
 	}
+	if id.match != nil {
+		v.dest = o.anchor(v.lib, v.dest, m, id.match.TMDBID, anchors)
+	}
 	v.media, v.resolvedBy, v.titleSource, v.identified = m, id.by, id.titleSource, id.match != nil
 	return Result{}
+}
+
+var (
+	// reTMDBTag finds a TMDB id tag in a folder name, in any server's format
+	// ("[tmdbid-1]", "[tmdbid=1]", "{tmdb-1}", "[tmdb-1]").
+	reTMDBTag = regexp.MustCompile(`(?i)[\[{]tmdb(?:id)?[-=](\d+)[\]}]`)
+	// reEditionTag finds a Plex edition tag: editions of one movie live in
+	// folders of their own, sharing the TMDB id.
+	reEditionTag = regexp.MustCompile(`(?i)\{edition-[^}]*\}`)
+)
+
+// anchorIndex maps a TMDB id (plus edition tag) to the top-level library
+// folders tagged with it.
+type anchorIndex map[string][]string
+
+func anchorKey(tmdbID, edition string) string { return tmdbID + "|" + strings.ToLower(edition) }
+
+// anchorsOf indexes the tagged top-level folders of lib, once per run.
+func (o *Organizer) anchorsOf(lib Library, cache map[string]anchorIndex) anchorIndex {
+	if idx, ok := cache[lib.Name]; ok {
+		return idx
+	}
+	idx := anchorIndex{}
+	if entries, err := fs.ReadDir(lib.Root.FS(), "."); err == nil {
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			if m := reTMDBTag.FindStringSubmatch(e.Name()); m != nil {
+				k := anchorKey(m[1], reEditionTag.FindString(e.Name()))
+				idx[k] = append(idx[k], e.Name())
+			}
+		}
+	}
+	cache[lib.Name] = idx
+	return idx
+}
+
+// anchor keeps a title in the folder the library already has for its TMDB id
+// (created earlier under another title or year, by a translation that
+// changed, or by another tool), instead of opening a parallel folder the
+// server would show as a second entry. A movie's file name follows the
+// folder. Nothing changes when no folder, or more than one, has the id.
+func (o *Organizer) anchor(lib Library, dest string, m parser.Media, tmdbID int, cache map[string]anchorIndex) string {
+	folder, rest, ok := strings.Cut(dest, "/")
+	if !ok {
+		return dest
+	}
+	dirs := o.anchorsOf(lib, cache)[anchorKey(strconv.Itoa(tmdbID), o.platform.EditionTag(m.Edition))]
+	switch {
+	case len(dirs) > 1:
+		o.log.Warn("several library folders have the same TMDB id; not choosing one", "library", lib.Name, "tmdb_id", tmdbID, "folders", dirs)
+		return dest
+	case len(dirs) == 0 || dirs[0] == folder:
+		return dest
+	}
+	if m.Kind != parser.Episode && strings.HasPrefix(rest, folder) {
+		rest = dirs[0] + rest[len(folder):]
+	}
+	return dirs[0] + "/" + rest
 }
 
 // extra links a video from a release's extras folder into the extras folder
