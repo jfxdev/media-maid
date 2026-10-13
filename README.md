@@ -22,6 +22,28 @@ tv/Dark (2017) [tmdbid-70523]/Season 01/Dark S01E01-E02.mkv
 The ID tag only appears when `TMDB_API_KEY` is set, in the server's format:
 `[tmdbid-1]` (Jellyfin), `[tmdbid=1]` (Emby), `{tmdb-1}` (Plex).
 
+## When to use it (and when not)
+
+Media Maid is the import step of a media stack, alone: for downloads you
+start yourself (a torrent client, by hand) rather than through indexers.
+
+- **Already on Sonarr/Radarr?** They import, rename, hardlink and refresh
+  the server themselves; you do not need Media Maid. Use it for what you
+  download outside them.
+- **[FileBot](https://www.filebot.net/)** (the AMC script with
+  `--action hardlink`) covers the renaming too, with far more naming options,
+  as a paid desktop/CLI tool run per download. Media Maid is a free,
+  always-on sidecar bound to one server: it watches, refreshes only the
+  touched folders, keeps a ledger of what it placed (deletions are
+  respected, upgrades are tracked) and lists what needs a decision.
+- **Library cleanup tools** (Maintainerr and similar) delete by rules such
+  as "watched 30 days ago". Media Maid's orphan report only lists broken
+  entries (server items without files, folders with only metadata,
+  downloads not in the library) and never removes anything by itself.
+- **Not for you** if the library is not on the same filesystem as the
+  downloads and disk space matters (hardlinks are the point), or if you need
+  quality profiles, indexers or release monitoring.
+
 ## Quick start
 
 Pick a ready-made compose file from [`examples/`](examples/) (one per server),
@@ -120,9 +142,12 @@ without peers, stops changing too, and its partial file would be linked (a
 hardlink then keeps showing whatever is written later). The torrent client
 knows when a download is complete, so with `ORGANIZE_TRIGGER=hook` only API
 requests organize, sent by the client's completion hook; the watcher and
-periodic scans are off. (Keeping incomplete downloads in a separate folder,
-qBittorrent's *Keep incomplete torrents in*, also helps in `watch` mode.) For
-qBittorrent (*Run external program on torrent finished*), use
+periodic scans are off. **Use `hook` with clients built on libtorrent 2.x
+(qBittorrent 4.4 and later, the default build)**: they may create a file at
+its full size up front and write it through memory maps, which raise no
+change events, so a download in progress can look finished to the watcher.
+(Keeping incomplete downloads in a separate folder, qBittorrent's *Keep
+incomplete torrents in*, also helps in `watch` mode.) For qBittorrent (*Run external program on torrent finished*), use
 [`examples/qbittorrent-hook.sh`](examples/qbittorrent-hook.sh):
 
 ```sh
