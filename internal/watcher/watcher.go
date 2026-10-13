@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -38,6 +39,21 @@ type Watcher struct {
 	queued map[string]bool
 	work   chan string
 	done   chan string
+
+	// running and lastLoop back Healthy: set while Run is active, and the
+	// last time its loop went round (unix nanoseconds).
+	running  atomic.Bool
+	lastLoop atomic.Int64
+}
+
+// stallLimit is how long the event loop may go without a tick before the
+// watcher reports itself unhealthy. The loop never blocks on organizing, so
+// only a stuck filesystem call can hold it that long.
+const stallLimit = 30 * time.Second
+
+// Healthy reports whether Run is active and its event loop is not stalled.
+func (w *Watcher) Healthy() bool {
+	return w.running.Load() && time.Since(time.Unix(0, w.lastLoop.Load())) < stallLimit
 }
 
 const workQueueSize = 256
@@ -159,6 +175,9 @@ func (w *Watcher) worker(ctx context.Context) {
 
 // Run processes events until ctx is cancelled.
 func (w *Watcher) Run(ctx context.Context) {
+	w.lastLoop.Store(time.Now().UnixNano())
+	w.running.Store(true)
+	defer w.running.Store(false)
 	defer w.fsw.Close()
 	go w.worker(ctx)
 	tick := time.NewTicker(time.Second)
@@ -180,6 +199,7 @@ func (w *Watcher) Run(ctx context.Context) {
 			}
 			w.handleError(err)
 		case <-tick.C:
+			w.lastLoop.Store(time.Now().UnixNano())
 			w.flush()
 		}
 	}

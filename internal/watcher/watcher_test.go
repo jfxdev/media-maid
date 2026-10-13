@@ -221,3 +221,32 @@ func TestWatcherRescansOnOverflow(t *testing.T) {
 	}
 	w.handleError(errors.New("other"))
 }
+
+func TestWatcherHealthy(t *testing.T) {
+	w, err := New(t.TempDir(), time.Second, func(context.Context, string) {}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.Healthy() {
+		t.Error("healthy before Run")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	stopped := make(chan struct{})
+	go func() { w.Run(ctx); close(stopped) }()
+	deadline := time.Now().Add(2 * time.Second)
+	for !w.Healthy() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !w.Healthy() {
+		t.Fatal("not healthy while running")
+	}
+	w.lastLoop.Store(time.Now().Add(-time.Minute).UnixNano())
+	if w.Healthy() {
+		t.Error("healthy with a stalled loop")
+	}
+	cancel()
+	<-stopped
+	if w.Healthy() {
+		t.Error("healthy after Run returned")
+	}
+}

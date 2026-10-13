@@ -244,6 +244,7 @@ func run(log *slog.Logger) error {
 
 	apiServer := api.New(cfg.APIToken, org, det, syncer, history, log)
 	apiServer.SetContext(ctx)
+	apiServer.SetHealth(w.Healthy)
 	srv := api.NewHTTPServer(cfg.ListenAddr, apiServer.Handler())
 	errCh := make(chan error, 1)
 	go func() {

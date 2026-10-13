@@ -79,7 +79,7 @@ Every `/api/v1/*` route requires `Authorization: Bearer $API_TOKEN`.
 
 | Method | Route | Description |
 |---|---|---|
-| `GET` | `/healthz` | liveness |
+| `GET` | `/healthz` | liveness: `503` when the downloads watcher stopped or stalled |
 | `POST` | `/api/v1/scan` | organize the whole downloads folder; `?async=true` answers `202` and logs to the history |
 | `POST` | `/api/v1/organize` | `{"path": "...", "overwrite": false}` organize one file/folder |
 | `POST` | `/api/v1/preview` | same as organize, without touching disk |

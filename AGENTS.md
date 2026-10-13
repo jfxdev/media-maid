@@ -63,7 +63,8 @@ Go 1.25+ is required (`os.Root`). Dependencies are stdlib plus `fsnotify` and
    on a single worker goroutine. `SCAN_INTERVAL` adds a periodic scan with
    `MinAge`.
 10. `internal/api`: stdlib `ServeMux`; `/api/v1/*` behind bearer auth;
-   `/healthz`, `/openapi.yaml`, `/docs` are public.
+   `/healthz`, `/openapi.yaml`, `/docs` are public; `/healthz` answers 503
+   when `watcher.Healthy` is false (`Run` returned or its loop stalled).
 
 Other packages: `parser` (release name → `Analysis`: `Media` with part,
 edition and absolute episode, `Quality`, country, confidence and signals;
