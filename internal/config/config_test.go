@@ -165,19 +165,31 @@ func TestLoadInvalid(t *testing.T) {
 }
 
 func TestLoadOwnServerVarsWarn(t *testing.T) {
-	c, err := load(baseEnv(), "JELLYFIN_PublishedServerUrl=http://x")
+	env := baseEnv()
+	env["STATE_DIR"] = "/state"
+	c, err := load(env, "JELLYFIN_PublishedServerUrl=http://x")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(c.Warnings) != 1 || !strings.Contains(c.Warnings[0], "JELLYFIN_PublishedServerUrl is ignored") {
 		t.Errorf("warnings = %v", c.Warnings)
 	}
-	env := baseEnv()
-	env["STATE_DIR"] = "/state"
 	env["SCAN_INTERVAL"] = "15m"
 	c, err = load(env)
-	if err != nil || c.StateDir != "/state" || c.ScanInterval.Minutes() != 15 {
+	if err != nil || c.StateDir != "/state" || c.ScanInterval.Minutes() != 15 || len(c.Warnings) != 0 {
 		t.Errorf("state/scan = %+v %v", c, err)
+	}
+}
+
+// Without STATE_DIR the ledger is lost on restart, so deleted library
+// entries come back: that must be visible at startup.
+func TestLoadNoStateDirWarns(t *testing.T) {
+	c, err := load(baseEnv())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.Warnings) != 1 || !strings.Contains(c.Warnings[0], "STATE_DIR is not set") {
+		t.Errorf("warnings = %v", c.Warnings)
 	}
 }
 

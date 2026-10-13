@@ -192,6 +192,9 @@ func Load(getenv func(string) string, environ []string) (*Config, error) {
 	c.TVDir = requireAbs("TV_DIR", getenv, fail)
 	if v := strings.TrimSpace(getenv("STATE_DIR")); v != "" {
 		c.StateDir = requireAbs("STATE_DIR", getenv, fail)
+	} else {
+		c.Warnings = append(c.Warnings, "STATE_DIR is not set: the organize ledger lives in memory, so after a restart "+
+			"files removed from the library are linked again and TMDB/LLM lookups are repeated")
 	}
 	if c.DownloadsDir != "" && c.MoviesDir != "" && c.TVDir != "" {
 		if err := DistinctRoots(c.Roots()); err != nil {

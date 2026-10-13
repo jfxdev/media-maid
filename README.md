@@ -44,7 +44,7 @@ server (say `PLEX_CLAIM` from a shared env file) are ignored with a warning.
 | `API_TOKEN` | yes | — | bearer token for the API (≥ 32 chars) |
 | `DOWNLOADS_DIR` | yes | — | source folder |
 | `MOVIES_DIR` / `TV_DIR` | yes | — | library folders |
-| `STATE_DIR` | no | — | folder for caches, history, orphan report and the organize ledger, kept across restarts (see below); empty keeps everything in memory |
+| `STATE_DIR` | recommended | — | folder for caches, history, orphan report and the organize ledger, kept across restarts (see below); empty keeps everything in memory, so files removed from the library are linked again after a restart (a startup warning says so) |
 | `TMDB_API_KEY` | no | — | TMDB v3 key or v4 token for canonical title/year/ID |
 | `PREFERRED_LANGUAGE` | no | — | BCP 47 tag (`pt-BR`, `es`) for localized folder names, see below |
 | `LLM_PROVIDER` | no | — | `openai` or `anthropic`; leave empty to disable the LLM layer |
@@ -206,6 +206,11 @@ work already done. Empty TMDB results expire after a day, so a title added to
 TMDB later is found. The folder is created if missing; it must be writable
 and inside a mounted volume (the image runs with a read-only root), e.g.
 `STATE_DIR: /data/media-maid-state` as in the examples.
+
+Without `STATE_DIR` the ledger only lives as long as the process: after a
+restart every download is identified again (TMDB and LLM calls included), and
+a file whose library copy you deleted is linked again. Media Maid logs a
+warning at startup when it runs this way.
 
 After organizing, only the touched folders are refreshed on the server
 (`Library/Media/Updated` on Jellyfin/Emby, `sections/{id}/refresh?path=` on
