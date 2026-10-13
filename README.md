@@ -27,9 +27,9 @@ The ID tag only appears when `TMDB_API_KEY` is set, in the server's format:
 Pick a ready-made compose file from [`examples/`](examples/) (one per server),
 set `MEDIA_SERVER_TOKEN` and `MEDIA_MAID_API_TOKEN`, and run
 `docker compose up -d`. Keep downloads and library on the **same filesystem**
-so hardlinks work (otherwise files are copied, or fail with
-`COPY_FALLBACK=false`; a startup warning names the folders on different
-mounts).
+so hardlinks work: otherwise organizing fails with an error (a startup warning
+names the folders on different mounts), unless `COPY_FALLBACK=true` lets Media
+Maid copy the files, using as much disk space again.
 
 Images for `linux/amd64` and `linux/arm64` are published to
 `ghcr.io/jfxdev/media-maid` for every version tag (`1.2.3`, `1.2`, `1` and
@@ -75,7 +75,9 @@ server (say `PLEX_CLAIM` from a shared env file) are ignored with a warning.
 | `STABLE_SECONDS` | no | `30` | quiet time before a download counts as done |
 | `LISTEN_ADDR` | no | `:8080` | HTTP address |
 | `DRY_RUN` | no | `false` | never link or remove anything |
-| `COPY_FALLBACK` | no | `true` | copy a file that cannot be hardlinked (different filesystem or mount); `false` reports an error instead of using extra disk space |
+| `COPY_FALLBACK` | no | `false` | `true` copies a file that cannot be hardlinked (different filesystem or mount), using extra disk space; by default that is an error |
+| `ORGANIZE_TRIGGER` | no | `watch` | `watch`: the watcher (and `SCAN_INTERVAL`) organize downloads once they stop changing; `hook`: only API requests do, e.g. the torrent client's "download finished" hook (see below) |
+| `AMBIGUOUS_MATCH` | no | `pending` | when TMDB's best candidate is weak or tied and nothing settles it: `pending` leaves the file pending for a manual identification; `best` takes the best candidate anyway |
 | `AUTO_UPGRADE` | no | `false` | let the watcher and scans replace a release Media Maid placed with a better one of the same title (see [Duplicate releases](#duplicate-releases-and-upgrades)) |
 | `LINK_EXTRAS` | no | `true` | link videos from a release's extras folders (`Featurettes`, `Trailers`, …) as server extras |
 | `NOTIFY_URL` | no | — | webhook for problems and upgrades (see [Notifications](#notifications)); a secret, never logged |
@@ -109,9 +111,15 @@ Every `/api/v1/*` route requires `Authorization: Bearer $API_TOKEN`.
 | `GET` | `/api/v1/orphans` | latest report |
 | `POST` | `/api/v1/orphans/remove` | `{"ids": [...]}` remove reported orphans |
 
-The watcher already picks up finished downloads, so a torrent client hook is
-optional; it only saves the `STABLE_SECONDS` wait. For qBittorrent (*Run
-external program on torrent finished*), use
+By default the watcher picks up a download once its files stop changing for
+`STABLE_SECONDS`. That is not proof it finished: a paused torrent, or one
+without peers, stops changing too, and its partial file would be linked (a
+hardlink then keeps showing whatever is written later). The torrent client
+knows when a download is complete, so with `ORGANIZE_TRIGGER=hook` only API
+requests organize, sent by the client's completion hook; the watcher and
+periodic scans are off. (Keeping incomplete downloads in a separate folder,
+qBittorrent's *Keep incomplete torrents in*, also helps in `watch` mode.) For
+qBittorrent (*Run external program on torrent finished*), use
 [`examples/qbittorrent-hook.sh`](examples/qbittorrent-hook.sh):
 
 ```sh
@@ -138,7 +146,13 @@ disabled, the previous decision stands.
    its own confidence.
 2. **TMDB** (optional, `TMDB_API_KEY`). Up to five candidates are scored
    against the parsed title and year; a clear winner sets the canonical
-   title, year and ID tag.
+   title, year and ID tag. When the best candidate is weak or tied (say
+   `Dune.1080p.mkv`, with the 1984 and 2021 films) and the LLM is off or
+   cannot settle it, the file is `skipped` as `ambiguous title: ...`, naming
+   the candidates, and waits in `/api/v1/pending` for a manual
+   identification, instead of getting a possibly wrong ID
+   (`AMBIGUOUS_MATCH=best` takes the best candidate anyway). When TMDB finds
+   nothing or is unreachable, the parser's reading is used without an ID.
 3. **LLM** (optional, `LLM_PROVIDER`, off by default). Consulted only when
    the parser's confidence is below `LLM_MIN_CONFIDENCE`, TMDB found nothing,
    or the candidates are too close to call. It acts as a tie-breaker: it picks
@@ -219,7 +233,15 @@ there is none, the LLM (when enabled) may only pick one of the titles TMDB
 lists for that language or market; without TMDB, it may answer only when it
 is confident an official title exists. Otherwise the original title is kept.
 The ID tag still points at the TMDB entry, so the server matches it either
-way. Results report `title_source` (`tmdb_translation`, `llm_localized` or
+way.
+
+A title identified by TMDB goes into the library folder that already carries
+its ID, in any server's tag format (`[tmdbid-1]`, `[tmdbid=1]`, `{tmdb-1}`),
+even under another name: a folder created by Sonarr/Radarr or by hand, or
+before a TMDB title or translation changed, does not get a parallel folder
+the server would list twice. A movie's file name follows that folder. Plex
+editions keep their own folders, and when several folders carry the same ID
+none is chosen. Folders without an ID tag are not matched. Results report `title_source` (`tmdb_translation`, `llm_localized` or
 `original`).
 
 ## Duplicate releases and upgrades
@@ -231,11 +253,12 @@ BluRay > WEB-DL > WEBRip > HDTV > DVD), then HDR, then file size.
 
 - **In the same run**, only the best one is linked; the others are
   `duplicate`.
-- **In later runs**, the new release is compared with the one in the library.
-  When Media Maid placed that one (it is in the ledger, so its quality is
-  known): a release of the same or lower quality is `duplicate`; a better one
-  is an `upgraded` replacement with `AUTO_UPGRADE=true`, and a `conflict`
-  saying so without it. A library file Media Maid did not place is never
+- **In later runs**, the new release is compared with the one in the library
+  by the same ranking. When Media Maid placed that one (it is in the ledger,
+  so its quality is known): a release that does not rank higher is
+  `duplicate`; one that does (better quality, or equal quality and a larger
+  file) is an `upgraded` replacement with `AUTO_UPGRADE=true`, and a
+  `conflict` saying so without it. A library file Media Maid did not place is never
   touched: the result is `conflict`.
 
 An upgrade, or an explicit `"overwrite": true` on organize (`replaced`),
@@ -286,10 +309,17 @@ each release is organized as soon as it is complete, whatever else is still
 downloading in the category. Loose files in a category folder are organized one
 by one. If the kernel drops events (inotify queue overflow, e.g.
 when a large pack is extracted at once), the whole downloads folder is walked
-again.
+again. If a folder cannot be watched at all (the inotify watch limit,
+`fs.inotify.max_user_watches`), `/healthz` reports `"watcher": "degraded"`
+and, unless `SCAN_INTERVAL` is set, the downloads folder is scanned every 15
+minutes so those downloads are still found.
 
 Every placed video is recorded in an **organize ledger** (by device and inode,
-so renames keep their entry). Automatic runs (watcher, scans) skip
+so renames keep their entry; an entry follows its file when the filesystem
+comes back under another device number, as btrfs, mergerfs or ZFS may after a
+reboot). A library file that is not the download's own inode counts as placed
+only when the ledger records it as that download's copy: equal size and
+modification time alone never do. Automatic runs (watcher, scans) skip
 identification for files already placed, and leave alone a file whose library
 copy you deleted (it is `skipped`, quietly). An explicit `POST /api/v1/organize`
 ignores the ledger and links it again.
@@ -311,15 +341,21 @@ Plex); a full refresh is used for more than 50 folders or when that fails.
 ## Orphans
 
 - `server_item_missing_file`: the server lists an item whose files are all gone
-  (only when every path is inside the managed libraries). Removal calls the
+  (only when every path is inside the managed libraries). Removal fetches the
+  item again and checks its current paths the same way before calling the
   server's delete endpoint.
   The servers usually drop these on their own library scan (Plex with *Empty
   trash automatically*); this report is a cross-check.
-- `orphan_directory`: a library folder with no video left. Removal deletes it.
-- `unlinked_download`: a video in `DOWNLOADS_DIR` with no other hard link, so
-  it is not in the library (deleted there, or never organized) and still uses
-  disk space. Report-only (`not_removable`): remove it in the torrent client.
-  Files copied across filesystems are recognized through the ledger.
+- `orphan_directory`: a library folder that is empty or holds only metadata
+  (artwork, `.nfo`, `.xml`, `.txt`, subtitles). Any other file (an `.iso`, a
+  Blu-ray `.m2ts`, a `.strm`, theme music) keeps the folder. Removal deletes
+  it, while nothing is being organized.
+- `unlinked_download`: a video in `DOWNLOADS_DIR` that is not in the library
+  (deleted there, or never organized) and still uses disk space: one with no
+  other hard link, or one the ledger placed whose library copy is gone even
+  though it is linked elsewhere (a cross-seed folder). Report-only
+  (`not_removable`): remove it in the torrent client. Files copied across
+  filesystems are recognized through the ledger.
 
 Nothing is removed automatically. Each ID is revalidated on removal and
 returns `stale` if it is no longer an orphan.
