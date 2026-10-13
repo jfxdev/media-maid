@@ -37,7 +37,7 @@ services:
       # Optional LLM tie-breaker for ambiguous names (off when LLM_PROVIDER is empty):
       # LLM_PROVIDER: anthropic                    # or openai (also Ollama/LM Studio via LLM_BASE_URL)
       # LLM_API_KEY: ${LLM_API_KEY}
-      # LLM_MODEL: claude-opus-5-5
+      # LLM_MODEL: claude-haiku-5-5
       # ORPHAN_SCAN_INTERVAL: 24h
       # SCAN_INTERVAL: 15m                           # fallback when inotify misses events (NFS/SMB)
     ports:

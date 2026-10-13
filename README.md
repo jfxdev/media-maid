@@ -49,7 +49,7 @@ server (say `PLEX_CLAIM` from a shared env file) are ignored with a warning.
 | `PREFERRED_LANGUAGE` | no | — | BCP 47 tag (`pt-BR`, `es`) for localized folder names, see below |
 | `LLM_PROVIDER` | no | — | `openai` or `anthropic`; leave empty to disable the LLM layer |
 | `LLM_API_KEY` | no² | — | key for the LLM endpoint |
-| `LLM_MODEL` | no² | `claude-opus-5-5` (anthropic) | model name; required for `openai` |
+| `LLM_MODEL` | no² | `claude-haiku-5-5` (anthropic) | model name; required for `openai` |
 | `LLM_BASE_URL` | no | provider default | any OpenAI-compatible server (Ollama, LM Studio, OpenRouter, vLLM) or an Anthropic gateway |
 | `LLM_MIN_CONFIDENCE` | no | `0.7` | below this parser confidence the LLM is consulted; also the minimum confidence its answers need |
 | `LLM_TIMEOUT` | no | `20s` | per request, at most `2m` |

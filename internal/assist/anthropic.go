@@ -10,7 +10,7 @@ import (
 const DefaultAnthropicURL = "https://api.anthropic.com"
 
 // DefaultAnthropicModel is used when LLM_MODEL is empty with LLM_PROVIDER=anthropic.
-const DefaultAnthropicModel = "claude-opus-5-5"
+const DefaultAnthropicModel = "claude-haiku-5-5"
 
 type anthropic struct {
 	url, key, model string
