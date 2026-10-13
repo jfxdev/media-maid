@@ -54,6 +54,7 @@ func TestLoadLLM(t *testing.T) {
 	valid := []map[string]string{
 		{"LLM_PROVIDER": "anthropic", "LLM_API_KEY": "k"},
 		{"LLM_PROVIDER": "OpenAI", "LLM_API_KEY": "k", "LLM_MODEL": "gpt-x"},
+		{"LLM_PROVIDER": "openai", "LLM_API_KEY": "k"}, // public endpoint: default model
 		{"LLM_PROVIDER": "openai", "LLM_BASE_URL": "http://ollama:11434/v1/", "LLM_MODEL": "llama3", "LLM_MIN_CONFIDENCE": "0.5", "LLM_TIMEOUT": "45s"},
 		{"PREFERRED_LANGUAGE": "pt-BR"},
 		{"PREFERRED_LANGUAGE": "es-419"},
@@ -81,7 +82,7 @@ func TestLoadLLM(t *testing.T) {
 		{map[string]string{"LLM_PROVIDER": "gemini", "LLM_API_KEY": "k"}, "LLM_PROVIDER"},
 		{map[string]string{"LLM_PROVIDER": "openai,anthropic", "LLM_API_KEY": "k"}, "single value"},
 		{map[string]string{"LLM_PROVIDER": "anthropic"}, "LLM_API_KEY is required"},
-		{map[string]string{"LLM_PROVIDER": "openai", "LLM_API_KEY": "k"}, "LLM_MODEL is required"},
+		{map[string]string{"LLM_PROVIDER": "openai", "LLM_BASE_URL": "http://ollama:11434/v1"}, "LLM_MODEL is required"},
 		{map[string]string{"LLM_MODEL": "x"}, "require LLM_PROVIDER"},
 		{map[string]string{"LLM_PROVIDER": "anthropic", "LLM_API_KEY": "k", "LLM_BASE_URL": "ftp://x"}, "LLM_BASE_URL"},
 		{map[string]string{"LLM_PROVIDER": "anthropic", "LLM_API_KEY": "k", "LLM_MIN_CONFIDENCE": "2"}, "LLM_MIN_CONFIDENCE"},

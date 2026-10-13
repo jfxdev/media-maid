@@ -49,7 +49,7 @@ server (say `PLEX_CLAIM` from a shared env file) are ignored with a warning.
 | `PREFERRED_LANGUAGE` | no | — | BCP 47 tag (`pt-BR`, `es`) for localized folder names, see below |
 | `LLM_PROVIDER` | no | — | `openai` or `anthropic`; leave empty to disable the LLM layer |
 | `LLM_API_KEY` | no² | — | key for the LLM endpoint |
-| `LLM_MODEL` | no² | `claude-haiku-5-5` (anthropic) | model name; required for `openai` |
+| `LLM_MODEL` | no² | `claude-haiku-5-5` (anthropic), `gpt-6-luna` (openai) | model name; required with `LLM_BASE_URL` on `openai` |
 | `LLM_BASE_URL` | no | provider default | any OpenAI-compatible server (Ollama, LM Studio, OpenRouter, vLLM) or an Anthropic gateway |
 | `LLM_MIN_CONFIDENCE` | no | `0.7` | below this parser confidence the LLM is consulted; also the minimum confidence its answers need |
 | `LLM_TIMEOUT` | no | `20s` | per request, at most `2m` |
@@ -65,7 +65,8 @@ server (say `PLEX_CLAIM` from a shared env file) are ignored with a warning.
 
 ¹ Set both or neither; without them, sync and server-side orphan checks are off.
 ² `LLM_API_KEY` is required with the public endpoints (no `LLM_BASE_URL`);
-`LLM_MODEL` is required with `openai`.
+`LLM_MODEL` is required with `openai` plus `LLM_BASE_URL` (Ollama, LM Studio,
+OpenRouter…), where the default model name does not exist.
 The folders (including `STATE_DIR`) must be distinct, non-nested and inside
 mounted volumes.
 

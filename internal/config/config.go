@@ -304,8 +304,10 @@ func loadLLM(getenv func(string) string, fail func(string, ...any)) LLMConfig {
 	if hasMultiple(l.APIKey) {
 		fail("LLM_API_KEY must be a single value")
 	}
-	if l.Model == "" && l.Provider == LLMOpenAI {
-		fail("LLM_MODEL is required with LLM_PROVIDER=openai")
+	// The public OpenAI endpoint has a default model; another server
+	// (Ollama, LM Studio, a gateway) names its own.
+	if l.Model == "" && l.Provider == LLMOpenAI && l.BaseURL != "" {
+		fail("LLM_MODEL is required with LLM_PROVIDER=openai and LLM_BASE_URL")
 	}
 	if hasMultiple(l.Model) {
 		fail("LLM_MODEL must be a single value")

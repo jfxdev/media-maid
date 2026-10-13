@@ -10,6 +10,10 @@ import (
 // (Ollama, LM Studio, OpenRouter, vLLM) works through LLM_BASE_URL.
 const DefaultOpenAIURL = "https://api.openai.com/v1"
 
+// DefaultOpenAIModel is used when LLM_MODEL is empty on the public OpenAI
+// endpoint. A custom LLM_BASE_URL always needs LLM_MODEL.
+const DefaultOpenAIModel = "gpt-6-luna"
+
 type openAI struct {
 	url, key, model string
 	http            *http.Client
@@ -19,6 +23,9 @@ type openAI struct {
 func newOpenAI(baseURL, key, model string, c *http.Client) *openAI {
 	if baseURL == "" {
 		baseURL = DefaultOpenAIURL
+		if model == "" {
+			model = DefaultOpenAIModel
+		}
 	}
 	return &openAI{url: strings.TrimRight(baseURL, "/") + "/chat/completions", key: key, model: model, http: c, ladder: ladder{max: 2}}
 }

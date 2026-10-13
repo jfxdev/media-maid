@@ -367,3 +367,18 @@ func TestCachePersistence(t *testing.T) {
 		t.Errorf("requests = %d, want 1 (served from the imported cache)", len(*reqs))
 	}
 }
+
+func TestDefaultModels(t *testing.T) {
+	if m := newOpenAI("", "k", "", nil).model; m != DefaultOpenAIModel {
+		t.Errorf("public OpenAI default = %q", m)
+	}
+	if m := newOpenAI("http://ollama:11434/v1", "", "", nil).model; m != "" {
+		t.Errorf("a custom server must not get the OpenAI default, got %q", m)
+	}
+	if m := newAnthropic("", "k", "", nil).model; m != "claude-haiku-5-5" {
+		t.Errorf("anthropic default = %q", m)
+	}
+	if m := newOpenAI("", "k", "gpt-x", nil).model; m != "gpt-x" {
+		t.Errorf("LLM_MODEL must win, got %q", m)
+	}
+}
