@@ -11,8 +11,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/jfxdev/media-maid/internal/assist"
 	"github.com/jfxdev/media-maid/internal/integration"
@@ -21,15 +23,33 @@ import (
 	"github.com/jfxdev/media-maid/internal/safepath"
 )
 
-type fakeSyncer struct{ n atomic.Int32 }
+type fakeSyncer struct {
+	n     atomic.Int32
+	mu    sync.Mutex
+	paths []string
+}
 
-func (f *fakeSyncer) Request()                      { f.n.Add(1) }
+func (f *fakeSyncer) Request(paths ...string) {
+	f.n.Add(1)
+	f.mu.Lock()
+	f.paths = append(f.paths, paths...)
+	f.mu.Unlock()
+}
 func (f *fakeSyncer) SyncNow(context.Context) error { return nil }
 
 type fakeMeta struct{}
 
 func (fakeMeta) Search(_ context.Context, kind metadata.Kind, title string, year int) ([]metadata.Result, error) {
 	if kind != metadata.Movie {
+		switch title {
+		case "One Piece":
+			return []metadata.Result{{Title: "One Piece", Year: 1999, TMDBID: 37854}}, nil
+		case "The Office":
+			return []metadata.Result{
+				{Title: "The Office", Year: 2001, TMDBID: 2996, OriginCountry: "GB"},
+				{Title: "The Office", Year: 2005, TMDBID: 2316, OriginCountry: "US"},
+			}, nil
+		}
 		return nil, nil
 	}
 	switch title {
@@ -53,6 +73,13 @@ func (fakeMeta) Titles(_ context.Context, _ metadata.Kind, id int) ([]metadata.T
 		return []metadata.Title{{Language: "pt", Country: "BR", Title: "A Viagem de Chihiro", Source: "translation"}}, nil
 	case 27205:
 		return []metadata.Title{{Country: "BR", Title: "A Origem", Source: "alternative"}, {Country: "FR", Title: "Inception FR", Source: "alternative"}}, nil
+	}
+	return nil, nil
+}
+
+func (fakeMeta) Seasons(_ context.Context, id int) ([]metadata.Season, error) {
+	if id == 37854 {
+		return []metadata.Season{{Number: 1, Episodes: 61}, {Number: 2, Episodes: 16}}, nil
 	}
 	return nil, nil
 }
@@ -586,5 +613,179 @@ func TestLLMEndToEnd(t *testing.T) {
 	r = organizeOne(t, e, "Inception.2010.1080p.BluRay.mkv")
 	if r.ResolvedBy != ByTMDB || calls.Load() != 1 {
 		t.Errorf("confident name must not call the llm: %+v, %d calls", r, calls.Load())
+	}
+}
+
+func TestReleaseShapes(t *testing.T) {
+	e := newEnv(t, "plex")
+	files := map[string]string{
+		// Season pack whose files only carry the episode number.
+		"Show.Name.S01.COMPLETE/Show.Name.E05.mkv": filepath.Join(e.tv, "Show Name", "Season 01", "Show Name S01E05.mkv"),
+		// Multi-file movie: both parts land in one folder.
+		"Old.Movie.1990.DVDRip/Old.Movie.1990.DVDRip.CD1.mkv": filepath.Join(e.movies, "Old Movie (1990)", "Old Movie (1990) - part1.mkv"),
+		"Old.Movie.1990.DVDRip/Old.Movie.1990.DVDRip.CD2.mkv": filepath.Join(e.movies, "Old Movie (1990)", "Old Movie (1990) - part2.mkv"),
+		// Edition: Plex tag, and TMDB still matches the bare title.
+		"Inception.2010.Extended.Cut.1080p.mkv": filepath.Join(e.movies, "Inception (2010) {tmdb-27205} {edition-Extended Cut}", "Inception (2010) {tmdb-27205} {edition-Extended Cut}.mkv"),
+		// Absolute anime numbering mapped through TMDB seasons (61 + 16).
+		"[Grp] One Piece - 65 (1080p).mkv": filepath.Join(e.tv, "One Piece (1999) {tmdb-37854}", "Season 02", "One Piece S02E04.mkv"),
+		// Origin marker picks the US remake.
+		"The.Office.US.S02E03.720p.mkv": filepath.Join(e.tv, "The Office (2005) {tmdb-2316}", "Season 02", "The Office S02E03.mkv"),
+	}
+	for src := range files {
+		write(t, filepath.Join(e.downloads, src))
+	}
+	res, err := e.org.Scan(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for src, dst := range files {
+		if _, err := os.Stat(dst); err != nil {
+			t.Errorf("%s: %v (results %+v)", src, err, res)
+			continue
+		}
+		if !sameInode(t, filepath.Join(e.downloads, src), dst) {
+			t.Errorf("%s is not linked to %s", src, dst)
+		}
+	}
+}
+
+func TestUnidentifiedSameName(t *testing.T) {
+	e := newEnv(t, "jellyfin")
+	a := filepath.Join(e.downloads, "A", "Some.Film.2001.1080p.WEB-DL.mkv")
+	b := filepath.Join(e.downloads, "B", "Some.Film.2001.1080p.WEB-DL.mkv")
+	write(t, a)
+	write(t, b)
+	write(t, filepath.Join(e.downloads, "B", "Some.Film.2001.1080p.WEB-DL.en.srt"))
+	res, err := e.org.Scan(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := statuses(res)
+	linked, conflict := 0, 0
+	for _, s := range st {
+		switch s {
+		case jobs.StatusLinked:
+			linked++
+		case jobs.StatusConflict:
+			conflict++
+		}
+	}
+	if linked != 1 || conflict != 1 {
+		t.Errorf("statuses = %v, want one linked video and one conflict", st)
+	}
+}
+
+// countingMeta counts TMDB searches.
+type countingMeta struct {
+	fakeMeta
+	n atomic.Int32
+}
+
+func (c *countingMeta) Search(ctx context.Context, kind metadata.Kind, title string, year int) ([]metadata.Result, error) {
+	c.n.Add(1)
+	return c.fakeMeta.Search(ctx, kind, title, year)
+}
+
+func TestLedger(t *testing.T) {
+	meta := &countingMeta{}
+	ledger := NewLedger()
+	e := newEnv(t, "jellyfin", func(o *Options) { o.Meta = meta; o.Ledger = ledger })
+	src := filepath.Join(e.downloads, "Inception.2010.1080p", "Inception.2010.1080p.mkv")
+	write(t, src)
+	dest := filepath.Join(e.movies, "Inception (2010) [tmdbid-27205]", "Inception (2010) [tmdbid-27205].mkv")
+
+	if _, err := e.org.Scan(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !sameInode(t, src, dest) || meta.n.Load() != 1 {
+		t.Fatalf("first scan: searches = %d", meta.n.Load())
+	}
+	e.syncer.mu.Lock()
+	if len(e.syncer.paths) != 1 || e.syncer.paths[0] != filepath.Dir(dest) {
+		t.Errorf("sync paths = %v, want the movie folder", e.syncer.paths)
+	}
+	e.syncer.mu.Unlock()
+
+	// A restart with the saved ledger: nothing is identified again.
+	data, err := ledger.Export()
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored := NewLedger()
+	if err := restored.Import(data); err != nil {
+		t.Fatal(err)
+	}
+	meta2 := &countingMeta{}
+	e2 := *e
+	e2.org = New(Options{
+		DownloadsDir: e.downloads, Movies: e.org.movies, TV: e.org.tv, Filter: e.org.filter, Guard: e.org.guard,
+		Meta: meta2, Platform: e.org.platform, Syncer: e.syncer, History: e.history, Log: e.org.log, Ledger: restored,
+	})
+	res, err := e2.org.Scan(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta2.n.Load() != 0 || len(res) != 1 || res[0].Status != jobs.StatusExists {
+		t.Errorf("rescan: searches = %d, results %+v", meta2.n.Load(), res)
+	}
+
+	// The user deletes the movie from the library: automatic runs respect it.
+	os.Remove(dest)
+	res, _ = e2.org.Scan(context.Background())
+	if len(res) != 1 || res[0].Status != jobs.StatusSkipped || res[0].Error != errRemovedMsg {
+		t.Errorf("after deletion: %+v", res)
+	}
+	if _, err := os.Stat(dest); err == nil {
+		t.Error("a deleted library entry was linked again by a scan")
+	}
+	// An explicit request links it again.
+	res, _ = e2.org.Organize(context.Background(), src, OrganizeOptions{Explicit: true})
+	if len(res) != 1 || res[0].Status != jobs.StatusLinked || !sameInode(t, src, dest) {
+		t.Errorf("explicit organize: %+v", res)
+	}
+
+	// Entries for files gone from the downloads folder are pruned by a scan.
+	os.RemoveAll(filepath.Dir(src))
+	e2.org.Scan(context.Background())
+	if data, _ := restored.Export(); string(data) != "{}" {
+		t.Errorf("ledger not pruned: %s", data)
+	}
+}
+
+func TestMinAge(t *testing.T) {
+	e := newEnv(t, "jellyfin")
+	fresh := filepath.Join(e.downloads, "Inception.2010.mkv")
+	old := filepath.Join(e.downloads, "Dune.2021.mkv")
+	write(t, fresh)
+	write(t, old)
+	past := time.Now().Add(-time.Hour)
+	os.Chtimes(old, past, past)
+	res, err := e.org.Organize(context.Background(), e.downloads, OrganizeOptions{MinAge: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res) != 1 || res[0].Source != "Dune.2021.mkv" {
+		t.Errorf("results = %+v, want only the settled file", res)
+	}
+}
+
+// Subtitles matched by episode number still resolve when the videos come
+// from the ledger on a later scan.
+func TestLedgerKeepsSubtitleMatching(t *testing.T) {
+	e := newEnv(t, "jellyfin")
+	dir := filepath.Join(e.downloads, "Show.S01.1080p")
+	write(t, filepath.Join(dir, "Show.S01E01.1080p.mkv"))
+	write(t, filepath.Join(dir, "Show.S01E02.1080p.mkv"))
+	write(t, filepath.Join(dir, "Subs", "S01E02.en.srt"))
+	for run := 0; run < 2; run++ {
+		res, err := e.org.Scan(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, r := range res {
+			if r.Status == jobs.StatusSkipped {
+				t.Errorf("run %d: %+v", run, r)
+			}
+		}
 	}
 }

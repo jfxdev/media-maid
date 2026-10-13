@@ -5,8 +5,10 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestTMDB(t *testing.T) {
@@ -129,5 +131,88 @@ func TestPick(t *testing.T) {
 	}
 	if Score("Inception", 2010, Result{Title: "Inception", Year: 2001}) >= Score("Inception", 2010, Result{Title: "Inception", Year: 2010}) {
 		t.Error("a wrong year must lower the score")
+	}
+}
+
+func TestPickIn(t *testing.T) {
+	cands := []Result{
+		{Title: "The Office", Year: 2001, TMDBID: 2996, OriginCountry: "GB"},
+		{Title: "The Office", Year: 2005, TMDBID: 2316, OriginCountry: "US"},
+	}
+	if best, _, margin, _ := PickIn("The Office", 0, "US", cands); best.TMDBID != 2316 || margin < MinMargin {
+		t.Errorf("US = %d margin %.2f", best.TMDBID, margin)
+	}
+	if best, _, _, _ := PickIn("The Office", 0, "UK", cands); best.TMDBID != 2996 {
+		t.Errorf("UK = %d", best.TMDBID)
+	}
+	if _, _, margin, _ := Pick("The Office", 0, cands); margin >= MinMargin {
+		t.Errorf("without a country the pick must stay a tie, margin %.2f", margin)
+	}
+}
+
+func TestAbsoluteToSeason(t *testing.T) {
+	seasons := []Season{{1, 28}, {2, 10}}
+	tests := []struct {
+		abs, season, ep int
+		ok              bool
+	}{
+		{1, 1, 1, true}, {28, 1, 28, true}, {29, 2, 1, true}, {38, 2, 10, true}, {39, 0, 0, false}, {0, 0, 0, false},
+	}
+	for _, tt := range tests {
+		s, e, ok := AbsoluteToSeason(seasons, tt.abs)
+		if s != tt.season || e != tt.ep || ok != tt.ok {
+			t.Errorf("AbsoluteToSeason(%d) = %d, %d, %v", tt.abs, s, e, ok)
+		}
+	}
+}
+
+func TestTMDBCacheExpiryAndExport(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		switch r.URL.Path {
+		case "/tv/1":
+			io.WriteString(w, `{"seasons":[{"season_number":0,"episode_count":3},{"season_number":2,"episode_count":12},{"season_number":1,"episode_count":28}]}`)
+		default:
+			io.WriteString(w, `{"results":[]}`)
+		}
+	}))
+	defer srv.Close()
+	ctx := context.Background()
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	m := NewTMDB("k", srv.URL)
+	m.now = func() time.Time { return now }
+	changes := 0
+	m.OnChange = func() { changes++ }
+
+	seasons, err := m.Seasons(ctx, 1)
+	if err != nil || len(seasons) != 2 || seasons[0] != (Season{1, 28}) {
+		t.Fatalf("seasons = %+v %v", seasons, err)
+	}
+	m.Search(ctx, Movie, "new release", 2026)
+	m.Search(ctx, Movie, "new release", 2026)
+	if calls.Load() != 2 || changes != 2 {
+		t.Fatalf("calls = %d changes = %d, want 2 and 2", calls.Load(), changes)
+	}
+	// An empty result expires after a day, so a later TMDB entry is found.
+	now = now.Add(25 * time.Hour)
+	m.Search(ctx, Movie, "new release", 2026)
+	if calls.Load() != 3 {
+		t.Errorf("negative result not refreshed: %d calls", calls.Load())
+	}
+
+	data, err := m.Export()
+	if err != nil || strings.Contains(string(data), `"k"`) {
+		t.Fatalf("export = %s %v", data, err)
+	}
+	m2 := NewTMDB("k", srv.URL)
+	m2.now = func() time.Time { return now }
+	if err := m2.Import(data); err != nil {
+		t.Fatal(err)
+	}
+	m2.Search(ctx, Movie, "new release", 2026)
+	m2.Seasons(ctx, 1) // expired (seasons live a day): fetched again
+	if calls.Load() != 4 {
+		t.Errorf("imported cache: %d calls, want 4", calls.Load())
 	}
 }

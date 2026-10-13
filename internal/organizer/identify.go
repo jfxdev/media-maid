@@ -48,10 +48,12 @@ func (o *Organizer) identify(ctx context.Context, rel string, a parser.Analysis,
 	var score, margin float64
 	var found, tmdbFailed bool
 	if parsed && o.hasMeta {
+		// "The Office US" is searched as "The Office", preferring US entries.
+		query, _ := parser.SplitCountry(a.Title)
 		var err error
-		cands, err = o.meta.Search(ctx, metaKind(a.Kind), a.Title, a.Year)
+		cands, err = o.meta.Search(ctx, metaKind(a.Kind), query, a.Year)
 		tmdbFailed = err != nil
-		best, score, margin, found = metadata.Pick(a.Title, a.Year, cands)
+		best, score, margin, found = metadata.PickIn(query, a.Year, a.Country, cands)
 	}
 
 	ambiguous := !parsed || a.Confidence < o.minConf
@@ -77,6 +79,7 @@ func (o *Organizer) identify(ctx context.Context, rel string, a parser.Analysis,
 		if id.match.Year > 0 {
 			id.media.Year = id.match.Year
 		}
+		o.mapAbsolute(ctx, &id)
 	}
 	if o.language != "" {
 		o.localize(ctx, &id)
@@ -103,6 +106,13 @@ func (o *Organizer) askLLM(ctx context.Context, rel string, a parser.Analysis, c
 	if d.Kind == a.Kind && d.Kind == parser.Episode && a.AirDate != "" {
 		m.AirDate, m.Season, m.Episodes = a.AirDate, a.Season, nil
 	}
+	// Facts the model is not asked about are kept from the parser.
+	if d.Kind == a.Kind {
+		m.Part, m.Edition = a.Part, a.Edition
+		if d.Kind == parser.Episode && a.Absolute > 0 && len(d.Episodes) == 1 && d.Episodes[0] == a.Absolute {
+			m.Absolute = a.Absolute
+		}
+	}
 	var match *metadata.Result
 	switch {
 	case d.Choice >= 0:
@@ -124,6 +134,23 @@ func (o *Organizer) askLLM(ctx context.Context, rel string, a parser.Analysis, c
 	id.media, id.match, id.by = m, match, ByLLM
 	o.log.Info("llm decision", "source", rel, "kind", d.Kind, "title", m.Title, "confidence", d.Confidence)
 	return true
+}
+
+// mapAbsolute turns an anime-style absolute episode number into the season
+// and episode of the accepted TMDB series ("One Piece - 1080" is not S01E1080
+// on TMDB). When the seasons are unknown or too short, the parse is kept.
+func (o *Organizer) mapAbsolute(ctx context.Context, id *identity) {
+	m := &id.media
+	if m.Kind != parser.Episode || m.Absolute <= 0 || m.AirDate != "" {
+		return
+	}
+	seasons, err := o.meta.Seasons(ctx, id.match.TMDBID)
+	if err != nil {
+		return
+	}
+	if season, ep, ok := metadata.AbsoluteToSeason(seasons, m.Absolute); ok {
+		m.Season, m.Episodes = season, []int{ep}
+	}
 }
 
 // localize replaces the title with the official one in o.language: a TMDB

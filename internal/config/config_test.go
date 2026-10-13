@@ -54,6 +54,7 @@ func TestLoadLLM(t *testing.T) {
 	valid := []map[string]string{
 		{"LLM_PROVIDER": "anthropic", "LLM_API_KEY": "k"},
 		{"LLM_PROVIDER": "OpenAI", "LLM_API_KEY": "k", "LLM_MODEL": "gpt-x"},
+		{"LLM_PROVIDER": "openai", "LLM_API_KEY": "k"}, // public endpoint: default model
 		{"LLM_PROVIDER": "openai", "LLM_BASE_URL": "http://ollama:11434/v1/", "LLM_MODEL": "llama3", "LLM_MIN_CONFIDENCE": "0.5", "LLM_TIMEOUT": "45s"},
 		{"PREFERRED_LANGUAGE": "pt-BR"},
 		{"PREFERRED_LANGUAGE": "es-419"},
@@ -81,7 +82,7 @@ func TestLoadLLM(t *testing.T) {
 		{map[string]string{"LLM_PROVIDER": "gemini", "LLM_API_KEY": "k"}, "LLM_PROVIDER"},
 		{map[string]string{"LLM_PROVIDER": "openai,anthropic", "LLM_API_KEY": "k"}, "single value"},
 		{map[string]string{"LLM_PROVIDER": "anthropic"}, "LLM_API_KEY is required"},
-		{map[string]string{"LLM_PROVIDER": "openai", "LLM_API_KEY": "k"}, "LLM_MODEL is required"},
+		{map[string]string{"LLM_PROVIDER": "openai", "LLM_BASE_URL": "http://ollama:11434/v1"}, "LLM_MODEL is required"},
 		{map[string]string{"LLM_MODEL": "x"}, "require LLM_PROVIDER"},
 		{map[string]string{"LLM_PROVIDER": "anthropic", "LLM_API_KEY": "k", "LLM_BASE_URL": "ftp://x"}, "LLM_BASE_URL"},
 		{map[string]string{"LLM_PROVIDER": "anthropic", "LLM_API_KEY": "k", "LLM_MIN_CONFIDENCE": "2"}, "LLM_MIN_CONFIDENCE"},
@@ -133,7 +134,10 @@ func TestLoadInvalid(t *testing.T) {
 		{"url without token", func(e map[string]string) { delete(e, "MEDIA_SERVER_TOKEN") }, nil, "set together"},
 		{"multiple tokens", func(e map[string]string) { e["MEDIA_SERVER_TOKEN"] = "a,b" }, nil, "MEDIA_SERVER_TOKEN must be a single"},
 		{"foreign var", nil, []string{"PLEX_TOKEN=x"}, "single tenant"},
-		{"legacy jellyfin var", nil, []string{"JELLYFIN_URL=http://x"}, "single tenant"},
+		{"other server var", nil, []string{"EMBY_URL=http://x"}, "single tenant"},
+		{"state dir relative", func(e map[string]string) { e["STATE_DIR"] = "state" }, nil, "STATE_DIR must be an absolute"},
+		{"state dir nested", func(e map[string]string) { e["STATE_DIR"] = "/data/downloads/.state" }, nil, "non-nested"},
+		{"tiny scan interval", func(e map[string]string) { e["SCAN_INTERVAL"] = "10s" }, nil, "SCAN_INTERVAL"},
 		{"no api token", func(e map[string]string) { delete(e, "API_TOKEN") }, nil, "API_TOKEN"},
 		{"short api token", func(e map[string]string) { e["API_TOKEN"] = "short" }, nil, "API_TOKEN"},
 		{"relative dir", func(e map[string]string) { e["MOVIES_DIR"] = "movies" }, nil, "absolute"},
@@ -160,6 +164,23 @@ func TestLoadInvalid(t *testing.T) {
 	}
 }
 
+func TestLoadOwnServerVarsWarn(t *testing.T) {
+	c, err := load(baseEnv(), "JELLYFIN_PublishedServerUrl=http://x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.Warnings) != 1 || !strings.Contains(c.Warnings[0], "JELLYFIN_PublishedServerUrl is ignored") {
+		t.Errorf("warnings = %v", c.Warnings)
+	}
+	env := baseEnv()
+	env["STATE_DIR"] = "/state"
+	env["SCAN_INTERVAL"] = "15m"
+	c, err = load(env)
+	if err != nil || c.StateDir != "/state" || c.ScanInterval.Minutes() != 15 {
+		t.Errorf("state/scan = %+v %v", c, err)
+	}
+}
+
 func TestPathMap(t *testing.T) {
 	env := baseEnv()
 	env["SERVER_PATH_MAP"] = "/media=/data/media"
@@ -180,6 +201,14 @@ func TestPathMap(t *testing.T) {
 	for in, want := range cases {
 		if got := c.PathMap.Translate(in); got != want {
 			t.Errorf("Translate(%q) = %q, want %q", in, got, want)
+		}
+	}
+	for local, want := range map[string]string{
+		"/data/media/tv/Show/Season 01": "/media/tv/Show/Season 01",
+		"/data/other":                   "/data/other",
+	} {
+		if got := c.PathMap.ToServer(local); got != want {
+			t.Errorf("ToServer(%q) = %q, want %q", local, got, want)
 		}
 	}
 }

@@ -93,9 +93,22 @@ func Score(title string, year int, r Result) float64 {
 // Pick returns the best candidate, its score and its lead over the runner-up.
 // On equal scores the earlier (more relevant) candidate wins.
 func Pick(title string, year int, cands []Result) (best Result, score, margin float64, ok bool) {
+	return PickIn(title, year, "", cands)
+}
+
+// PickIn is Pick for a title with an origin marker ("The Office US"):
+// candidates from that country are preferred over remakes from elsewhere.
+func PickIn(title string, year int, country string, cands []Result) (best Result, score, margin float64, ok bool) {
 	second := 0.0
 	for i, c := range cands {
 		s := Score(title, year, c)
+		if country != "" && c.OriginCountry != "" {
+			if strings.EqualFold(c.OriginCountry, country) || (country == "UK" && c.OriginCountry == "GB") {
+				s = min(s+0.15, 1)
+			} else {
+				s = max(s-0.15, 0)
+			}
+		}
 		switch {
 		case i == 0 || s > score:
 			if i > 0 {

@@ -29,10 +29,10 @@ func TestSanitize(t *testing.T) {
 
 func TestPaths(t *testing.T) {
 	movie := parser.Media{Kind: parser.Movie, Title: "Inception", Year: 2010}
-	if got := MoviePath(movie, "[tmdbid-27205]", ".MKV"); got != "Inception (2010) [tmdbid-27205]/Inception (2010) [tmdbid-27205].mkv" {
+	if got := MoviePath(movie, "[tmdbid-27205]", "", ".MKV"); got != "Inception (2010) [tmdbid-27205]/Inception (2010) [tmdbid-27205].mkv" {
 		t.Errorf("MoviePath = %q", got)
 	}
-	if got := MoviePath(movie, "", "mkv"); got != "Inception (2010)/Inception (2010).mkv" {
+	if got := MoviePath(movie, "", "", "mkv"); got != "Inception (2010)/Inception (2010).mkv" {
 		t.Errorf("MoviePath no tag = %q", got)
 	}
 	ep := parser.Media{Kind: parser.Episode, Title: "Breaking Bad", Year: 2008, Season: 1, Episodes: []int{2, 3}}
@@ -44,10 +44,29 @@ func TestPaths(t *testing.T) {
 		t.Errorf("EpisodePath air date = %q", got)
 	}
 	evil := parser.Media{Kind: parser.Movie, Title: "../../../root/.ssh/x"}
-	if got := MoviePath(evil, "", ".mkv"); strings.Contains(got, "..") || strings.Count(got, "/") != 1 {
+	if got := MoviePath(evil, "", "", ".mkv"); strings.Contains(got, "..") || strings.Count(got, "/") != 1 {
 		t.Errorf("escaping path produced: %q", got)
 	}
 	if got := SubtitlePath("Inception (2010)/Inception (2010).mkv", "pt-BR", true, false, ".SRT"); got != "Inception (2010)/Inception (2010).pt-BR.forced.srt" {
 		t.Errorf("SubtitlePath = %q", got)
+	}
+}
+
+func TestMovieEditionAndPart(t *testing.T) {
+	m := parser.Media{Kind: parser.Movie, Title: "Avatar", Year: 2009, Edition: "Extended Cut"}
+	tests := []struct {
+		media        parser.Media
+		idTag, edTag string
+		want         string
+	}{
+		{m, "[tmdbid-19995]", "", "Avatar (2009) [tmdbid-19995]/Avatar (2009) [tmdbid-19995] - Extended Cut.mkv"},
+		{m, "{tmdb-19995}", "{edition-Extended Cut}", "Avatar (2009) {tmdb-19995} {edition-Extended Cut}/Avatar (2009) {tmdb-19995} {edition-Extended Cut}.mkv"},
+		{parser.Media{Kind: parser.Movie, Title: "Movie", Year: 2001, Part: 2}, "", "", "Movie (2001)/Movie (2001) - part2.mkv"},
+		{parser.Media{Kind: parser.Movie, Title: "Movie", Edition: "Director's Cut", Part: 1}, "", "", "Movie/Movie - Director's Cut - part1.mkv"},
+	}
+	for _, tt := range tests {
+		if got := MoviePath(tt.media, tt.idTag, tt.edTag, ".mkv"); got != tt.want {
+			t.Errorf("MoviePath(%+v) = %q, want %q", tt.media, got, tt.want)
+		}
 	}
 }

@@ -119,3 +119,74 @@ func TestWatcherKeepsProcessingDuringOrganize(t *testing.T) {
 	}
 	t.Fatal("release created during organize was never organized")
 }
+
+func TestUnitOf(t *testing.T) {
+	root := t.TempDir()
+	for _, d := range []string{"movies/Done.2001/Subs", "tv/Show.S01/Season 01", "Release.2020/Sample", "loose"} {
+		os.MkdirAll(filepath.Join(root, d), 0o755)
+	}
+	w := &Watcher{root: root}
+	tests := map[string]string{
+		"File.2000.mkv":                         "File.2000.mkv",
+		"movies/Done.2001/Done.2001.mkv":        "movies/Done.2001",
+		"movies/Done.2001/Subs/en.srt":          "movies/Done.2001",
+		"movies/Single.File.2003.mkv":           "movies/Single.File.2003.mkv", // category with releases
+		"tv/Show.S01/Season 01/Show.S01E01.mkv": "tv/Show.S01",
+		"Release.2020/Sample/sample.mkv":        "Release.2020",
+		"loose/Movie.2004.mkv":                  "loose",
+	}
+	for rel, want := range tests {
+		if got := w.unitOf(filepath.Join(root, rel), map[string]bool{}); got != filepath.Join(root, want) {
+			t.Errorf("unitOf(%s) = %s, want %s", rel, got, want)
+		}
+	}
+	if got := w.unitOf(filepath.Join(filepath.Dir(root), "elsewhere.mkv"), map[string]bool{}); got != "" {
+		t.Errorf("outside root = %q", got)
+	}
+}
+
+// A finished release must not wait for another download in the same
+// torrent client category.
+func TestWatcherCategoryFolders(t *testing.T) {
+	root := t.TempDir()
+	done := filepath.Join(root, "movies", "Done.2001")
+	active := filepath.Join(root, "movies", "Active.2002")
+	os.MkdirAll(done, 0o755)
+	os.MkdirAll(active, 0o755)
+
+	var mu sync.Mutex
+	var calls []string
+	w, err := New(root, time.Second, func(_ context.Context, p string) {
+		mu.Lock()
+		calls = append(calls, p)
+		mu.Unlock()
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go w.Run(ctx)
+
+	time.Sleep(200 * time.Millisecond)
+	os.WriteFile(filepath.Join(done, "Done.2001.mkv"), []byte("x"), 0o644)
+	f, _ := os.Create(filepath.Join(active, "Active.2002.mkv"))
+	defer f.Close()
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		f.Write([]byte("data"))
+		mu.Lock()
+		got := append([]string(nil), calls...)
+		mu.Unlock()
+		for _, c := range got {
+			if c == active {
+				t.Fatal("organized while still being written")
+			}
+			if c == done {
+				return
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatalf("finished release was held back by an active one: calls = %v", calls)
+}

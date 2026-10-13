@@ -55,9 +55,24 @@ func withTag(name, tag string) string {
 }
 
 // MoviePath returns "Title (Year) tag/Title (Year) tag.ext".
-func MoviePath(m parser.Media, idTag, ext string) string {
+//
+// An edition goes into editionTag when the server has a tag for it (Plex's
+// "{edition-Extended Cut}", in folder and file names); otherwise it becomes a
+// " - Extended Cut" file suffix, which Jellyfin and Emby read as a version of
+// the movie in the same folder. A file part becomes " - part1".
+func MoviePath(m parser.Media, idTag, editionTag, ext string) string {
 	name := withTag(withYear(m.Title, m.Year), idTag)
-	return path.Join(name, name+cleanExt(ext))
+	if editionTag != "" {
+		name = withTag(name, editionTag)
+	}
+	file := name
+	if m.Edition != "" && editionTag == "" {
+		file += " - " + Sanitize(m.Edition)
+	}
+	if m.Part > 0 {
+		file += fmt.Sprintf(" - part%d", m.Part)
+	}
+	return path.Join(name, file+cleanExt(ext))
 }
 
 // EpisodePath returns "Show (Year) tag/Season 01/Show S01E02[-E03].ext", or

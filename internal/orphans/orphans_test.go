@@ -286,3 +286,82 @@ func TestRemoveRejectsRoot(t *testing.T) {
 		t.Error("tv library removed")
 	}
 }
+
+func TestUnlinkedDownloads(t *testing.T) {
+	vol := t.TempDir()
+	downloads := filepath.Join(vol, "downloads")
+	movies := filepath.Join(vol, "movies")
+	os.MkdirAll(movies, 0o755)
+	linked := filepath.Join(downloads, "Linked.2001", "Linked.2001.mkv")
+	unlinked := filepath.Join(downloads, "Gone.2002", "Gone.2002.mkv")
+	copied := filepath.Join(downloads, "Copied.2003.mkv")
+	for _, p := range []string{linked, unlinked, copied, filepath.Join(downloads, "Gone.2002", "Sample", "sample.mkv"), filepath.Join(downloads, "notes.txt")} {
+		write(t, p)
+	}
+	os.MkdirAll(filepath.Join(movies, "Linked (2001)"), 0o755)
+	if err := os.Link(linked, filepath.Join(movies, "Linked (2001)", "Linked (2001).mkv")); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(movies, "Copied (2003)", "Copied (2003).mkv"))
+	ledger := organizer.NewLedger()
+	fi, _ := os.Stat(copied)
+	ledger.Put(fi, organizer.LedgerEntry{Lib: "movies", Dest: "Copied (2003)/Copied (2003).mkv", Status: jobs.StatusCopied})
+
+	mr, _ := os.OpenRoot(movies)
+	defer mr.Close()
+	g, _ := safepath.NewGuard([]string{vol})
+	det := New(Options{
+		Libraries: []organizer.Library{{Name: "movies", Path: movies, Root: mr}},
+		Filter:    organizer.Filter{Video: map[string]bool{".mkv": true}},
+		Guard:     g, History: jobs.NewHistory(10), Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Downloads: downloads, Ledger: ledger,
+	})
+	rep, err := det.Scan(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	var id string
+	for _, o := range rep.Orphans {
+		if o.Type == TypeUnlinkedDownload {
+			got = append(got, o.Path)
+			id = o.ID
+		}
+	}
+	if len(got) != 1 || got[0] != "downloads/Gone.2002/Gone.2002.mkv" {
+		t.Fatalf("unlinked = %v (report %+v)", got, rep)
+	}
+	if res := det.Remove(context.Background(), []string{id}); res[0].Status != jobs.StatusError || res[0].Error != errNotRemovable {
+		t.Errorf("remove = %+v", res)
+	}
+	if _, err := os.Stat(unlinked); err != nil {
+		t.Error("a download was removed")
+	}
+}
+
+func TestReportPersistence(t *testing.T) {
+	e := newEnv(t, false, false)
+	write(t, filepath.Join(e.movies, "Empty (2000)", "poster.jpg"))
+	rep, _ := e.det.Scan(context.Background())
+	if len(rep.Orphans) != 1 {
+		t.Fatalf("orphans = %+v", rep.Orphans)
+	}
+	data, err := e.det.Export()
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored := New(Options{Libraries: e.det.libraries, Filter: e.det.filter, Guard: e.det.guard, History: jobs.NewHistory(10), Log: e.det.log})
+	if err := restored.Import(data); err != nil {
+		t.Fatal(err)
+	}
+	if r := restored.Report(); r == nil || len(r.Orphans) != 1 {
+		t.Fatalf("restored report = %+v", r)
+	}
+	// Removal after a restart still works, with revalidation.
+	if res := restored.Remove(context.Background(), []string{rep.Orphans[0].ID}); res[0].Status != jobs.StatusRemoved {
+		t.Errorf("remove after restore = %+v", res)
+	}
+	if _, err := os.Stat(filepath.Join(e.movies, "Empty (2000)")); err == nil {
+		t.Error("directory not removed")
+	}
+}
