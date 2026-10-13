@@ -162,6 +162,11 @@ func TestHealthReflectsWatcher(t *testing.T) {
 	if code, body := do(t, h, "GET", "/healthz", "", ""); code != 200 || !strings.Contains(body, `"ok"`) {
 		t.Errorf("watcher up: got %d %s", code, body)
 	}
+	degraded := true
+	srv.SetDegraded(func() bool { return degraded })
+	if code, body := do(t, h, "GET", "/healthz", "", ""); code != 200 || !strings.Contains(body, `"watcher":"degraded"`) {
+		t.Errorf("watcher degraded: got %d %s", code, body)
+	}
 	up = false
 	if code, body := do(t, h, "GET", "/healthz", "", ""); code != 503 || !strings.Contains(body, `"watcher":"stopped"`) {
 		t.Errorf("watcher down: got %d %s", code, body)

@@ -44,7 +44,17 @@ type Watcher struct {
 	// last time its loop went round (unix nanoseconds).
 	running  atomic.Bool
 	lastLoop atomic.Int64
+	// watchFailures counts folders that could not be watched (see Degraded).
+	watchFailures atomic.Int64
 }
+
+// addWatch is fsnotify's Add; tests replace it to simulate a watch limit.
+var addWatch = func(w *fsnotify.Watcher, dir string) error { return w.Add(dir) }
+
+// Degraded reports whether some folder could not be watched (typically the
+// inotify watch limit, fs.inotify.max_user_watches): new files there raise
+// no event, so only a periodic scan finds them. It stays set once seen.
+func (w *Watcher) Degraded() bool { return w.watchFailures.Load() > 0 }
 
 // stallLimit is how long the event loop may go without a tick before the
 // watcher reports itself unhealthy. The loop never blocks on organizing, so
@@ -85,7 +95,8 @@ func (w *Watcher) addTree(dir string) error {
 			return nil
 		}
 		if d.IsDir() {
-			if err := w.fsw.Add(p); err != nil {
+			if err := addWatch(w.fsw, p); err != nil {
+				w.watchFailures.Add(1)
 				w.log.Warn("watch failed", "dir", w.rel(p), "err", err)
 			}
 		} else if d.Type().IsRegular() || d.Type()&fs.ModeSymlink != 0 {

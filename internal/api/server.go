@@ -53,6 +53,9 @@ type Server struct {
 	scanning atomic.Bool
 	// watcherOK, when set, makes /healthz fail while the watcher is down.
 	watcherOK func() bool
+	// watcherDegraded, when set, makes /healthz say some folders are not
+	// watched (it still answers 200: periodic scans cover them).
+	watcherDegraded func() bool
 }
 
 // New builds the API server. token must already be validated.
@@ -67,6 +70,10 @@ func (s *Server) SetContext(ctx context.Context) { s.bg = ctx }
 // SetHealth makes /healthz report 503 while watcherOK returns false. Call it
 // before serving.
 func (s *Server) SetHealth(watcherOK func() bool) { s.watcherOK = watcherOK }
+
+// SetDegraded makes /healthz report "watcher": "degraded" while degraded
+// returns true. Call it before serving.
+func (s *Server) SetDegraded(degraded func() bool) { s.watcherDegraded = degraded }
 
 // Handler returns the HTTP handler.
 func (s *Server) Handler() http.Handler {
@@ -195,6 +202,10 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "unhealthy", "watcher": "stopped"})
 		return
 	}
+	if s.watcherDegraded != nil && s.watcherDegraded() {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "watcher": "degraded"})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
@@ -311,6 +322,10 @@ func (s *Server) sync(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeError(w, http.StatusBadGateway, "sync_failed")
+		return
+	}
+	if s.watcherDegraded != nil && s.watcherDegraded() {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "watcher": "degraded"})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})

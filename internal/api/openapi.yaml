@@ -31,7 +31,10 @@ paths:
       description: >-
         Answers 200 while the process serves requests and the downloads
         watcher is running; 503 when the watcher stopped or its event loop
-        stalled for more than 30 seconds.
+        stalled for more than 30 seconds. A 200 with `"watcher": "degraded"`
+        means some folders could not be watched (usually the inotify watch
+        limit): a periodic scan covers them. With `ORGANIZE_TRIGGER=hook`
+        there is no watcher and the probe only checks the process.
       operationId: health
       security: []
       responses:
@@ -43,6 +46,7 @@ paths:
                 type: object
                 properties:
                   status: { type: string, const: ok }
+                  watcher: { type: string, const: degraded }
                 required: [status]
         "503":
           description: The downloads watcher is not running.
@@ -194,6 +198,7 @@ paths:
                 type: object
                 properties:
                   status: { type: string, const: ok }
+                  watcher: { type: string, const: degraded }
                 required: [status]
         "401": { $ref: "#/components/responses/Unauthorized" }
         "409":

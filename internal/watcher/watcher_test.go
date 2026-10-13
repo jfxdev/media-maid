@@ -250,3 +250,22 @@ func TestWatcherHealthy(t *testing.T) {
 		t.Error("healthy after Run returned")
 	}
 }
+
+// A folder that cannot be watched (inotify limit) marks the watcher degraded.
+func TestWatcherDegraded(t *testing.T) {
+	root := t.TempDir()
+	os.MkdirAll(filepath.Join(root, "Release.2020"), 0o755)
+	w, err := New(root, time.Second, func(context.Context, string) {}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.Degraded() {
+		t.Fatal("degraded with every folder watched")
+	}
+	addWatch = func(*fsnotify.Watcher, string) error { return errors.New("no space left on device") }
+	defer func() { addWatch = func(w *fsnotify.Watcher, dir string) error { return w.Add(dir) } }()
+	w.addTree(filepath.Join(root, "Release.2020"))
+	if !w.Degraded() {
+		t.Error("not degraded after a watch failed")
+	}
+}

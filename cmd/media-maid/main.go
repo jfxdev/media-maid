@@ -213,9 +213,10 @@ func run(log *slog.Logger) error {
 		Meta: meta, Assist: resolver, MinConfidence: cfg.LLM.MinConfidence, Language: cfg.PreferredLanguage,
 		Platform: cfg.Platform, Syncer: syncer, History: history, Log: log, DryRun: cfg.DryRun,
 		Ledger: ledger, NoCopy: !cfg.CopyFallback, Pending: pending, Notify: notifyFn,
-		AutoUpgrade: cfg.AutoUpgrade, LinkExtras: cfg.LinkExtras,
+		AutoUpgrade: cfg.AutoUpgrade, LinkExtras: cfg.LinkExtras, AmbiguousBest: cfg.AmbiguousBest,
 	})
-	log.Info("organizer", "auto_upgrade", cfg.AutoUpgrade, "link_extras", cfg.LinkExtras, "copy_fallback", cfg.CopyFallback)
+	log.Info("organizer", "auto_upgrade", cfg.AutoUpgrade, "link_extras", cfg.LinkExtras, "copy_fallback", cfg.CopyFallback,
+		"trigger", cfg.OrganizeTrigger, "ambiguous_best", cfg.AmbiguousBest)
 
 	var server orphans.Server
 	if client != nil {
@@ -231,35 +232,25 @@ func run(log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	w, err := watcher.New(downloads, cfg.StableDuration, func(ctx context.Context, p string) {
-		_, err := org.Organize(ctx, p, organizer.OrganizeOptions{})
-		// Not found and unauthorized links are already recorded by the organizer.
-		if err != nil && !errors.Is(err, organizer.ErrNotFound) && !errors.Is(err, safepath.ErrUnauthorizedVolume) {
-			log.Warn("organize failed", "err", err)
-		}
-	}, log)
-	if err != nil {
-		return fmt.Errorf("watcher: %w", err)
-	}
-	go w.Run(ctx)
-
-	if cfg.ScanInterval > 0 {
-		// Fallback for missed filesystem events (network filesystems). Files
-		// still changing within STABLE_SECONDS are left for the next run.
-		go func() {
-			t := time.NewTicker(cfg.ScanInterval)
-			defer t.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-t.C:
-					if _, err := org.Organize(ctx, downloads, organizer.OrganizeOptions{MinAge: cfg.StableDuration}); err != nil && ctx.Err() == nil {
-						log.Warn("periodic scan failed", "err", err)
-					}
-				}
+	// With ORGANIZE_TRIGGER=hook nothing is organized automatically: only API
+	// requests (the torrent client's "download finished" hook) do, so a
+	// paused or stalled download is never mistaken for a finished one.
+	var w *watcher.Watcher
+	if cfg.OrganizeTrigger == config.TriggerWatch {
+		w, err = watcher.New(downloads, cfg.StableDuration, func(ctx context.Context, p string) {
+			_, err := org.Organize(ctx, p, organizer.OrganizeOptions{})
+			// Not found and unauthorized links are already recorded by the organizer.
+			if err != nil && !errors.Is(err, organizer.ErrNotFound) && !errors.Is(err, safepath.ErrUnauthorizedVolume) {
+				log.Warn("organize failed", "err", err)
 			}
-		}()
+		}, log)
+		if err != nil {
+			return fmt.Errorf("watcher: %w", err)
+		}
+		go w.Run(ctx)
+		go periodicScan(ctx, log, org, downloads, cfg, w)
+	} else {
+		log.Info("downloads are organized only through the API (ORGANIZE_TRIGGER=hook)")
 	}
 
 	if cfg.OrphanScanInterval > 0 {
@@ -279,7 +270,10 @@ func run(log *slog.Logger) error {
 
 	apiServer := api.New(cfg.APIToken, org, det, syncer, history, log)
 	apiServer.SetContext(ctx)
-	apiServer.SetHealth(w.Healthy)
+	if w != nil {
+		apiServer.SetHealth(w.Healthy)
+		apiServer.SetDegraded(w.Degraded)
+	}
 	srv := api.NewHTTPServer(cfg.ListenAddr, apiServer.Handler())
 	errCh := make(chan error, 1)
 	go func() {
@@ -297,4 +291,43 @@ func run(log *slog.Logger) error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	return srv.Shutdown(shutdownCtx)
+}
+
+// degradedScanInterval is how often the downloads folder is scanned when
+// SCAN_INTERVAL is off but some folders could not be watched.
+const degradedScanInterval = 15 * time.Minute
+
+// periodicScan organizes the whole downloads folder every SCAN_INTERVAL, a
+// fallback for missed filesystem events (network filesystems). With
+// SCAN_INTERVAL off, it still runs every 15 minutes once the watcher is
+// degraded (folders it could not watch), so those downloads are not missed
+// silently. Files still changing within STABLE_SECONDS wait for the next run.
+func periodicScan(ctx context.Context, log *slog.Logger, org *organizer.Organizer, downloads string, cfg *config.Config, w *watcher.Watcher) {
+	interval, fallback := cfg.ScanInterval, cfg.ScanInterval == 0
+	if fallback {
+		interval = degradedScanInterval
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	warned := false
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		if fallback {
+			if !w.Degraded() {
+				continue
+			}
+			if !warned {
+				log.Warn("some download folders cannot be watched (raise fs.inotify.max_user_watches); scanning periodically instead",
+					"interval", interval.String())
+				warned = true
+			}
+		}
+		if _, err := org.Organize(ctx, downloads, organizer.OrganizeOptions{MinAge: cfg.StableDuration}); err != nil && ctx.Err() == nil {
+			log.Warn("periodic scan failed", "err", err)
+		}
+	}
 }
