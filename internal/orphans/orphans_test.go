@@ -302,10 +302,21 @@ func TestUnlinkedDownloads(t *testing.T) {
 	if err := os.Link(linked, filepath.Join(movies, "Linked (2001)", "Linked (2001).mkv")); err != nil {
 		t.Fatal(err)
 	}
-	write(t, filepath.Join(movies, "Copied (2003)", "Copied (2003).mkv"))
-	ledger := organizer.NewLedger()
+	// A copy keeps the size and mtime of its source.
 	fi, _ := os.Stat(copied)
+	libCopy := filepath.Join(movies, "Copied (2003)", "Copied (2003).mkv")
+	os.MkdirAll(filepath.Dir(libCopy), 0o755)
+	data, _ := os.ReadFile(copied)
+	os.WriteFile(libCopy, data, 0o644)
+	os.Chtimes(libCopy, fi.ModTime(), fi.ModTime())
+	ledger := organizer.NewLedger()
 	ledger.Put(fi, organizer.LedgerEntry{Lib: "movies", Dest: "Copied (2003)/Copied (2003).mkv", Status: jobs.StatusCopied})
+	// A copy since replaced by another release (an upgrade) no longer counts.
+	replaced := filepath.Join(downloads, "Replaced.2004.mkv")
+	write(t, replaced)
+	write(t, filepath.Join(movies, "Replaced (2004)", "Replaced (2004).mkv"))
+	rfi, _ := os.Stat(replaced)
+	ledger.Put(rfi, organizer.LedgerEntry{Lib: "movies", Dest: "Replaced (2004)/Replaced (2004).mkv", Status: jobs.StatusCopied})
 
 	mr, _ := os.OpenRoot(movies)
 	defer mr.Close()
@@ -325,10 +336,13 @@ func TestUnlinkedDownloads(t *testing.T) {
 	for _, o := range rep.Orphans {
 		if o.Type == TypeUnlinkedDownload {
 			got = append(got, o.Path)
-			id = o.ID
+			if id == "" {
+				id = o.ID
+			}
 		}
 	}
-	if len(got) != 1 || got[0] != "downloads/Gone.2002/Gone.2002.mkv" {
+	sort.Strings(got)
+	if len(got) != 2 || got[0] != "downloads/Gone.2002/Gone.2002.mkv" || got[1] != "downloads/Replaced.2004.mkv" {
 		t.Fatalf("unlinked = %v (report %+v)", got, rep)
 	}
 	if res := det.Remove(context.Background(), []string{id}); res[0].Status != jobs.StatusError || res[0].Error != errNotRemovable {

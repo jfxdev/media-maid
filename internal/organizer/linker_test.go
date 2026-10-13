@@ -200,8 +200,9 @@ func TestSwapInNoExchange(t *testing.T) {
 	checked, _ := os.Lstat(dest)
 	os.WriteFile(filepath.Join(dst, ".staged"), []byte("staged"), 0o644)
 
+	orig := renameat2
 	renameat2 = func(int, string, int, string, uint) error { return unix.EINVAL }
-	defer func() { renameat2 = unix.Renameat2 }()
+	defer func() { renameat2 = orig }()
 
 	if st, err := swapIn(root, d, ".staged", "Movie.mkv", checked); st != jobs.StatusError || !errors.Is(err, errNoAtomicReplace) {
 		t.Fatalf("swapIn = %s, %v", st, err)
@@ -254,5 +255,37 @@ func TestPlaceNoCopy(t *testing.T) {
 	// The default still copies.
 	if st, err := place(root, "New (2000)/New (2000).mkv", f, fi, false, false); st != jobs.StatusCopied || err != nil {
 		t.Errorf("with copy fallback = %s, %v; want copied", st, err)
+	}
+}
+
+// removeChecked deletes only the file that was inspected; anything else that
+// took its name is put back.
+func TestRemoveChecked(t *testing.T) {
+	dst := t.TempDir()
+	root, _ := os.OpenRoot(dst)
+	defer root.Close()
+	p := filepath.Join(dst, "Movie.mp4")
+
+	os.WriteFile(p, []byte("old"), 0o644)
+	checked, _ := os.Lstat(p)
+	if err := removeChecked(root, "Movie.mp4", checked); err != nil {
+		t.Fatalf("unchanged file: %v", err)
+	}
+	if _, err := os.Lstat(p); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("file kept: %v", err)
+	}
+
+	os.WriteFile(p, []byte("old"), 0o644)
+	checked, _ = os.Lstat(p)
+	os.Remove(p)
+	os.WriteFile(p, []byte("someone else's"), 0o644)
+	if err := removeChecked(root, "Movie.mp4", checked); !errors.Is(err, errChanged) {
+		t.Fatalf("changed file: %v", err)
+	}
+	if b, _ := os.ReadFile(p); string(b) != "someone else's" {
+		t.Errorf("changed file not restored: %q", b)
+	}
+	if entries, _ := os.ReadDir(dst); len(entries) != 1 {
+		t.Errorf("temp entry left behind: %v", entries)
 	}
 }

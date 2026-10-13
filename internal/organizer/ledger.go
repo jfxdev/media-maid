@@ -17,13 +17,16 @@ type LedgerEntry struct {
 	Size  int64     `json:"size"`
 	MTime time.Time `json:"mtime"`
 	// Lib is "movies" or "tv"; Dest is relative to that library.
-	Lib         string    `json:"lib"`
-	Dest        string    `json:"dest"`
-	Status      string    `json:"status"`
-	Kind        string    `json:"kind,omitempty"`
-	ResolvedBy  string    `json:"resolved_by,omitempty"`
-	TitleSource string    `json:"title_source,omitempty"`
-	At          time.Time `json:"at"`
+	Lib         string `json:"lib"`
+	Dest        string `json:"dest"`
+	Status      string `json:"status"`
+	Kind        string `json:"kind,omitempty"`
+	ResolvedBy  string `json:"resolved_by,omitempty"`
+	TitleSource string `json:"title_source,omitempty"`
+	// Quality is the parser.Quality rank of the release (0 when unknown); it
+	// decides automatic upgrades.
+	Quality int       `json:"quality,omitempty"`
+	At      time.Time `json:"at"`
 }
 
 // Ledger maps source files (by device and inode, so renames inside the
@@ -34,12 +37,55 @@ type LedgerEntry struct {
 type Ledger struct {
 	mu sync.Mutex
 	m  map[string]LedgerEntry
+	// byDest maps "lib/dest" to the key of the entry placed there (the most
+	// recent one), so a library file can be traced back to its source.
+	byDest map[string]string
 	// OnChange, when set, is called (without locks held) after an update.
 	OnChange func()
 }
 
 // NewLedger returns an empty ledger.
-func NewLedger() *Ledger { return &Ledger{m: map[string]LedgerEntry{}} }
+func NewLedger() *Ledger { return &Ledger{m: map[string]LedgerEntry{}, byDest: map[string]string{}} }
+
+func destKey(lib, dest string) string { return lib + "/" + dest }
+
+// ByDest returns the entry placed at dest in lib, if any. The caller decides
+// whether the library file is still that placement.
+func (l *Ledger) ByDest(lib, dest string) (LedgerEntry, bool) {
+	if l == nil {
+		return LedgerEntry{}, false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	k, ok := l.byDest[destKey(lib, dest)]
+	if !ok {
+		return LedgerEntry{}, false
+	}
+	e, ok := l.m[k]
+	return e, ok && e.Lib == lib && e.Dest == dest
+}
+
+// setLocked stores e under key and keeps byDest in step. l.mu must be held.
+func (l *Ledger) setLocked(key string, e LedgerEntry) {
+	if old, ok := l.m[key]; ok {
+		l.dropDestLocked(key, old)
+	}
+	l.m[key] = e
+	l.byDest[destKey(e.Lib, e.Dest)] = key
+}
+
+func (l *Ledger) deleteLocked(key string) {
+	if old, ok := l.m[key]; ok {
+		l.dropDestLocked(key, old)
+		delete(l.m, key)
+	}
+}
+
+func (l *Ledger) dropDestLocked(key string, e LedgerEntry) {
+	if dk := destKey(e.Lib, e.Dest); l.byDest[dk] == key {
+		delete(l.byDest, dk)
+	}
+}
 
 // fileKey identifies a file by device and inode.
 func fileKey(fi os.FileInfo) (string, bool) {
@@ -79,7 +125,8 @@ func (l *Ledger) Put(fi os.FileInfo, e LedgerEntry) {
 	}
 	e.Size, e.MTime = fi.Size(), fi.ModTime()
 	l.mu.Lock()
-	if old, ok := l.m[key]; ok && old.Lib == e.Lib && old.Dest == e.Dest && old.Size == e.Size && old.MTime.Equal(e.MTime) {
+	if old, ok := l.m[key]; ok && old.Lib == e.Lib && old.Dest == e.Dest && old.Size == e.Size && old.MTime.Equal(e.MTime) &&
+		old.Quality == e.Quality && old.ResolvedBy == e.ResolvedBy {
 		l.mu.Unlock()
 		return // nothing new
 	}
@@ -91,9 +138,9 @@ func (l *Ledger) Put(fi os.FileInfo, e LedgerEntry) {
 				oldest, at = k, v.At
 			}
 		}
-		delete(l.m, oldest)
+		l.deleteLocked(oldest)
 	}
-	l.m[key] = e
+	l.setLocked(key, e)
 	l.mu.Unlock()
 	l.changed()
 }
@@ -107,7 +154,7 @@ func (l *Ledger) Prune(keep map[string]bool) {
 	l.mu.Lock()
 	for k := range l.m {
 		if !keep[k] {
-			delete(l.m, k)
+			l.deleteLocked(k)
 			n++
 		}
 	}
@@ -136,8 +183,14 @@ func (l *Ledger) Import(data []byte) error {
 	if err := json.Unmarshal(data, &m); err != nil {
 		return err
 	}
+	byDest := map[string]string{}
+	for k, e := range m {
+		if cur, ok := byDest[destKey(e.Lib, e.Dest)]; !ok || m[cur].At.Before(e.At) {
+			byDest[destKey(e.Lib, e.Dest)] = k
+		}
+	}
 	l.mu.Lock()
-	l.m = m
+	l.m, l.byDest = m, byDest
 	l.mu.Unlock()
 	return nil
 }

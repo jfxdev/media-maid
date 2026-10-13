@@ -13,11 +13,13 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/jfxdev/media-maid/internal/integration"
 	"github.com/jfxdev/media-maid/internal/jobs"
 	"github.com/jfxdev/media-maid/internal/organizer"
 	"github.com/jfxdev/media-maid/internal/orphans"
+	"github.com/jfxdev/media-maid/internal/parser"
 	"github.com/jfxdev/media-maid/internal/safepath"
 )
 
@@ -27,6 +29,7 @@ const maxBody = 64 << 10
 type Organizer interface {
 	Organize(ctx context.Context, path string, opts organizer.OrganizeOptions) ([]organizer.Result, error)
 	Scan(ctx context.Context) ([]organizer.Result, error)
+	Pending() []organizer.PendingItem
 }
 
 // Orphans is what the API needs from the orphan detector.
@@ -77,6 +80,7 @@ func (s *Server) Handler() http.Handler {
 	api.HandleFunc("POST /api/v1/scan", s.scan)
 	api.HandleFunc("POST /api/v1/organize", s.organize(false))
 	api.HandleFunc("POST /api/v1/preview", s.organize(true))
+	api.HandleFunc("GET /api/v1/pending", s.pending)
 	api.HandleFunc("GET /api/v1/history", s.historyHandler)
 	api.HandleFunc("POST /api/v1/sync", s.sync)
 	api.HandleFunc("POST /api/v1/orphans/scan", s.orphansScan)
@@ -234,11 +238,23 @@ func (s *Server) organize(preview bool) http.HandlerFunc {
 		var req struct {
 			Path      string `json:"path"`
 			Overwrite bool   `json:"overwrite"`
+			Kind      string `json:"kind"`
+			Title     string `json:"title"`
+			Year      int    `json:"year"`
+			TMDBID    int    `json:"tmdb_id"`
 		}
 		if !decode(w, r, &req) {
 			return
 		}
 		opts := organizer.OrganizeOptions{Preview: preview, Overwrite: req.Overwrite, Explicit: true}
+		if req.Kind != "" || req.Title != "" || req.Year != 0 || req.TMDBID != 0 {
+			ov, ok := override(req.Kind, req.Title, req.Year, req.TMDBID)
+			if !ok {
+				writeError(w, http.StatusBadRequest, "invalid_override")
+				return
+			}
+			opts.Override = ov
+		}
 		res, err := s.organizer.Organize(r.Context(), req.Path, opts)
 		if err != nil {
 			s.fail(w, err)
@@ -246,6 +262,41 @@ func (s *Server) organize(preview bool) http.HandlerFunc {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"results": nonNil(res)})
 	}
+}
+
+// Bounds of a manual identification.
+const (
+	maxOverrideTitle = 200
+	minOverrideYear  = 1870
+	maxOverrideYear  = 2100
+	maxTMDBID        = 1 << 30
+)
+
+// override validates a manual identification: kind is required with any
+// other field; the title is plain text (it is sanitized again before it
+// becomes a path); year and tmdb_id are in range.
+func override(kind, title string, year, tmdbID int) (*organizer.Override, bool) {
+	k := parser.Kind(kind)
+	if k != parser.Movie && k != parser.Episode {
+		return nil, false
+	}
+	title = strings.TrimSpace(title)
+	if len([]rune(title)) > maxOverrideTitle || strings.IndexFunc(title, unicode.IsControl) >= 0 {
+		return nil, false
+	}
+	if year != 0 && (year < minOverrideYear || year > maxOverrideYear) {
+		return nil, false
+	}
+	if tmdbID < 0 || tmdbID > maxTMDBID {
+		return nil, false
+	}
+	return &organizer.Override{Kind: k, Title: title, Year: year, TMDBID: tmdbID}, true
+}
+
+// pending lists the downloads that need a decision (conflicts, duplicates,
+// unidentified titles, errors), oldest first.
+func (s *Server) pending(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"items": nonNil(s.organizer.Pending())})
 }
 
 func (s *Server) historyHandler(w http.ResponseWriter, r *http.Request) {
@@ -305,6 +356,12 @@ func (s *Server) fail(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusForbidden, "unauthorized_volume")
 	case errors.Is(err, organizer.ErrNotFound):
 		writeError(w, http.StatusNotFound, "not_found")
+	case errors.Is(err, organizer.ErrInvalidOverride):
+		writeError(w, http.StatusBadRequest, "invalid_override")
+	case errors.Is(err, organizer.ErrOverrideNotFound):
+		writeError(w, http.StatusNotFound, "tmdb_not_found")
+	case errors.Is(err, organizer.ErrMetadataUnavailable):
+		writeError(w, http.StatusBadGateway, "metadata_unavailable")
 	default:
 		s.log.Error("request failed", "err", err)
 		writeError(w, http.StatusInternalServerError, "internal_error")

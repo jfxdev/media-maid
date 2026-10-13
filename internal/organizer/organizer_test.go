@@ -84,6 +84,20 @@ func (fakeMeta) Seasons(_ context.Context, id int) ([]metadata.Season, error) {
 	return nil, nil
 }
 
+func (fakeMeta) Lookup(_ context.Context, kind metadata.Kind, id int) (metadata.Result, error) {
+	switch {
+	case kind == metadata.Movie && id == 603:
+		return metadata.Result{Title: "The Matrix", Year: 1999, TMDBID: 603}, nil
+	case kind == metadata.Movie && id == 129:
+		return metadata.Result{Title: "Spirited Away", OriginalTitle: "Sen to Chihiro", Year: 2001, TMDBID: 129}, nil
+	case kind == metadata.Series && id == 1396:
+		return metadata.Result{Title: "Breaking Bad", Year: 2008, TMDBID: 1396}, nil
+	case id == 500:
+		return metadata.Result{}, errors.New("tmdb status 500")
+	}
+	return metadata.Result{}, metadata.ErrNotFound
+}
+
 // fakeAssist is a scripted LLM layer.
 type fakeAssist struct {
 	decision  assist.Decision

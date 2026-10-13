@@ -173,10 +173,9 @@ func replaceWith(root *os.Root, rel string, src *os.File, srcInfo, checked os.Fi
 // entries atomically: overwrite is refused rather than raced.
 var errNoAtomicReplace = errors.New("overwrite needs renameat2 RENAME_EXCHANGE, which this filesystem does not support")
 
-// Test hooks.
+// Test hooks. renameat2 is set in rename_linux.go and rename_other.go.
 var (
 	linkat           = unix.Linkat
-	renameat2        = unix.Renameat2
 	testHookRollback = func() {}
 )
 
@@ -191,7 +190,7 @@ func swapIn(root *os.Root, d *os.File, tmp, rel string, checked os.FileInfo) (st
 		return jobs.StatusError, mapRootErr(err)
 	}
 	dfd, t, n := int(d.Fd()), path.Base(tmp), path.Base(rel)
-	switch err := renameat2(dfd, t, dfd, n, unix.RENAME_EXCHANGE); {
+	switch err := renameat2(dfd, t, dfd, n, renameExchange); {
 	case err == nil:
 	case errors.Is(err, unix.EINVAL), errors.Is(err, unix.ENOTSUP), errors.Is(err, unix.ENOSYS):
 		root.Remove(tmp) // untouched, still ours
@@ -213,7 +212,7 @@ func swapIn(root *os.Root, d *os.File, tmp, rel string, checked os.FileInfo) (st
 
 	// Someone else's entry came out: put it back.
 	testHookRollback()
-	if err := renameat2(dfd, t, dfd, n, unix.RENAME_EXCHANGE); err != nil {
+	if err := renameat2(dfd, t, dfd, n, renameExchange); err != nil {
 		return jobs.StatusError, fmt.Errorf("replace interrupted, previous entry kept as %s: %w", t, err)
 	}
 	if back, err := root.Lstat(tmp); err == nil && unchanged(back, staged) {
@@ -224,6 +223,38 @@ func swapIn(root *os.Root, d *os.File, tmp, rel string, checked os.FileInfo) (st
 	// entry. Keep it.
 	return jobs.StatusError, fmt.Errorf("destination changed during replace, entry kept as %s", t)
 }
+
+// removeChecked deletes rel only if it is still the regular file the caller
+// inspected (checked). The entry is first moved aside to a fresh temporary
+// name, so what gets deleted is exactly what was verified; anything else is
+// moved back (never over a new entry) and the call fails.
+func removeChecked(root *os.Root, rel string, checked os.FileInfo) error {
+	d, err := root.Open(path.Dir(rel))
+	if err != nil {
+		return mapRootErr(err)
+	}
+	defer d.Close()
+	tmp := tmpName(rel)
+	dfd, t, n := int(d.Fd()), path.Base(tmp), path.Base(rel)
+	switch err := renameat2(dfd, n, dfd, t, renameNoReplace); {
+	case err == nil:
+	case errors.Is(err, unix.EINVAL), errors.Is(err, unix.ENOTSUP), errors.Is(err, unix.ENOSYS):
+		return errNoAtomicReplace
+	default:
+		return fmt.Errorf("move aside: %w", err)
+	}
+	if out, err := root.Lstat(tmp); err == nil && unchanged(out, checked) {
+		return root.Remove(tmp)
+	}
+	if err := renameat2(dfd, t, dfd, n, renameNoReplace); err != nil {
+		return fmt.Errorf("%s changed before removal, entry kept as %s: %w", n, t, err)
+	}
+	return errChanged
+}
+
+// errChanged is returned by removeChecked when the entry was not the checked
+// file; it is left in place.
+var errChanged = errors.New("changed after it was checked; kept")
 
 // unchanged reports whether cur is still the regular file seen as checked.
 // Size and mtime guard against an inode number reused by a new file.

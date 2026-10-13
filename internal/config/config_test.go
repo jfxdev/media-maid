@@ -14,6 +14,7 @@ func baseEnv() map[string]string {
 		"DOWNLOADS_DIR":      "/data/downloads",
 		"MOVIES_DIR":         "/data/media/movies",
 		"TV_DIR":             "/data/media/tv",
+		"STATE_DIR":          "/data/state",
 	}
 }
 
@@ -34,7 +35,8 @@ func TestLoadValid(t *testing.T) {
 	if c.Mode != "jellyfin" || c.ServerURL != "http://jellyfin:8096" || !c.SyncEnabled() {
 		t.Errorf("unexpected config: %+v", c)
 	}
-	if !c.VideoExts[".mkv"] || !c.SubtitleExts[".srt"] || c.SyncDebounce.Seconds() != 30 || !c.CopyFallback {
+	if !c.VideoExts[".mkv"] || !c.SubtitleExts[".srt"] || c.SyncDebounce.Seconds() != 30 || !c.CopyFallback ||
+		c.AutoUpgrade || !c.LinkExtras || c.Notify.URL != "" {
 		t.Errorf("defaults not applied")
 	}
 	env := baseEnv()
@@ -74,7 +76,7 @@ func TestLoadLLM(t *testing.T) {
 			t.Errorf("%v: %v", extra, err)
 		}
 	}
-	c, _ = load(map[string]string{"INTEGRATION_MODE": "jellyfin", "API_TOKEN": strings.Repeat("x", 32), "DOWNLOADS_DIR": "/d", "MOVIES_DIR": "/m", "TV_DIR": "/t",
+	c, _ = load(map[string]string{"INTEGRATION_MODE": "jellyfin", "API_TOKEN": strings.Repeat("x", 32), "DOWNLOADS_DIR": "/d", "MOVIES_DIR": "/m", "TV_DIR": "/t", "STATE_DIR": "/s",
 		"LLM_PROVIDER": "openai", "LLM_BASE_URL": "http://ollama:11434/v1/", "LLM_MODEL": "llama3", "LLM_MIN_CONFIDENCE": "0.5", "LLM_TIMEOUT": "45s"})
 	if c == nil || c.LLM.BaseURL != "http://ollama:11434/v1" || c.LLM.MinConfidence != 0.5 || c.LLM.Timeout.Seconds() != 45 {
 		t.Errorf("llm config = %+v", c)
@@ -155,6 +157,13 @@ func TestLoadInvalid(t *testing.T) {
 		{"relative path map", func(e map[string]string) { e["SERVER_PATH_MAP"] = "media=/b" }, nil, "SERVER_PATH_MAP"},
 		{"copy fallback not bool", func(e map[string]string) { e["COPY_FALLBACK"] = "maybe" }, nil, "COPY_FALLBACK"},
 		{"tiny orphan interval", func(e map[string]string) { e["ORPHAN_SCAN_INTERVAL"] = "5s" }, nil, "ORPHAN_SCAN_INTERVAL"},
+		{"no state dir", func(e map[string]string) { delete(e, "STATE_DIR") }, nil, "STATE_DIR is required"},
+		{"auto upgrade not bool", func(e map[string]string) { e["AUTO_UPGRADE"] = "sometimes" }, nil, "AUTO_UPGRADE"},
+		{"link extras not bool", func(e map[string]string) { e["LINK_EXTRAS"] = "2" }, nil, "LINK_EXTRAS"},
+		{"notify options without url", func(e map[string]string) { e["NOTIFY_ON"] = "error" }, nil, "require NOTIFY_URL"},
+		{"notify bad scheme", func(e map[string]string) { e["NOTIFY_URL"] = "ftp://x/secret-topic" }, nil, "NOTIFY_URL must be"},
+		{"notify bad format", func(e map[string]string) { e["NOTIFY_URL"] = "https://ntfy.sh/t"; e["NOTIFY_FORMAT"] = "xml" }, nil, "NOTIFY_FORMAT"},
+		{"notify bad status", func(e map[string]string) { e["NOTIFY_URL"] = "https://ntfy.sh/t"; e["NOTIFY_ON"] = "error,exploded" }, nil, "unknown status"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -165,6 +174,9 @@ func TestLoadInvalid(t *testing.T) {
 			_, err := load(env, tt.extra...)
 			if err == nil || !strings.Contains(err.Error(), tt.want) {
 				t.Fatalf("err = %v, want containing %q", err, tt.want)
+			}
+			if strings.Contains(err.Error(), "secret-topic") {
+				t.Error("error leaks NOTIFY_URL")
 			}
 		})
 	}
@@ -187,15 +199,24 @@ func TestLoadOwnServerVarsWarn(t *testing.T) {
 	}
 }
 
-// Without STATE_DIR the ledger is lost on restart, so deleted library
-// entries come back: that must be visible at startup.
-func TestLoadNoStateDirWarns(t *testing.T) {
-	c, err := load(baseEnv())
+func TestLoadOptions(t *testing.T) {
+	env := baseEnv()
+	env["AUTO_UPGRADE"] = "true"
+	env["LINK_EXTRAS"] = "false"
+	env["NOTIFY_URL"] = "https://apprise.local/notify/key"
+	c, err := load(env)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(c.Warnings) != 1 || !strings.Contains(c.Warnings[0], "STATE_DIR is not set") {
-		t.Errorf("warnings = %v", c.Warnings)
+	if !c.AutoUpgrade || c.LinkExtras || c.Notify.Format != "json" ||
+		!c.Notify.On["conflict"] || !c.Notify.On["upgraded"] || c.Notify.On["linked"] {
+		t.Errorf("config = %+v", c)
+	}
+	env["NOTIFY_FORMAT"] = "TEXT"
+	env["NOTIFY_ON"] = "linked, error"
+	c, err = load(env)
+	if err != nil || c.Notify.Format != "text" || len(c.Notify.On) != 2 || !c.Notify.On["linked"] {
+		t.Errorf("notify = %+v, %v", c.Notify, err)
 	}
 }
 

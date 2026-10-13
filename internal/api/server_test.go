@@ -30,11 +30,21 @@ func (f *fakeOrg) Organize(_ context.Context, p string, opts organizer.OrganizeO
 		return nil, safepath.ErrUnauthorizedVolume
 	case "missing":
 		return nil, organizer.ErrNotFound
+	case "unknown-id":
+		return nil, organizer.ErrOverrideNotFound
+	case "tmdb-down":
+		return nil, organizer.ErrMetadataUnavailable
+	case "no-title":
+		return nil, organizer.ErrInvalidOverride
 	}
 	return []organizer.Result{{Source: p, Status: jobs.StatusPlanned}}, nil
 }
 
 func (f *fakeOrg) Scan(context.Context) ([]organizer.Result, error) { return nil, nil }
+
+func (f *fakeOrg) Pending() []organizer.PendingItem {
+	return []organizer.PendingItem{{Source: "The.Matrix.1999.1080p.mkv", Status: jobs.StatusConflict}}
+}
 
 type fakeOrphans struct{ removed []string }
 
@@ -99,6 +109,20 @@ func TestAPI(t *testing.T) {
 		{"nested duplicate", "POST", "/api/v1/orphans/remove", bearer, `{"ids":["a"],"ids":["b"]}`, 400, "invalid_request"},
 		{"too large", "POST", "/api/v1/organize", bearer, `{"path":"` + strings.Repeat("a", 70<<10) + `"}`, 400, "invalid_request"},
 		{"wrong method", "GET", "/api/v1/organize", bearer, "", 405, ""},
+		{"override", "POST", "/api/v1/organize", bearer, `{"path":"x","kind":"movie","tmdb_id":603}`, 200, "planned"},
+		{"override title", "POST", "/api/v1/preview", bearer, `{"path":"x","kind":"episode","title":"Breaking Bad","year":2008}`, 200, "planned"},
+		{"override without kind", "POST", "/api/v1/organize", bearer, `{"path":"x","tmdb_id":603}`, 400, "invalid_override"},
+		{"override bad kind", "POST", "/api/v1/organize", bearer, `{"path":"x","kind":"music","title":"X"}`, 400, "invalid_override"},
+		{"override bad year", "POST", "/api/v1/organize", bearer, `{"path":"x","kind":"movie","year":99999}`, 400, "invalid_override"},
+		{"override negative id", "POST", "/api/v1/organize", bearer, `{"path":"x","kind":"movie","tmdb_id":-1}`, 400, "invalid_override"},
+		{"override control chars", "POST", "/api/v1/organize", bearer, `{"path":"x","kind":"movie","title":"a\nb"}`, 400, "invalid_override"},
+		{"override long title", "POST", "/api/v1/organize", bearer, `{"path":"x","kind":"movie","title":"` + strings.Repeat("a", 201) + `"}`, 400, "invalid_override"},
+		{"override id not a number", "POST", "/api/v1/organize", bearer, `{"path":"x","kind":"movie","tmdb_id":"603"}`, 400, "invalid_request"},
+		{"override unknown id", "POST", "/api/v1/organize", bearer, `{"path":"unknown-id","kind":"movie","tmdb_id":1}`, 404, "tmdb_not_found"},
+		{"override tmdb down", "POST", "/api/v1/organize", bearer, `{"path":"tmdb-down","kind":"movie","tmdb_id":1}`, 502, "metadata_unavailable"},
+		{"override needs title", "POST", "/api/v1/organize", bearer, `{"path":"no-title","kind":"movie","tmdb_id":1}`, 400, "invalid_override"},
+		{"pending", "GET", "/api/v1/pending", bearer, "", 200, `"status":"conflict"`},
+		{"pending no auth", "GET", "/api/v1/pending", "", "", 401, "unauthorized"},
 		{"history", "GET", "/api/v1/history", bearer, "", 200, `"entries"`},
 		{"sync disabled", "POST", "/api/v1/sync", bearer, "", 409, "sync_disabled"},
 		{"orphans none yet", "GET", "/api/v1/orphans", bearer, "", 404, "no_report"},
@@ -121,8 +145,12 @@ func TestAPI(t *testing.T) {
 		t.Errorf("preview options = %+v, want preview and overwrite", org.last)
 	}
 	do(t, h, "POST", "/api/v1/organize", bearer, `{"path":"x"}`)
-	if org.last.Preview || org.last.Overwrite || !org.last.Explicit {
-		t.Errorf("organize options = %+v, want explicit without preview or overwrite", org.last)
+	if org.last.Preview || org.last.Overwrite || !org.last.Explicit || org.last.Override != nil {
+		t.Errorf("organize options = %+v, want explicit without preview, overwrite or override", org.last)
+	}
+	do(t, h, "POST", "/api/v1/organize", bearer, `{"path":"x","kind":"movie","title":" The Matrix ","year":1999,"tmdb_id":603}`)
+	if ov := org.last.Override; ov == nil || *ov != (organizer.Override{Kind: "movie", Title: "The Matrix", Year: 1999, TMDBID: 603}) {
+		t.Errorf("override = %+v", ov)
 	}
 }
 

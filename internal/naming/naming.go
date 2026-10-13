@@ -109,6 +109,13 @@ func SubtitlePath(videoRel, lang string, forced, sdh bool, ext string) string {
 	return stem + cleanExt(ext)
 }
 
+// ExtraPath places an extra video in an extras folder of a title folder:
+// "<titleDir>/<folder>/<sanitized file name>.ext".
+func ExtraPath(titleDir, folder, file string) string {
+	ext := path.Ext(file)
+	return path.Join(titleDir, Sanitize(folder), Sanitize(strings.TrimSuffix(file, ext))+cleanExt(ext))
+}
+
 func cleanExt(ext string) string {
 	ext = strings.ToLower(strings.TrimPrefix(ext, "."))
 	var b strings.Builder

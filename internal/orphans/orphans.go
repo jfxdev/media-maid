@@ -268,17 +268,26 @@ func (d *Detector) unlinkedDownloads(ctx context.Context, now time.Time) ([]Orph
 }
 
 // isCopy reports whether fi was copied into the library and that copy is
-// still there.
+// still there (not replaced by another release).
 func (d *Detector) isCopy(fi os.FileInfo) bool {
 	e, ok := d.ledger.Lookup(fi)
 	if !ok || e.Status != jobs.StatusCopied {
 		return false
 	}
 	for _, lib := range d.libraries {
-		if lib.Name == e.Lib {
-			ok, err := exists(lib, e.Dest)
-			return ok || err != nil
+		if lib.Name != e.Lib {
+			continue
 		}
+		cur, err := lib.Root.Lstat(e.Dest)
+		if errors.Is(err, fs.ErrNotExist) {
+			return false
+		}
+		if err != nil {
+			return true // doubt means keep it out of the report
+		}
+		// A copy keeps the source's size and mtime; another file there (an
+		// upgrade replaced it) means this download is no longer in use.
+		return cur.Size() == fi.Size() && cur.ModTime().Equal(fi.ModTime())
 	}
 	return false
 }

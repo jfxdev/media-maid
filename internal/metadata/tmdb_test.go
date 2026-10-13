@@ -2,6 +2,7 @@ package metadata
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -214,5 +215,95 @@ func TestTMDBCacheExpiryAndExport(t *testing.T) {
 	m2.Seasons(ctx, 1) // expired (seasons live a day): fetched again
 	if calls.Load() != 4 {
 		t.Errorf("imported cache: %d calls, want 4", calls.Load())
+	}
+}
+
+func TestTMDBLookup(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		switch r.URL.Path {
+		case "/movie/603":
+			io.WriteString(w, `{"id":603,"title":"The Matrix","original_title":"The Matrix","release_date":"1999-03-30"}`)
+		case "/tv/1396":
+			io.WriteString(w, `{"id":1396,"name":"Breaking Bad","original_name":"Breaking Bad","first_air_date":"2008-01-20","origin_country":["US"]}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			io.WriteString(w, `{"status_code":34}`)
+		}
+	}))
+	defer srv.Close()
+	ctx := context.Background()
+	m := NewTMDB("k", srv.URL)
+	if r, err := m.Lookup(ctx, Movie, 603); err != nil || r != (Result{Title: "The Matrix", OriginalTitle: "The Matrix", Year: 1999, TMDBID: 603}) {
+		t.Errorf("movie = %+v, %v", r, err)
+	}
+	m.Lookup(ctx, Movie, 603)
+	if calls.Load() != 1 {
+		t.Errorf("lookup not cached: %d calls", calls.Load())
+	}
+	if r, err := m.Lookup(ctx, Series, 1396); err != nil || r.Title != "Breaking Bad" || r.Year != 2008 || r.OriginCountry != "US" {
+		t.Errorf("series = %+v, %v", r, err)
+	}
+	for _, id := range []int{7, 0, -1} {
+		if _, err := m.Lookup(ctx, Movie, id); !errors.Is(err, ErrNotFound) {
+			t.Errorf("Lookup(%d) err = %v, want ErrNotFound", id, err)
+		}
+	}
+	// The cache survives a restart.
+	data, _ := m.Export()
+	m2 := NewTMDB("k", srv.URL)
+	m2.Import(data)
+	before := calls.Load()
+	if _, err := m2.Lookup(ctx, Movie, 603); err != nil || calls.Load() != before {
+		t.Errorf("imported lookup: %v, calls %d -> %d", err, before, calls.Load())
+	}
+}
+
+// A 429 is retried after Retry-After; a persistent one fails without
+// looping forever.
+func TestTMDBRateLimit(t *testing.T) {
+	var calls atomic.Int32
+	var limitFor atomic.Int32
+	limitFor.Store(2)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) <= limitFor.Load() {
+			w.Header().Set("Retry-After", "3")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		io.WriteString(w, `{"results":[{"id":27205,"title":"Inception","release_date":"2010-07-15"}]}`)
+	}))
+	defer srv.Close()
+	m := NewTMDB("k", srv.URL)
+	var waits []time.Duration
+	m.wait = func(_ context.Context, d time.Duration) error { waits = append(waits, d); return nil }
+	res, err := m.Search(context.Background(), Movie, "inception", 0)
+	if err != nil || len(res) != 1 || len(waits) != 2 || waits[0] != 3*time.Second {
+		t.Errorf("search = %+v, %v, waits %v", res, err, waits)
+	}
+
+	calls.Store(0)
+	limitFor.Store(100)
+	waits = nil
+	if _, err := m.Search(context.Background(), Movie, "other", 0); err == nil || !strings.Contains(err.Error(), "429") {
+		t.Errorf("persistent 429: %v", err)
+	}
+	if len(waits) != maxRetries {
+		t.Errorf("retries = %d, want %d", len(waits), maxRetries)
+	}
+
+	for in, want := range map[string]time.Duration{"": time.Second, "0": 0, "120": maxRetryWait, "soon": time.Second} {
+		if got := retryAfter(in, 0); got != want {
+			t.Errorf("retryAfter(%q) = %v, want %v", in, got, want)
+		}
+	}
+	if got := retryAfter("", 2); got != 4*time.Second {
+		t.Errorf("backoff = %v", got)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := sleepCtx(ctx, time.Hour); !errors.Is(err, context.Canceled) {
+		t.Errorf("sleepCtx = %v", err)
 	}
 }
