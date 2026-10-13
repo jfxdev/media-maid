@@ -25,7 +25,11 @@ type LedgerEntry struct {
 	TitleSource string `json:"title_source,omitempty"`
 	// Quality is the parser.Quality rank of the release (0 when unknown); it
 	// decides automatic upgrades.
-	Quality int       `json:"quality,omitempty"`
+	Quality int `json:"quality,omitempty"`
+	// DestIno is the inode of the library file when Status is "copied": a
+	// copy is only recognized while it is still that file. Zero in entries
+	// recorded before it existed.
+	DestIno uint64    `json:"dest_ino,omitempty"`
 	At      time.Time `json:"at"`
 }
 
@@ -96,6 +100,14 @@ func fileKey(fi os.FileInfo) (string, bool) {
 	return strconv.FormatUint(uint64(st.Dev), 10) + ":" + strconv.FormatUint(st.Ino, 10), true
 }
 
+// Inode returns the inode number of fi (0 when unknown).
+func Inode(fi os.FileInfo) uint64 {
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		return st.Ino
+	}
+	return 0
+}
+
 // Lookup returns the entry for fi when it still describes the same content.
 func (l *Ledger) Lookup(fi os.FileInfo) (LedgerEntry, bool) {
 	if l == nil {
@@ -126,7 +138,7 @@ func (l *Ledger) Put(fi os.FileInfo, e LedgerEntry) {
 	e.Size, e.MTime = fi.Size(), fi.ModTime()
 	l.mu.Lock()
 	if old, ok := l.m[key]; ok && old.Lib == e.Lib && old.Dest == e.Dest && old.Size == e.Size && old.MTime.Equal(e.MTime) &&
-		old.Quality == e.Quality && old.ResolvedBy == e.ResolvedBy {
+		old.Quality == e.Quality && old.ResolvedBy == e.ResolvedBy && old.DestIno == e.DestIno {
 		l.mu.Unlock()
 		return // nothing new
 	}

@@ -317,6 +317,17 @@ func TestUnlinkedDownloads(t *testing.T) {
 	write(t, filepath.Join(movies, "Replaced (2004)", "Replaced (2004).mkv"))
 	rfi, _ := os.Stat(replaced)
 	ledger.Put(rfi, organizer.LedgerEntry{Lib: "movies", Dest: "Replaced (2004)/Replaced (2004).mkv", Status: jobs.StatusCopied})
+	// Same size and mtime, but not the library file recorded for the copy.
+	swapped := filepath.Join(downloads, "Swapped.2005.mkv")
+	write(t, swapped)
+	sfi, _ := os.Stat(swapped)
+	libSwap := filepath.Join(movies, "Swapped (2005)", "Swapped (2005).mkv")
+	os.MkdirAll(filepath.Dir(libSwap), 0o755)
+	sdata, _ := os.ReadFile(swapped)
+	os.WriteFile(libSwap, sdata, 0o644)
+	os.Chtimes(libSwap, sfi.ModTime(), sfi.ModTime())
+	lfi, _ := os.Stat(libSwap)
+	ledger.Put(sfi, organizer.LedgerEntry{Lib: "movies", Dest: "Swapped (2005)/Swapped (2005).mkv", Status: jobs.StatusCopied, DestIno: organizer.Inode(lfi) + 1})
 
 	mr, _ := os.OpenRoot(movies)
 	defer mr.Close()
@@ -342,7 +353,7 @@ func TestUnlinkedDownloads(t *testing.T) {
 		}
 	}
 	sort.Strings(got)
-	if len(got) != 2 || got[0] != "downloads/Gone.2002/Gone.2002.mkv" || got[1] != "downloads/Replaced.2004.mkv" {
+	if len(got) != 3 || got[0] != "downloads/Gone.2002/Gone.2002.mkv" || got[1] != "downloads/Replaced.2004.mkv" || got[2] != "downloads/Swapped.2005.mkv" {
 		t.Fatalf("unlinked = %v (report %+v)", got, rep)
 	}
 	if res := det.Remove(context.Background(), []string{id}); res[0].Status != jobs.StatusError || res[0].Error != errNotRemovable {

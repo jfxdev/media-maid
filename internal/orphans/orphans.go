@@ -285,9 +285,12 @@ func (d *Detector) isCopy(fi os.FileInfo) bool {
 		if err != nil {
 			return true // doubt means keep it out of the report
 		}
-		// A copy keeps the source's size and mtime; another file there (an
-		// upgrade replaced it) means this download is no longer in use.
-		return cur.Size() == fi.Size() && cur.ModTime().Equal(fi.ModTime())
+		// A copy keeps the source's size and mtime and is the library file
+		// recorded when it was made; another file there (an upgrade replaced
+		// it, even one with the same size and mtime) means this download is
+		// no longer in use.
+		return cur.Mode().IsRegular() && cur.Size() == fi.Size() && cur.ModTime().Equal(fi.ModTime()) &&
+			(e.DestIno == 0 || e.DestIno == organizer.Inode(cur))
 	}
 	return false
 }

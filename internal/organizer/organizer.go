@@ -643,15 +643,15 @@ func (o *Organizer) findPeer(v *videoPlan, src os.FileInfo) *peer {
 		}
 		rel := path.Join(dir, name)
 		fi, err := v.lib.Root.Lstat(rel)
-		if err != nil || !fi.Mode().IsRegular() || samePlaced(fi, src) {
+		if err != nil || !fi.Mode().IsRegular() || os.SameFile(fi, src) || o.copyOf(v.lib, rel, fi, src) {
 			continue
 		}
 		p := &peer{rel: rel, fi: fi}
 		if le, ok := o.ledger.Lookup(fi); ok && le.Lib == v.lib.Name && le.Dest == rel {
 			p.entry, p.tracked = le, true // a hardlink: same inode as its source
 		} else if le, ok := o.ledger.ByDest(v.lib.Name, rel); ok && le.Status == jobs.StatusCopied &&
-			le.Size == fi.Size() && le.MTime.Equal(fi.ModTime()) {
-			p.entry, p.tracked = le, true // a copy, recognised by size and mtime
+			le.Size == fi.Size() && le.MTime.Equal(fi.ModTime()) && (le.DestIno == 0 || le.DestIno == Inode(fi)) {
+			p.entry, p.tracked = le, true // our copy: the recorded file, same size and mtime
 		}
 		return p
 	}
@@ -738,7 +738,7 @@ func (o *Organizer) movePrevious(v *videoPlan, src os.FileInfo, dry bool, r *Res
 	if err != nil || !cur.Mode().IsRegular() {
 		return
 	}
-	if !os.SameFile(cur, src) && !(prev.Status == jobs.StatusCopied && samePlaced(cur, src)) {
+	if !os.SameFile(cur, src) && !o.copyOf(lib, prev.Dest, cur, src) {
 		return // something else lives there now
 	}
 	old := lib.Name + "/" + prev.Dest
@@ -800,6 +800,11 @@ func (o *Organizer) rememberFile(src string, lib Library, dest, status string, e
 			status = jobs.StatusCopied
 		}
 	}
+	if status == jobs.StatusCopied {
+		if dfi, err := lib.Root.Lstat(dest); err == nil {
+			e.DestIno = Inode(dfi)
+		}
+	}
 	e.Lib, e.Dest, e.Status = lib.Name, dest, status
 	o.ledger.Put(fi, e)
 }
@@ -835,10 +840,27 @@ func (o *Organizer) placementGone(lib Library, e LedgerEntry, src os.FileInfo) s
 	if err != nil {
 		return errRemovedMsg
 	}
-	if !os.SameFile(cur, src) && !(e.Status == jobs.StatusCopied && samePlaced(cur, src)) {
+	if !os.SameFile(cur, src) && !o.copyOf(lib, e.Dest, cur, src) {
 		return errSupersededMsg
 	}
 	return ""
+}
+
+// copyOf reports whether cur, the file at dest in lib, is the copy of src
+// Media Maid made: the ledger records a copy of src at dest, cur still has
+// src's size and mtime, and it is the library file recorded then (entries
+// from before DestIno existed are trusted on the ledger record alone). An
+// inode number reused by a later file with the same size and mtime is not
+// told apart: that needs a content check, which costs a full read.
+func (o *Organizer) copyOf(lib Library, dest string, cur, src os.FileInfo) bool {
+	if !cur.Mode().IsRegular() || cur.Size() != src.Size() || !cur.ModTime().Equal(src.ModTime()) {
+		return false
+	}
+	e, ok := o.ledger.Lookup(src)
+	if !ok || e.Status != jobs.StatusCopied || e.Lib != lib.Name || e.Dest != dest {
+		return false
+	}
+	return e.DestIno == 0 || e.DestIno == Inode(cur)
 }
 
 func (o *Organizer) planVideo(ctx context.Context, v *videoPlan, opts OrganizeOptions, man *manual) Result {
@@ -963,11 +985,12 @@ func (o *Organizer) apply(src string, lib Library, dest string, dry, overwrite b
 		return r
 	}
 	defer f.Close()
+	ourCopy := func(cur os.FileInfo) bool { return o.copyOf(lib, dest, cur, fi) }
 
 	if dry {
 		if existing, err := lib.Root.Lstat(dest); err == nil {
 			switch {
-			case samePlaced(existing, fi):
+			case samePlaced(existing, fi, ourCopy):
 				r.Status = jobs.StatusExists
 			case overwrite && existing.Mode().IsRegular():
 				r.Status, r.Replaces = jobs.StatusPlanned, true
@@ -980,7 +1003,7 @@ func (o *Organizer) apply(src string, lib Library, dest string, dry, overwrite b
 		return r
 	}
 
-	status, err := place(lib.Root, dest, f, fi, overwrite, o.noCopy)
+	status, err := place(lib.Root, dest, f, fi, overwrite, o.noCopy, ourCopy)
 	r.Status = status
 	if err != nil {
 		r.Error = describe(err)
