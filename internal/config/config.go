@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jfxdev/media-maid/internal/integration"
+	"github.com/jfxdev/media-maid/internal/notify"
 	"github.com/jfxdev/media-maid/internal/safepath"
 )
 
@@ -85,8 +86,8 @@ type Config struct {
 	DownloadsDir string
 	MoviesDir    string
 	TVDir        string
-	// StateDir keeps caches, history and the organize ledger across
-	// restarts; empty keeps everything in memory.
+	// StateDir keeps caches, history, the pending list and the organize
+	// ledger across restarts.
 	StateDir           string
 	VideoExts          map[string]bool
 	SubtitleExts       map[string]bool
@@ -105,8 +106,23 @@ type Config struct {
 	// CopyFallback copies a file that cannot be hardlinked (another
 	// filesystem or mount); false makes that an error.
 	CopyFallback bool
+	// AutoUpgrade lets automatic runs replace a release Media Maid placed
+	// with a better one of the same title.
+	AutoUpgrade bool
+	// LinkExtras links extras folders of a release as server extras.
+	LinkExtras bool
+	// Notify is the optional webhook; URL is empty when it is disabled.
+	Notify NotifyConfig
 	// Warnings are non-fatal configuration notes to log at startup.
 	Warnings []string
+}
+
+// NotifyConfig configures the notification webhook. URL may carry a token:
+// it is a secret.
+type NotifyConfig struct {
+	URL    string
+	Format string
+	On     map[string]bool
 }
 
 // LLMConfig configures the optional LLM decision layer. Provider is empty
@@ -193,12 +209,9 @@ func Load(getenv func(string) string, environ []string) (*Config, error) {
 	c.DownloadsDir = requireAbs("DOWNLOADS_DIR", getenv, fail)
 	c.MoviesDir = requireAbs("MOVIES_DIR", getenv, fail)
 	c.TVDir = requireAbs("TV_DIR", getenv, fail)
-	if v := strings.TrimSpace(getenv("STATE_DIR")); v != "" {
-		c.StateDir = requireAbs("STATE_DIR", getenv, fail)
-	} else {
-		c.Warnings = append(c.Warnings, "STATE_DIR is not set: the organize ledger lives in memory, so after a restart "+
-			"files removed from the library are linked again and TMDB/LLM lookups are repeated")
-	}
+	// Without the ledger on disk, a restart would link again files the user
+	// removed from the library: STATE_DIR is required.
+	c.StateDir = requireAbs("STATE_DIR", getenv, fail)
 	if c.DownloadsDir != "" && c.MoviesDir != "" && c.TVDir != "" {
 		if err := DistinctRoots(c.Roots()); err != nil {
 			errs = append(errs, err)
@@ -262,27 +275,78 @@ func Load(getenv func(string) string, environ []string) (*Config, error) {
 
 	c.ListenAddr = getenvDefault(getenv, "LISTEN_ADDR", defaultListenAddr)
 
-	if v := strings.TrimSpace(getenv("DRY_RUN")); v != "" {
-		b, err := strconv.ParseBool(v)
-		if err != nil {
-			fail("DRY_RUN must be a boolean")
-		}
-		c.DryRun = b
-	}
+	c.DryRun = parseBool("DRY_RUN", getenv, false, fail)
 
-	c.CopyFallback = true
-	if v := strings.TrimSpace(getenv("COPY_FALLBACK")); v != "" {
-		b, err := strconv.ParseBool(v)
-		if err != nil {
-			fail("COPY_FALLBACK must be a boolean")
-		}
-		c.CopyFallback = b
-	}
+	c.CopyFallback = parseBool("COPY_FALLBACK", getenv, true, fail)
+	c.AutoUpgrade = parseBool("AUTO_UPGRADE", getenv, false, fail)
+	c.LinkExtras = parseBool("LINK_EXTRAS", getenv, true, fail)
+	c.Notify = loadNotify(getenv, fail)
 
 	if len(errs) > 0 {
 		return nil, errors.Join(errs...)
 	}
 	return c, nil
+}
+
+func parseBool(name string, getenv func(string) string, def bool, fail func(string, ...any)) bool {
+	v := strings.TrimSpace(getenv(name))
+	if v == "" {
+		return def
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		fail("%s must be a boolean", name)
+		return def
+	}
+	return b
+}
+
+// loadNotify reads NOTIFY_URL, NOTIFY_FORMAT and NOTIFY_ON. The URL never
+// appears in an error: it may carry a token.
+func loadNotify(getenv func(string) string, fail func(string, ...any)) NotifyConfig {
+	n := NotifyConfig{URL: strings.TrimSpace(getenv("NOTIFY_URL"))}
+	format := strings.ToLower(strings.TrimSpace(getenv("NOTIFY_FORMAT")))
+	on := strings.TrimSpace(getenv("NOTIFY_ON"))
+	if n.URL == "" {
+		if format != "" || on != "" {
+			fail("NOTIFY_FORMAT and NOTIFY_ON require NOTIFY_URL")
+		}
+		return NotifyConfig{}
+	}
+	if u, err := url.Parse(n.URL); err != nil || hasMultiple(n.URL) || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		fail("NOTIFY_URL must be a single http(s) URL")
+	}
+	switch format {
+	case "":
+		n.Format = notify.FormatJSON
+	case notify.FormatJSON, notify.FormatText:
+		n.Format = format
+	default:
+		fail("NOTIFY_FORMAT must be %s or %s", notify.FormatJSON, notify.FormatText)
+	}
+	if on == "" {
+		on = notify.DefaultOn
+	}
+	valid := map[string]bool{}
+	for _, s := range notify.Statuses {
+		valid[s] = true
+	}
+	n.On = map[string]bool{}
+	for _, s := range strings.Split(on, ",") {
+		s = strings.ToLower(strings.TrimSpace(s))
+		if s == "" {
+			continue
+		}
+		if !valid[s] {
+			fail("NOTIFY_ON: unknown status %q (one of %s)", s, strings.Join(notify.Statuses, ", "))
+			continue
+		}
+		n.On[s] = true
+	}
+	if len(n.On) == 0 {
+		fail("NOTIFY_ON must list at least one status")
+	}
+	return n
 }
 
 func loadLLM(getenv func(string) string, fail func(string, ...any)) LLMConfig {

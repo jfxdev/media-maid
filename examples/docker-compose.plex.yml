@@ -14,7 +14,8 @@ services:
     restart: unless-stopped
 
   media-maid:
-    build: ..                  # image built from this repository
+    image: ghcr.io/jfxdev/media-maid:latest   # pin a version (e.g. :1.2.3) in production
+    # build: ..                                # or build from this repository
     user: "1000:1000"            # owner of the files in /data
     read_only: true
     security_opt:
@@ -27,7 +28,7 @@ services:
       MEDIA_SERVER_URL: http://plex:32400
       MEDIA_SERVER_TOKEN: ${MEDIA_SERVER_TOKEN:?}   # X-Plex-Token of the account/server
       API_TOKEN: ${MEDIA_MAID_API_TOKEN:?}          # >= 32 characters (openssl rand -hex 32)
-      STATE_DIR: /data/media-maid-state             # caches, history and ledger across restarts
+      STATE_DIR: /data/media-maid-state             # required: ledger, pending list, caches and history
       DOWNLOADS_DIR: /data/downloads
       MOVIES_DIR: /data/media/movies
       TV_DIR: /data/media/tv
@@ -41,6 +42,11 @@ services:
       # ORPHAN_SCAN_INTERVAL: 24h
       # SCAN_INTERVAL: 15m                           # fallback when inotify misses events (NFS/SMB)
       # COPY_FALLBACK: "false"                       # fail instead of copying when hardlinks are impossible
+      # AUTO_UPGRADE: "true"                         # replace a release with a better one of the same title
+      # LINK_EXTRAS: "false"                         # keep extras folders (Featurettes, Trailers...) out
+      # NOTIFY_URL: ${NOTIFY_URL}                     # e.g. https://ntfy.sh/<topic> or http://apprise:8000/notify/<key>
+      # NOTIFY_FORMAT: text                          # text for ntfy, json (default) for Apprise
+      # NOTIFY_ON: conflict,error,skipped,upgraded
     ports:
       - "127.0.0.1:8080:8080"
     depends_on: [plex]

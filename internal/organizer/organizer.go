@@ -29,11 +29,35 @@ import (
 // ErrNotFound is returned when the requested path does not exist.
 var ErrNotFound = errors.New("not found")
 
+// Errors of a manual identification (OrganizeOptions.Override).
+var (
+	// ErrInvalidOverride: the override cannot be applied (a TMDB id without
+	// TMDB_API_KEY and without a title).
+	ErrInvalidOverride = errors.New("invalid override")
+	// ErrOverrideNotFound: TMDB has no entry with the given id and kind.
+	ErrOverrideNotFound = errors.New("tmdb id not found")
+	// ErrMetadataUnavailable: TMDB could not be reached to check the override.
+	ErrMetadataUnavailable = errors.New("metadata provider unavailable")
+)
+
+// KindExtra marks a result for a file from a release's extras folder.
+const KindExtra = "extra"
+
 // errUnauthorizedMsg is what callers see; the real target is never exposed.
 const errUnauthorizedMsg = "unauthorized_volume"
 
-// errRemovedMsg explains a skipped file whose library copy was deleted.
-const errRemovedMsg = "previously organized; removed from the library"
+// errRemovedMsg and errSupersededMsg explain a skipped file whose library
+// copy was deleted, or replaced by another release (an upgrade or overwrite).
+const (
+	errRemovedMsg    = "previously organized; removed from the library"
+	errSupersededMsg = "previously organized; replaced in the library by another release"
+)
+
+// leftAlone reports a quiet skip: a file automatic runs leave alone on
+// purpose. It is neither recorded in the history nor pending.
+func leftAlone(r Result) bool {
+	return r.Status == jobs.StatusSkipped && (r.Error == errRemovedMsg || r.Error == errSupersededMsg)
+}
 
 // Library is a destination root (movies or tv).
 type Library struct {
@@ -61,6 +85,10 @@ type Organizer struct {
 	dryRun    bool
 	noCopy    bool
 	ledger    *Ledger
+	pending   *Pending
+	notify    func(Result)
+	upgrade   bool
+	extras    bool
 
 	// mu serializes placement (dedupe and writes). Identification, which
 	// may wait on TMDB or the LLM, runs outside it.
@@ -92,6 +120,17 @@ type Options struct {
 	NoCopy bool
 	// Ledger remembers placed files across runs; nil uses a fresh one.
 	Ledger *Ledger
+	// Pending tracks downloads that need attention; nil uses a fresh one.
+	Pending *Pending
+	// Notify, when set, receives results worth telling the user about: new
+	// or changed pending items and successful placements (not "exists").
+	Notify func(Result)
+	// AutoUpgrade lets automatic runs replace a library file placed by Media
+	// Maid with a better release of the same title (AUTO_UPGRADE).
+	AutoUpgrade bool
+	// LinkExtras links videos from a release's extras folders into the
+	// server's extras folders (LINK_EXTRAS).
+	LinkExtras bool
 }
 
 // New builds an Organizer.
@@ -103,7 +142,11 @@ func New(o Options) *Organizer {
 	if o.Ledger == nil {
 		o.Ledger = NewLedger()
 	}
+	if o.Pending == nil {
+		o.Pending = NewPending()
+	}
 	return &Organizer{
+		pending: o.Pending, notify: o.Notify, upgrade: o.AutoUpgrade, extras: o.LinkExtras,
 		hasMeta: hasMeta, assist: o.Assist, minConf: o.MinConfidence, language: o.Language,
 		downloads: o.DownloadsDir, movies: o.Movies, tv: o.TV, filter: o.Filter,
 		guard: o.Guard, meta: o.Meta, platform: o.Platform, syncer: o.Syncer,
@@ -120,7 +163,13 @@ type Result struct {
 	Error  string `json:"error,omitempty"`
 	// Replaces is set on a planned result that would overwrite Dest.
 	Replaces bool `json:"replaces,omitempty"`
-	// ResolvedBy names the layer that identified a video: parser, tmdb or llm.
+	// Previous is a library file this result removed (or would remove, in a
+	// preview): the lower-quality release it upgraded under another file
+	// name, or the earlier placement of the same file that a manual
+	// identification corrected.
+	Previous string `json:"previous,omitempty"`
+	// ResolvedBy names the layer that identified a video: parser, tmdb, llm
+	// or manual.
 	ResolvedBy string `json:"resolved_by,omitempty"`
 	// TitleSource is set with PREFERRED_LANGUAGE: tmdb_translation,
 	// llm_localized or original.
@@ -142,13 +191,31 @@ type OrganizeOptions struct {
 	// MinAge skips files modified more recently than this, so a periodic
 	// scan never picks up a download still being written.
 	MinAge time.Duration
+	// Override replaces automatic identification for every video of the
+	// request (an explicit organize or preview).
+	Override *Override
+}
+
+// Override is a manual identification. Kind is required; TMDBID names the
+// entry exactly (its title and year are used unless Title and Year are
+// given); Title alone is searched on TMDB and used as typed when TMDB has no
+// confident match. Season and episode numbers still come from the name.
+type Override struct {
+	Kind   parser.Kind
+	Title  string
+	Year   int
+	TMDBID int
 }
 
 // DownloadsDir returns the resolved downloads root.
+
 func (o *Organizer) DownloadsDir() string { return o.downloads }
 
 // Ledger returns the organize ledger.
 func (o *Organizer) Ledger() *Ledger { return o.ledger }
+
+// Pending returns the downloads that need attention, oldest first.
+func (o *Organizer) Pending() []PendingItem { return o.pending.List() }
 
 // Scan organizes the whole downloads directory.
 func (o *Organizer) Scan(ctx context.Context) ([]Result, error) {
@@ -167,6 +234,10 @@ func (o *Organizer) Organize(ctx context.Context, input string, opts OrganizeOpt
 		return nil, err
 	}
 	dry := opts.Preview || o.dryRun
+	man, err := o.resolveOverride(ctx, opts.Override)
+	if err != nil {
+		return nil, err
+	}
 
 	lst, err := os.Lstat(p)
 	if err != nil {
@@ -194,6 +265,7 @@ func (o *Organizer) Organize(ctx context.Context, input string, opts OrganizeOpt
 		}
 		if p == o.downloads && !dry && ctx.Err() == nil {
 			o.pruneLedger(files)
+			o.prunePending(files)
 		}
 	} else {
 		files = []string{p}
@@ -202,12 +274,15 @@ func (o *Organizer) Organize(ctx context.Context, input string, opts OrganizeOpt
 		files = settled(files, opts.MinAge)
 	}
 
-	results := o.process(ctx, files, dry, opts)
+	results := o.process(ctx, files, dry, opts, man)
 	var changed []string
 	for _, r := range results {
 		o.record(dry, r)
-		if r.Status == jobs.StatusLinked || r.Status == jobs.StatusCopied || r.Status == jobs.StatusReplaced {
+		if placed(r.Status) && r.Status != jobs.StatusExists && !dry {
 			changed = append(changed, o.libraryDir(r.Dest))
+		}
+		if r.Previous != "" && !dry {
+			changed = append(changed, o.libraryDir(r.Previous))
 		}
 	}
 	if len(changed) > 0 && o.syncer != nil {
@@ -216,15 +291,19 @@ func (o *Organizer) Organize(ctx context.Context, input string, opts OrganizeOpt
 	return results, nil
 }
 
+// lib returns the library named name ("movies" or "tv").
+func (o *Organizer) lib(name string) Library {
+	if name == o.tv.Name {
+		return o.tv
+	}
+	return o.movies
+}
+
 // libraryDir turns a result destination ("movies/A (2000)/A (2000).mkv") into
 // the absolute folder holding it, for a targeted library refresh.
 func (o *Organizer) libraryDir(dest string) string {
 	name, rel, _ := strings.Cut(dest, "/")
-	lib := o.movies
-	if name == o.tv.Name {
-		lib = o.tv
-	}
-	return filepath.Join(lib.Path, filepath.FromSlash(path.Dir(rel)))
+	return filepath.Join(o.lib(name).Path, filepath.FromSlash(path.Dir(rel)))
 }
 
 // settled drops files modified within the last minAge.
@@ -252,9 +331,26 @@ func (o *Organizer) pruneLedger(files []string) {
 	o.ledger.Prune(keep)
 }
 
+// prunePending drops pending items whose file left the downloads folder.
+func (o *Organizer) prunePending(files []string) {
+	keep := make(map[string]bool, len(files))
+	for _, f := range files {
+		keep[o.rel(f)] = true
+	}
+	o.pending.Prune(keep)
+}
+
 func (o *Organizer) record(dry bool, r Result) {
+	if dry {
+		return
+	}
+	// Repeated outcomes (a conflict seen on every scan) are told once.
+	changed := o.pending.Update(r)
+	if o.notify != nil && (changed || (placed(r.Status) && r.Status != jobs.StatusExists && r.Kind != "subtitle" && r.Kind != KindExtra)) {
+		o.notify(r)
+	}
 	// Unchanged outcomes would flood the history on every scan.
-	if dry || r.Status == jobs.StatusExists || r.Error == errRemovedMsg {
+	if r.Status == jobs.StatusExists || leftAlone(r) {
 		return
 	}
 	o.history.Add(jobs.Entry{Action: jobs.ActionOrganize, Source: r.Source, Dest: r.Dest, Status: r.Status, Error: r.Error})
@@ -308,11 +404,24 @@ type videoPlan struct {
 	identified bool
 	// resolvedBy and titleSource explain the decision (see Result).
 	resolvedBy, titleSource string
+	// prev is the earlier placement of this file, kept when a manual
+	// identification may move it.
+	prev *LedgerEntry
+	// upgraded is set when this video replaced a lower-quality release; its
+	// subtitles then replace the old release's ones.
+	upgraded bool
+}
+
+// extraFile is a video from a release's extras folder.
+type extraFile struct {
+	src      string
+	category string // normalized extras folder name ("featurettes")
+	release  string // the release folder holding the extras folder
 }
 
 var subsDirs = map[string]bool{"subs": true, "subtitles": true, "legendas": true, "sub": true}
 
-func (o *Organizer) process(ctx context.Context, files []string, dry bool, opts OrganizeOptions) []Result {
+func (o *Organizer) process(ctx context.Context, files []string, dry bool, opts OrganizeOptions, man *manual) []Result {
 	overwrite := opts.Overwrite
 	type group struct {
 		videos []*videoPlan
@@ -326,6 +435,7 @@ func (o *Organizer) process(ctx context.Context, files []string, dry bool, opts 
 		return groups[k]
 	}
 	var results []Result
+	var extras []extraFile
 
 	sort.Strings(files)
 	for _, f := range files {
@@ -335,6 +445,10 @@ func (o *Organizer) process(ctx context.Context, files []string, dry bool, opts 
 			get(filepath.Dir(f)).videos = append(get(filepath.Dir(f)).videos, &videoPlan{src: f})
 		case o.filter.IsSubtitle(rel):
 			get(subtitleGroup(f)).subs = append(get(subtitleGroup(f)).subs, f)
+		case o.extras:
+			if cat, dir, ok := o.filter.Extra(rel); ok {
+				extras = append(extras, extraFile{src: f, category: cat, release: filepath.Join(o.downloads, dir)})
+			}
 		}
 	}
 
@@ -346,16 +460,17 @@ func (o *Organizer) process(ctx context.Context, files []string, dry bool, opts 
 
 	// Plan every video before touching the disk, so releases of the same title
 	// in different qualities can be compared first.
-	var planned []*videoPlan
+	var planned, all []*videoPlan
 	for _, k := range keys {
 		for _, v := range groups[k].videos {
 			if ctx.Err() != nil {
 				return results
 			}
-			v.result = o.planVideo(ctx, v, opts.Explicit)
+			v.result = o.planVideo(ctx, v, opts, man)
 			if v.result.Status == "" {
 				planned = append(planned, v)
 			}
+			all = append(all, v)
 		}
 	}
 	o.dedupe(planned)
@@ -373,16 +488,16 @@ func (o *Organizer) process(ctx context.Context, files []string, dry bool, opts 
 			}
 			r := v.result
 			if r.Status == "" {
-				r = o.apply(v.src, v.lib, v.dest, dry, overwrite)
-				r.Kind = string(v.media.Kind)
-				r.ResolvedBy, r.TitleSource = v.resolvedBy, v.titleSource
+				r = o.placeVideo(v, dry, opts)
 				if !dry {
 					o.remember(v, r)
 				}
 			}
-			// Subtitles never follow a video that was not placed by this run's
-			// decision (an error, or a release that lost the dedupe).
-			if r.Status == jobs.StatusError || r.Status == jobs.StatusDuplicate || r.Status == jobs.StatusSkipped || v.result.Status == jobs.StatusConflict {
+			// Subtitles and extras never follow a video that was not placed
+			// by this run's decision (an error, a conflict, or a release that
+			// lost the dedupe).
+			switch r.Status {
+			case jobs.StatusError, jobs.StatusDuplicate, jobs.StatusSkipped, jobs.StatusConflict:
 				v.dest = ""
 			}
 			results = append(results, r)
@@ -391,21 +506,31 @@ func (o *Organizer) process(ctx context.Context, files []string, dry bool, opts 
 			results = append(results, o.subtitle(s, g.videos, dry, overwrite))
 		}
 	}
+	for _, x := range extras {
+		if ctx.Err() != nil {
+			return results
+		}
+		results = append(results, o.extra(x, all, dry, opts))
+	}
 	return results
 }
+
+// stem drops the extension: releases in .mkv and .mp4 of the same title are
+// the same library entry.
+func stem(dest string) string { return strings.TrimSuffix(dest, path.Ext(dest)) }
 
 // dedupe keeps a single video per destination: the best quality, then the
 // largest file. The others are reported as duplicates and left untouched.
 func (o *Organizer) dedupe(videos []*videoPlan) {
 	best := map[string]*videoPlan{}
 	for _, v := range videos {
-		key := v.lib.Name + "/" + v.dest
+		key := v.lib.Name + "/" + stem(v.dest)
 		if cur, ok := best[key]; !ok || better(v, cur) {
 			best[key] = v
 		}
 	}
 	for _, v := range videos {
-		w := best[v.lib.Name+"/"+v.dest]
+		w := best[v.lib.Name+"/"+stem(v.dest)]
 		if w == v {
 			continue
 		}
@@ -438,6 +563,150 @@ func fileSize(p string) int64 {
 	return fi.Size()
 }
 
+// peer is a video already in the library under the destination of a new
+// release, or next to it with another extension.
+type peer struct {
+	rel     string // relative to the library root
+	fi      os.FileInfo
+	entry   LedgerEntry
+	tracked bool // placed by Media Maid, so its quality is known
+}
+
+// findPeer looks for a regular file at v's destination or with the same name
+// and another video extension. A file that already is v's source is no peer.
+func (o *Organizer) findPeer(v *videoPlan, src os.FileInfo) *peer {
+	dir, base := path.Split(v.dest)
+	dir = strings.TrimSuffix(dir, "/")
+	if dir == "" {
+		dir = "."
+	}
+	d, err := v.lib.Root.Open(dir)
+	if err != nil {
+		return nil
+	}
+	entries, err := d.ReadDir(-1)
+	d.Close()
+	if err != nil {
+		return nil
+	}
+	want := stem(base)
+	for _, e := range entries {
+		name := e.Name()
+		if name != base && (stem(name) != want || !o.filter.Video[strings.ToLower(path.Ext(name))]) {
+			continue
+		}
+		rel := path.Join(dir, name)
+		fi, err := v.lib.Root.Lstat(rel)
+		if err != nil || !fi.Mode().IsRegular() || samePlaced(fi, src) {
+			continue
+		}
+		p := &peer{rel: rel, fi: fi}
+		if le, ok := o.ledger.Lookup(fi); ok && le.Lib == v.lib.Name && le.Dest == rel {
+			p.entry, p.tracked = le, true // a hardlink: same inode as its source
+		} else if le, ok := o.ledger.ByDest(v.lib.Name, rel); ok && le.Status == jobs.StatusCopied &&
+			le.Size == fi.Size() && le.MTime.Equal(fi.ModTime()) {
+			p.entry, p.tracked = le, true // a copy, recognised by size and mtime
+		}
+		return p
+	}
+	return nil
+}
+
+// placeVideo writes one planned video, first comparing it with a release of
+// the same title already in the library: a lower-quality one placed by Media
+// Maid is upgraded with AUTO_UPGRADE (or replaced on an explicit overwrite),
+// an equal or better one makes this a duplicate, anything else a conflict.
+func (o *Organizer) placeVideo(v *videoPlan, dry bool, opts OrganizeOptions) Result {
+	srcFi, err := os.Stat(v.src)
+	if err != nil {
+		r := o.apply(v.src, v.lib, v.dest, dry, false)
+		r.Kind = string(v.media.Kind)
+		return r
+	}
+	base := Result{
+		Source: o.rel(v.src), Dest: v.lib.Name + "/" + v.dest, Kind: string(v.media.Kind),
+		ResolvedBy: v.resolvedBy, TitleSource: v.titleSource,
+	}
+	p := o.findPeer(v, srcFi)
+	overwrite, upgrade := false, false
+	if p != nil {
+		inLib := v.lib.Name + "/" + p.rel
+		rank, known := v.quality.Rank(), p.tracked && p.entry.Quality > 0
+		switch {
+		case opts.Overwrite:
+			overwrite = true
+		case known && rank > p.entry.Quality && o.upgrade:
+			overwrite, upgrade = true, true
+		case known && rank <= p.entry.Quality:
+			base.Status, base.Error = jobs.StatusDuplicate, "the library already has "+inLib+" at the same or better quality"
+			return base
+		case known:
+			base.Status = jobs.StatusConflict
+			base.Error = "better than " + inLib + " in the library; set AUTO_UPGRADE=true or organize it with overwrite"
+			return base
+		case p.rel != v.dest:
+			base.Status, base.Error = jobs.StatusConflict, "another release is in the library as "+inLib
+			return base
+		}
+	}
+
+	r := o.apply(v.src, v.lib, v.dest, dry, overwrite)
+	r.Kind, r.ResolvedBy, r.TitleSource = base.Kind, base.ResolvedBy, base.TitleSource
+	if p != nil && overwrite && p.rel != v.dest {
+		// The new release has another extension: it was placed next to the
+		// old one, which goes now.
+		switch {
+		case dry && r.Status == jobs.StatusPlanned:
+			r.Previous = v.lib.Name + "/" + p.rel
+		case r.Status == jobs.StatusLinked || r.Status == jobs.StatusCopied:
+			if err := removeChecked(v.lib.Root, p.rel, p.fi); err != nil {
+				r.Error = "placed, but " + v.lib.Name + "/" + p.rel + " was kept: " + describe(err)
+				o.log.Warn("previous release kept", "dest", v.lib.Name+"/"+p.rel, "err", err)
+			} else {
+				r.Previous = v.lib.Name + "/" + p.rel
+				r.Status = jobs.StatusReplaced
+			}
+		}
+	}
+	if upgrade && r.Status == jobs.StatusReplaced {
+		r.Status = jobs.StatusUpgraded
+	}
+	v.upgraded = r.Status == jobs.StatusReplaced || r.Status == jobs.StatusUpgraded
+	o.movePrevious(v, srcFi, dry, &r)
+	return r
+}
+
+// movePrevious removes the earlier placement of a file that a manual
+// identification placed elsewhere, but only while it still is that file
+// (the same inode, or the recorded copy).
+func (o *Organizer) movePrevious(v *videoPlan, src os.FileInfo, dry bool, r *Result) {
+	prev := v.prev
+	if prev == nil || (prev.Lib == v.lib.Name && prev.Dest == v.dest) {
+		return
+	}
+	if !placed(r.Status) && !(dry && r.Status == jobs.StatusPlanned) {
+		return
+	}
+	lib := o.lib(prev.Lib)
+	cur, err := lib.Root.Lstat(prev.Dest)
+	if err != nil || !cur.Mode().IsRegular() {
+		return
+	}
+	if !os.SameFile(cur, src) && !(prev.Status == jobs.StatusCopied && samePlaced(cur, src)) {
+		return // something else lives there now
+	}
+	old := lib.Name + "/" + prev.Dest
+	if dry {
+		r.Previous = old
+		return
+	}
+	if err := removeChecked(lib.Root, prev.Dest, cur); err != nil {
+		o.log.Warn("previous placement kept", "dest", old, "err", err)
+		return
+	}
+	r.Previous = old
+}
+
 // subtitleGroup maps a subtitle to the directory of the videos it belongs to,
 // handling "Subs/" and "Subs/<video name>/" layouts.
 func subtitleGroup(p string) string {
@@ -453,30 +722,40 @@ func subtitleGroup(p string) string {
 
 // remember records a placed video in the ledger.
 func (o *Organizer) remember(v *videoPlan, r Result) {
-	switch r.Status {
-	case jobs.StatusLinked, jobs.StatusCopied, jobs.StatusReplaced, jobs.StatusExists:
-	default:
+	o.rememberFile(v.src, v.lib, v.dest, r.Status, LedgerEntry{
+		Kind: string(v.media.Kind), ResolvedBy: v.resolvedBy, TitleSource: v.titleSource, Quality: v.quality.Rank(),
+	})
+}
+
+// rememberFile records src as placed at dest in lib; e carries the details.
+func (o *Organizer) rememberFile(src string, lib Library, dest, status string, e LedgerEntry) {
+	if !placed(status) {
 		return
 	}
-	fi, err := os.Stat(v.src)
+	fi, err := os.Stat(src)
 	if err != nil {
 		return
 	}
-	status := r.Status
 	if status == jobs.StatusExists {
 		// Keep how it was first placed: a copy stays a copy.
 		if old, ok := o.ledger.Lookup(fi); ok {
 			status = old.Status
-		} else if dfi, err := v.lib.Root.Stat(v.dest); err == nil && os.SameFile(fi, dfi) {
+		} else if dfi, err := lib.Root.Stat(dest); err == nil && os.SameFile(fi, dfi) {
 			status = jobs.StatusLinked
 		} else {
 			status = jobs.StatusCopied
 		}
 	}
-	o.ledger.Put(fi, LedgerEntry{
-		Lib: v.lib.Name, Dest: v.dest, Status: status, Kind: string(v.media.Kind),
-		ResolvedBy: v.resolvedBy, TitleSource: v.titleSource,
-	})
+	if status == jobs.StatusReplaced || status == jobs.StatusUpgraded {
+		// The file in the library is this source's hardlink or copy.
+		if dfi, err := lib.Root.Stat(dest); err == nil && os.SameFile(fi, dfi) {
+			status = jobs.StatusLinked
+		} else {
+			status = jobs.StatusCopied
+		}
+	}
+	e.Lib, e.Dest, e.Status = lib.Name, dest, status
+	o.ledger.Put(fi, e)
 }
 
 // fromLedger reuses the recorded placement of v, if any. A file whose library
@@ -490,14 +769,11 @@ func (o *Organizer) fromLedger(v *videoPlan) (Result, bool) {
 	if !ok {
 		return Result{}, false
 	}
-	lib := o.movies
-	if e.Lib == o.tv.Name {
-		lib = o.tv
-	}
-	if _, err := lib.Root.Lstat(e.Dest); err != nil {
+	lib := o.lib(e.Lib)
+	if why := o.placementGone(lib, e, fi); why != "" {
 		return Result{
 			Source: o.rel(v.src), Dest: lib.Name + "/" + e.Dest, Kind: e.Kind, Status: jobs.StatusSkipped,
-			Error: errRemovedMsg,
+			Error: why,
 		}, true
 	}
 	v.lib, v.dest, v.resolvedBy, v.titleSource = lib, e.Dest, e.ResolvedBy, e.TitleSource
@@ -506,19 +782,42 @@ func (o *Organizer) fromLedger(v *videoPlan) (Result, bool) {
 	return Result{}, true
 }
 
-func (o *Organizer) planVideo(ctx context.Context, v *videoPlan, explicit bool) Result {
+// placementGone tells why the recorded placement e of src is no longer in
+// the library ("" while it is): deleted, or replaced by another file.
+func (o *Organizer) placementGone(lib Library, e LedgerEntry, src os.FileInfo) string {
+	cur, err := lib.Root.Lstat(e.Dest)
+	if err != nil {
+		return errRemovedMsg
+	}
+	if !os.SameFile(cur, src) && !(e.Status == jobs.StatusCopied && samePlaced(cur, src)) {
+		return errSupersededMsg
+	}
+	return ""
+}
+
+func (o *Organizer) planVideo(ctx context.Context, v *videoPlan, opts OrganizeOptions, man *manual) Result {
 	rel := o.rel(v.src)
 	a, ok := parser.Analyze(rel)
 	// The parser's reading is kept for subtitle matching even when the
 	// ledger supplies the destination.
 	v.quality, v.media = a.Quality, a.Media
-	if !explicit {
+	if !opts.Explicit {
 		if r, ok := o.fromLedger(v); ok {
 			return r
 		}
 	}
-	id, ok := o.identify(ctx, rel, a, ok)
-	if !ok {
+	var id identity
+	if man != nil {
+		if fi, err := os.Stat(v.src); err == nil {
+			if e, ok := o.ledger.Lookup(fi); ok {
+				v.prev = &e
+			}
+		}
+		var why string
+		if id, why = o.manualIdentity(ctx, a, ok, man); why != "" {
+			return Result{Source: rel, Status: jobs.StatusSkipped, Error: why}
+		}
+	} else if id, ok = o.identify(ctx, rel, a, ok); !ok {
 		return Result{Source: rel, Status: jobs.StatusSkipped, Error: "could not identify title"}
 	}
 	m := id.media
@@ -536,6 +835,58 @@ func (o *Organizer) planVideo(ctx context.Context, v *videoPlan, explicit bool) 
 	}
 	v.media, v.resolvedBy, v.titleSource, v.identified = m, id.by, id.titleSource, id.match != nil
 	return Result{}
+}
+
+// extra links a video from a release's extras folder into the extras folder
+// of the title its release was placed as: the movie folder, or the show
+// folder. It is skipped when the release did not place exactly one title.
+func (o *Organizer) extra(x extraFile, videos []*videoPlan, dry bool, opts OrganizeOptions) Result {
+	rel := o.rel(x.src)
+	folder, ok := o.platform.ExtrasDir(x.category)
+	if !ok {
+		return Result{Source: rel, Kind: KindExtra, Status: jobs.StatusSkipped, Error: "extras folder not read by the media server"}
+	}
+	if !opts.Explicit {
+		if fi, err := os.Stat(x.src); err == nil {
+			if e, ok := o.ledger.Lookup(fi); ok {
+				lib := o.lib(e.Lib)
+				if why := o.placementGone(lib, e, fi); why != "" {
+					return Result{Source: rel, Dest: lib.Name + "/" + e.Dest, Kind: KindExtra, Status: jobs.StatusSkipped, Error: why}
+				}
+				// Already placed: stays where it is, even once its release's
+				// video was upgraded away.
+				r := o.apply(x.src, lib, e.Dest, dry, false)
+				r.Kind = KindExtra
+				return r
+			}
+		}
+	}
+	var lib Library
+	base := ""
+	for _, v := range videos {
+		if v.dest == "" || !safepath.Within(x.release, v.src) {
+			continue
+		}
+		b := path.Dir(v.dest)
+		if v.media.Kind == parser.Episode {
+			b, _, _ = strings.Cut(v.dest, "/")
+		}
+		if base == "" {
+			base, lib = b, v.lib
+		} else if b != base || v.lib.Name != lib.Name {
+			return Result{Source: rel, Kind: KindExtra, Status: jobs.StatusSkipped, Error: "the release holds several titles"}
+		}
+	}
+	if base == "" {
+		return Result{Source: rel, Kind: KindExtra, Status: jobs.StatusSkipped, Error: "no matching video"}
+	}
+	dest := naming.ExtraPath(base, folder, filepath.Base(x.src))
+	r := o.apply(x.src, lib, dest, dry, opts.Overwrite)
+	r.Kind = KindExtra
+	if !dry {
+		o.rememberFile(x.src, lib, dest, r.Status, LedgerEntry{Kind: KindExtra})
+	}
+	return r
 }
 
 // apply links src to dest inside lib (or reports what would happen when dry).
@@ -617,7 +968,8 @@ func (o *Organizer) subtitle(sub string, videos []*videoPlan, dry, overwrite boo
 	vstem := strings.TrimSuffix(filepath.Base(target.src), filepath.Ext(target.src))
 	lang, forced, sdh := detectLang(strings.TrimPrefix(stem, vstem))
 	dest := naming.SubtitlePath(target.dest, lang, forced, sdh, filepath.Ext(sub))
-	r := o.apply(sub, target.lib, dest, dry, overwrite)
+	// An upgraded video's subtitles replace the old release's ones.
+	r := o.apply(sub, target.lib, dest, dry, overwrite || target.upgraded)
 	r.Kind = "subtitle"
 	return r
 }

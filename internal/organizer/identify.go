@@ -16,6 +16,7 @@ const (
 	ByParser = "parser"
 	ByTMDB   = "tmdb"
 	ByLLM    = "llm"
+	ByManual = "manual"
 
 	TitleTMDBTranslation = "tmdb_translation"
 	TitleLLMLocalized    = "llm_localized"
@@ -85,6 +86,103 @@ func (o *Organizer) identify(ctx context.Context, rel string, a parser.Analysis,
 		o.localize(ctx, &id)
 	}
 	return id, true
+}
+
+// manual is an Override resolved once per request.
+type manual struct {
+	kind  parser.Kind
+	title string // empty keeps the parser's title
+	year  int    // zero keeps the parser's year
+	match *metadata.Result
+	// fixed is set when the user typed the title: it is not localized.
+	fixed bool
+}
+
+// resolveOverride checks an Override against TMDB (when enabled) once for the
+// whole request.
+func (o *Organizer) resolveOverride(ctx context.Context, ov *Override) (*manual, error) {
+	if ov == nil {
+		return nil, nil
+	}
+	if ov.Kind != parser.Movie && ov.Kind != parser.Episode {
+		return nil, ErrInvalidOverride
+	}
+	m := &manual{kind: ov.Kind, title: strings.TrimSpace(ov.Title), year: ov.Year}
+	m.fixed = m.title != ""
+	kind := metaKind(ov.Kind)
+	switch {
+	case ov.TMDBID > 0 && o.hasMeta:
+		r, err := o.meta.Lookup(ctx, kind, ov.TMDBID)
+		if errors.Is(err, metadata.ErrNotFound) {
+			return nil, ErrOverrideNotFound
+		}
+		if err != nil {
+			return nil, ErrMetadataUnavailable
+		}
+		m.match = &r
+		if m.title == "" {
+			m.title = r.Title
+		}
+		if m.year == 0 {
+			m.year = r.Year
+		}
+	case ov.TMDBID > 0:
+		// Without TMDB the id cannot be checked: it is only a tag, and the
+		// title must be given.
+		if m.title == "" {
+			return nil, ErrInvalidOverride
+		}
+		m.match = &metadata.Result{Title: m.title, Year: m.year, TMDBID: ov.TMDBID}
+	case m.title != "" && o.hasMeta:
+		res, err := o.meta.Search(ctx, kind, m.title, m.year)
+		if err != nil {
+			break // the title is used as typed
+		}
+		if best, score, _, ok := metadata.Pick(m.title, m.year, res); ok && score >= metadata.GoodScore {
+			m.match, m.title, m.fixed = &best, best.Title, false
+			if m.year == 0 {
+				m.year = best.Year
+			}
+		}
+	}
+	return m, nil
+}
+
+// manualIdentity applies a resolved override to one parsed file. why is set
+// when the file cannot take it.
+func (o *Organizer) manualIdentity(ctx context.Context, a parser.Analysis, parsed bool, man *manual) (identity, string) {
+	m := a.Media
+	if !parsed {
+		m = parser.Media{}
+	}
+	switch man.kind {
+	case parser.Episode:
+		if m.Kind != parser.Episode {
+			return identity{}, "kind episode needs a season and episode number (or air date) in the name"
+		}
+	case parser.Movie:
+		if m.Kind == parser.Episode {
+			m = parser.Media{Title: m.Title, Year: m.Year}
+		}
+		m.Kind = parser.Movie
+	}
+	if man.title != "" {
+		m.Title = man.title
+	}
+	if man.year > 0 {
+		m.Year = man.year
+	}
+	if m.Title == "" {
+		return identity{}, "could not identify title"
+	}
+	id := identity{media: m, match: man.match, by: ByManual}
+	if id.match != nil && o.hasMeta {
+		o.mapAbsolute(ctx, &id)
+	}
+	if o.language != "" && !man.fixed {
+		o.localize(ctx, &id)
+	}
+	return id, ""
 }
 
 // askLLM applies a validated LLM decision to id. It reports false when the

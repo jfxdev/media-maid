@@ -19,6 +19,7 @@ import (
 	"github.com/jfxdev/media-maid/internal/integration"
 	"github.com/jfxdev/media-maid/internal/jobs"
 	"github.com/jfxdev/media-maid/internal/metadata"
+	"github.com/jfxdev/media-maid/internal/notify"
 	"github.com/jfxdev/media-maid/internal/organizer"
 	"github.com/jfxdev/media-maid/internal/orphans"
 	"github.com/jfxdev/media-maid/internal/safepath"
@@ -26,8 +27,12 @@ import (
 	"github.com/jfxdev/media-maid/internal/watcher"
 )
 
+// version is set at build time (-ldflags "-X main.version=1.2.3").
+var version = "dev"
+
 func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	log.Info("starting media-maid", "version", version)
 	if err := run(log); err != nil {
 		log.Error("fatal", "err", err)
 		os.Exit(1)
@@ -70,18 +75,15 @@ func run(log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	roots := map[string]string{"DOWNLOADS_DIR": downloads, "MOVIES_DIR": moviesDir, "TV_DIR": tvDir}
-	if cfg.StateDir != "" {
-		// Created on first start; it must still lie in a mounted volume.
-		if err := os.MkdirAll(cfg.StateDir, 0o700); err != nil {
-			return fmt.Errorf("STATE_DIR: %w", err)
-		}
-		stateDir, err := guard.ResolveRoot("STATE_DIR", cfg.StateDir)
-		if err != nil {
-			return err
-		}
-		roots["STATE_DIR"] = stateDir
+	// STATE_DIR is created on first start; it must still lie in a mounted volume.
+	if err := os.MkdirAll(cfg.StateDir, 0o700); err != nil {
+		return fmt.Errorf("STATE_DIR: %w", err)
 	}
+	stateDir, err := guard.ResolveRoot("STATE_DIR", cfg.StateDir)
+	if err != nil {
+		return err
+	}
+	roots := map[string]string{"DOWNLOADS_DIR": downloads, "MOVIES_DIR": moviesDir, "TV_DIR": tvDir, "STATE_DIR": stateDir}
 	if err := config.DistinctRoots(roots); err != nil {
 		return err
 	}
@@ -96,14 +98,12 @@ func run(log *slog.Logger) error {
 			log.Warn("hardlinks impossible: different mounts, organizing will fail with COPY_FALLBACK=false", "from", "DOWNLOADS_DIR", "to", lib)
 		}
 	}
-	var store *state.Store // nil keeps everything in memory
-	if dir := roots["STATE_DIR"]; dir != "" {
-		if store, err = state.Open(dir); err != nil {
-			return err
-		}
-		defer store.Close()
-		log.Info("persistent state enabled", "dir", dir)
+	store, err := state.Open(stateDir)
+	if err != nil {
+		return err
 	}
+	defer store.Close()
+	log.Info("persistent state", "dir", stateDir)
 	// Each persisted document is loaded now and saved a few seconds after it
 	// changes; everything is flushed at shutdown.
 	var savers []*state.Saver
@@ -141,6 +141,28 @@ func run(log *slog.Logger) error {
 	history.OnChange = persist("history", history.Import, history.Export)
 	ledger := organizer.NewLedger()
 	ledger.OnChange = persist("ledger", ledger.Import, ledger.Export)
+	pending := organizer.NewPending()
+	pending.OnChange = persist("pending", pending.Import, pending.Export)
+
+	var notifier *notify.Notifier // nil disables notifications
+	var notifyFn func(organizer.Result)
+	if cfg.Notify.URL != "" {
+		notifier = notify.New(notify.Options{
+			URL: cfg.Notify.URL, Format: cfg.Notify.Format, On: cfg.Notify.On, Delay: 10 * time.Second, Log: log,
+		})
+		defer notifier.Flush()
+		notifyFn = func(r organizer.Result) {
+			notifier.Notify(notify.Event{Source: r.Source, Dest: r.Dest, Kind: r.Kind, Status: r.Status, Error: r.Error})
+		}
+		on := make([]string, 0, len(cfg.Notify.On))
+		for _, st := range notify.Statuses {
+			if cfg.Notify.On[st] {
+				on = append(on, st)
+			}
+		}
+		// The URL may carry a token: only the format and statuses are logged.
+		log.Info("notifications enabled", "format", cfg.Notify.Format, "on", on)
+	}
 
 	var client *integration.Client
 	if cfg.SyncEnabled() {
@@ -190,8 +212,10 @@ func run(log *slog.Logger) error {
 		DownloadsDir: downloads, Movies: movies, TV: tv, Filter: filter, Guard: guard,
 		Meta: meta, Assist: resolver, MinConfidence: cfg.LLM.MinConfidence, Language: cfg.PreferredLanguage,
 		Platform: cfg.Platform, Syncer: syncer, History: history, Log: log, DryRun: cfg.DryRun,
-		Ledger: ledger, NoCopy: !cfg.CopyFallback,
+		Ledger: ledger, NoCopy: !cfg.CopyFallback, Pending: pending, Notify: notifyFn,
+		AutoUpgrade: cfg.AutoUpgrade, LinkExtras: cfg.LinkExtras,
 	})
+	log.Info("organizer", "auto_upgrade", cfg.AutoUpgrade, "link_extras", cfg.LinkExtras, "copy_fallback", cfg.CopyFallback)
 
 	var server orphans.Server
 	if client != nil {

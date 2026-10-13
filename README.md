@@ -31,6 +31,17 @@ so hardlinks work (otherwise files are copied, or fail with
 `COPY_FALLBACK=false`; a startup warning names the folders on different
 mounts).
 
+Images for `linux/amd64` and `linux/arm64` are published to
+`ghcr.io/jfxdev/media-maid` for every version tag (`1.2.3`, `1.2`, `1` and
+`latest`); pin a version in production.
+
+Media Maid is built to run **in a container**: only volumes mounted into it
+(read from `/proc/self/mountinfo`) are authorized, and the root filesystem
+never is. Run directly on a host, folders on the root partition are refused
+(`unauthorized_volume`); mount them as separate volumes or use the image. It
+builds and runs on Linux only (macOS builds compile for development, without
+atomic overwrite).
+
 Each instance is bound to **exactly one** media server (`INTEGRATION_MODE`).
 Multiple values, or `JELLYFIN_*` / `EMBY_*` / `PLEX_*` variables of *another*
 server, abort startup; run one sidecar per server. Variables of the configured
@@ -46,7 +57,7 @@ server (say `PLEX_CLAIM` from a shared env file) are ignored with a warning.
 | `API_TOKEN` | yes | — | bearer token for the API (≥ 32 chars) |
 | `DOWNLOADS_DIR` | yes | — | source folder |
 | `MOVIES_DIR` / `TV_DIR` | yes | — | library folders |
-| `STATE_DIR` | recommended | — | folder for caches, history, orphan report and the organize ledger, kept across restarts (see below); empty keeps everything in memory, so files removed from the library are linked again after a restart (a startup warning says so) |
+| `STATE_DIR` | yes | — | folder for caches, history, pending list, orphan report and the organize ledger, kept across restarts (see below) |
 | `TMDB_API_KEY` | no | — | TMDB v3 key or v4 token for canonical title/year/ID |
 | `PREFERRED_LANGUAGE` | no | — | BCP 47 tag (`pt-BR`, `es`) for localized folder names, see below |
 | `LLM_PROVIDER` | no | — | `openai` or `anthropic`; leave empty to disable the LLM layer |
@@ -65,6 +76,11 @@ server (say `PLEX_CLAIM` from a shared env file) are ignored with a warning.
 | `LISTEN_ADDR` | no | `:8080` | HTTP address |
 | `DRY_RUN` | no | `false` | never link or remove anything |
 | `COPY_FALLBACK` | no | `true` | copy a file that cannot be hardlinked (different filesystem or mount); `false` reports an error instead of using extra disk space |
+| `AUTO_UPGRADE` | no | `false` | let the watcher and scans replace a release Media Maid placed with a better one of the same title (see [Duplicate releases](#duplicate-releases-and-upgrades)) |
+| `LINK_EXTRAS` | no | `true` | link videos from a release's extras folders (`Featurettes`, `Trailers`, …) as server extras |
+| `NOTIFY_URL` | no | — | webhook for problems and upgrades (see [Notifications](#notifications)); a secret, never logged |
+| `NOTIFY_FORMAT` | no | `json` | `json` (title, body and events; Apprise API) or `text` (plain body, `Title` header; ntfy) |
+| `NOTIFY_ON` | no | `conflict,error,skipped,upgraded` | statuses to notify: any of `linked`, `copied`, `replaced`, `upgraded`, `conflict`, `duplicate`, `skipped`, `error` |
 
 ¹ Set both or neither; without them, sync and server-side orphan checks are off.
 ² `LLM_API_KEY` is required with the public endpoints (no `LLM_BASE_URL`);
@@ -84,8 +100,9 @@ Every `/api/v1/*` route requires `Authorization: Bearer $API_TOKEN`.
 |---|---|---|
 | `GET` | `/healthz` | liveness: `503` when the downloads watcher stopped or stalled |
 | `POST` | `/api/v1/scan` | organize the whole downloads folder; `?async=true` answers `202` and logs to the history |
-| `POST` | `/api/v1/organize` | `{"path": "...", "overwrite": false}` organize one file/folder |
+| `POST` | `/api/v1/organize` | `{"path": "...", "overwrite": false}` organize one file/folder; `kind`, `tmdb_id`, `title`, `year` identify it manually |
 | `POST` | `/api/v1/preview` | same as organize, without touching disk |
+| `GET` | `/api/v1/pending` | downloads that need a decision: conflicts, duplicates, unidentified titles, errors |
 | `GET` | `/api/v1/history` | recent actions and last sync |
 | `POST` | `/api/v1/sync` | refresh the media server library now |
 | `POST` | `/api/v1/orphans/scan` | build an orphan report |
@@ -131,7 +148,27 @@ disabled, the previous decision stands.
    candidates must be confirmed by TMDB, and it never chooses paths, IDs or
    libraries.
 
-Each organize result reports `resolved_by` (`parser`, `tmdb` or `llm`).
+Each organize result reports `resolved_by` (`parser`, `tmdb`, `llm` or
+`manual`).
+
+### Fixing a wrong identification
+
+When a title is misread, name it yourself. `kind` (`movie` or `episode`) is
+required; `tmdb_id` picks the TMDB entry exactly, `title` and `year` set the
+name (a `title` alone is searched on TMDB and used as typed when nothing
+matches). Season and episode numbers still come from the file name. Preview
+first:
+
+```sh
+curl -sH "Authorization: Bearer $API_TOKEN" localhost:8080/api/v1/preview \
+  -d '{"path": "Some.Release.2019.1080p", "kind": "movie", "tmdb_id": 496243}'
+```
+
+then send the same body to `/api/v1/organize`. If the file was placed under
+the wrong name before, that entry is removed once the new one is in place
+(`previous` names it; only while it still is the same file), and the ledger
+remembers the correction, so scans keep it. Subtitles linked next to the
+wrong entry stay behind; the orphan report lists the emptied folder.
 
 Release shapes the parser understands besides plain names:
 
@@ -143,10 +180,15 @@ Release shapes the parser understands besides plain names:
   and Emby a ` - Extended Cut` version file in the movie's folder.
 - **Anime absolute numbering** (`[Group] Show - 1080`): with TMDB, the number
   is mapped onto the series' seasons; without, it stays `S01E1080`.
-- **Extras folders** (`Sample`, `Extras`, `Featurettes`, `Trailers`,
-  `Behind The Scenes`, `Deleted Scenes`, `Interviews`, `Scenes`, `Shorts`,
-  `Clips`, `Bonus`) are skipped and keep the release a single unit, so bonus
-  videos never land in the library as movies of their own.
+- **Extras folders** (`Extras`, `Featurettes`, `Trailers`, `Behind The
+  Scenes`, `Deleted Scenes`, `Interviews`, `Scenes`, `Shorts`, `Clips`,
+  `Bonus`) keep the release a single unit, so bonus videos never land in the
+  library as movies of their own. With `LINK_EXTRAS` (default) they are
+  linked into the server's extras folder inside the movie folder (or the
+  show folder for series): `Featurettes/`, `Trailers/`, … on all servers;
+  `Extras` and `Bonus` become `Extras/` (`Other/` on Plex), `Clips` stays
+  `Clips/` on Jellyfin and becomes `Extras/` on Emby and `Other/` on Plex. A release that placed more than one title keeps its
+  extras out. `Sample` folders and sample files are never linked.
 - **Origin markers** (`The Office US`): TMDB is searched for `The Office` and
   the series from that country is preferred.
 
@@ -172,26 +214,61 @@ The ID tag still points at the TMDB entry, so the server matches it either
 way. Results report `title_source` (`tmdb_translation`, `llm_localized` or
 `original`).
 
-## Duplicate releases
+## Duplicate releases and upgrades
 
 Two releases of the same title (say `The.Matrix.1999.720p` and
-`The.Matrix.1999.1080p`) map to the same destination. Before anything is
-written, releases in the same run are compared and only the best one is linked
-(resolution, then source — REMUX > BluRay > WEB-DL > WEBRip > HDTV > DVD —,
-then HDR, then file size); the others are reported as `duplicate`.
+`The.Matrix.1999.1080p.mkv`/`.mp4`) are the same library entry, whatever
+their extension. Releases are ranked by resolution, then source (REMUX >
+BluRay > WEB-DL > WEBRip > HDTV > DVD), then HDR, then file size.
 
-A destination that already exists with different content is a `conflict` and
-is left alone. To upgrade it, call organize with `"overwrite": true`: the file
-is replaced atomically (directories and symlinks never are, nor a file that
-changed after it was checked), the old download stays untouched, and the
-result is `replaced`. This needs a filesystem with `renameat2`
-`RENAME_EXCHANGE` (ext4, XFS, Btrfs, tmpfs, overlayfs); elsewhere (e.g. NFS)
-overwrite fails with an error instead of risking a race. Preview with `overwrite` reports
-`planned` with `"replaces": true`. The watcher and scans never overwrite.
+- **In the same run**, only the best one is linked; the others are
+  `duplicate`.
+- **In later runs**, the new release is compared with the one in the library.
+  When Media Maid placed that one (it is in the ledger, so its quality is
+  known): a release of the same or lower quality is `duplicate`; a better one
+  is an `upgraded` replacement with `AUTO_UPGRADE=true`, and a `conflict`
+  saying so without it. A library file Media Maid did not place is never
+  touched: the result is `conflict`.
+
+An upgrade, or an explicit `"overwrite": true` on organize (`replaced`),
+swaps the file atomically: directories and symlinks are never replaced, nor a
+file that changed after it was checked. A release under another extension is
+linked first and the old file is then removed, only if it is still the file
+that was checked (`previous` names it). The new release's subtitles replace
+the old ones. The old download stays untouched; scans leave it alone from
+then on, and the orphan report lists it as `unlinked_download` so you can
+remove it in the torrent client. This needs a filesystem with `renameat2`
+(ext4, XFS, Btrfs, tmpfs, overlayfs); elsewhere (e.g. NFS) the replacement
+fails with an error instead of risking a race. Preview with `overwrite`
+reports `planned` with `"replaces": true`.
 
 Without TMDB, two releases of equal quality that map to the same name may be
 different works (remakes sharing title and year); the second is reported as
 `conflict` instead of `duplicate`.
+
+## Notifications
+
+`GET /api/v1/pending` lists the downloads that are not in the library and
+need a decision: `conflict`, `duplicate`, `skipped` (title not identified) and
+`error`, oldest first. An item goes away when the file is placed (a manual
+identification, an `overwrite`) or leaves the downloads folder.
+
+With `NOTIFY_URL`, each **new or changed** pending item is posted once (a
+conflict seen by every scan is not repeated), plus `upgraded` placements;
+`NOTIFY_ON` chooses the statuses. Events of a burst are grouped into one
+message after 10 seconds. `json` posts:
+
+```json
+{"title": "Media Maid: conflict The.Matrix.1999.1080p.mkv",
+ "body": "conflict: The.Matrix.1999.1080p.mkv -> movies/The Matrix (1999)/The Matrix (1999).mkv (another release is in the library as ...)",
+ "events": [{"time": "...", "source": "...", "dest": "...", "kind": "movie", "status": "conflict", "error": "..."}]}
+```
+
+which the [Apprise API](https://github.com/caronc/apprise-api)
+(`http://apprise:8000/notify/<key>`) relays to Telegram, Discord, e-mail and
+more. `NOTIFY_FORMAT=text` posts the body as plain text with a `Title`
+header, which [ntfy](https://ntfy.sh) (`https://ntfy.sh/<topic>`) shows as is.
+Delivery is best effort: a failure is logged (without the URL) and dropped.
 
 ## Watcher, restarts and persistence
 
@@ -209,17 +286,15 @@ identification for files already placed, and leave alone a file whose library
 copy you deleted (it is `skipped`, quietly). An explicit `POST /api/v1/organize`
 ignores the ledger and links it again.
 
-With `STATE_DIR`, the ledger, the TMDB and LLM caches, the history and the last
-orphan report survive restarts, so a restart costs no TMDB or LLM calls for
-work already done. Empty TMDB results expire after a day, so a title added to
-TMDB later is found. The folder is created if missing; it must be writable
-and inside a mounted volume (the image runs with a read-only root), e.g.
-`STATE_DIR: /data/media-maid-state` as in the examples.
-
-Without `STATE_DIR` the ledger only lives as long as the process: after a
-restart every download is identified again (TMDB and LLM calls included), and
-a file whose library copy you deleted is linked again. Media Maid logs a
-warning at startup when it runs this way.
+`STATE_DIR` keeps the ledger, the pending list, the TMDB and LLM caches, the
+history and the last orphan report across restarts, so a restart costs no
+TMDB or LLM calls for work already done and never links again a file you
+deleted from the library. Empty TMDB results expire after a day, so a title
+added to TMDB later is found. The folder is created if missing; it must be
+writable and inside a mounted volume (the image runs with a read-only root),
+e.g. `STATE_DIR: /data/media-maid-state` as in the examples. TMDB rate limits
+(HTTP 429) are retried up to three times, waiting what `Retry-After` asks (at
+most 10 seconds).
 
 After organizing, only the touched folders are refreshed on the server
 (`Library/Media/Updated` on Jellyfin/Emby, `sections/{id}/refresh?path=` on
@@ -266,4 +341,10 @@ docker build -t media-maid .
 ```
 
 Requires Go 1.25+. See [`AGENTS.md`](AGENTS.md) for architecture and
-contribution notes.
+contribution notes. A misread release name is best reported as a line for
+[`internal/parser/testdata/corpus.tsv`](internal/parser/testdata/corpus.tsv).
+
+Releases: pushing a tag `vX.Y.Z` runs the CI and publishes the image to
+GHCR (`.github/workflows/release.yml`). The first publish creates a private
+package; make it public in the package settings on GitHub. Every action in
+the workflows is pinned to a commit SHA.

@@ -1,0 +1,144 @@
+# Real-world release names and how the parser must read them.
+# Columns (tab separated): path, kind (movie, episode or none = not
+# parsed), title, year, season, episodes (comma list or -), air date,
+# absolute episode, part, edition. "-" means empty, 0 means unset.
+# Add a line for every name a user reports as misread.
+The.Shawshank.Redemption.1994.1080p.BluRay.x264-AMIABLE/The.Shawshank.Redemption.1994.1080p.BluRay.x264-AMIABLE.mkv	movie	The Shawshank Redemption	1994	0	-	-	0	0	-
+The.Godfather.1972.REMASTERED.1080p.BluRay.x264-SADPANDA.mkv	movie	The Godfather	1972	0	-	-	0	0	Remastered
+Pulp.Fiction.1994.2160p.UHD.BluRay.x265.10bit.HDR.DTS-HD.MA.5.1-SWTYBLZ.mkv	movie	Pulp Fiction	1994	0	-	-	0	0	-
+The.Dark.Knight.2008.IMAX.1080p.BluRay.x264-ROVERS.mkv	movie	The Dark Knight	2008	0	-	-	0	0	IMAX
+Fight.Club.1999.10th.Anniversary.Edition.1080p.BluRay.x264-HDMaNiAcS.mkv	movie	Fight Club	1999	0	-	-	0	0	-
+Forrest.Gump.1994.720p.BRrip.x264.YIFY.mp4	movie	Forrest Gump	1994	0	-	-	0	0	-
+Inception (2010) [1080p] [YTS.MX]/Inception.2010.1080p.BluRay.x264-[YTS.MX].mp4	movie	Inception	2010	0	-	-	0	0	-
+Interstellar.2014.IMAX.2160p.UHD.BluRay.REMUX.HDR.HEVC.Atmos-EPSiLON.mkv	movie	Interstellar	2014	0	-	-	0	0	IMAX
+Spirited.Away.2001.JAPANESE.1080p.BluRay.x264.DTS-FGT.mkv	movie	Spirited Away	2001	0	-	-	0	0	-
+Parasite.2019.KOREAN.1080p.BluRay.H264.AAC-VXT.mp4	movie	Parasite	2019	0	-	-	0	0	-
+Amelie.2001.FRENCH.720p.BluRay.x264-NERDHD.mkv	movie	Amelie	2001	0	-	-	0	0	-
+Blade.Runner.2049.2017.1080p.WEB-DL.DD5.1.H264-FGT.mkv	movie	Blade Runner 2049	2017	0	-	-	0	0	-
+Blade.Runner.1982.The.Final.Cut.1080p.BluRay.x264-HD4U.mkv	movie	Blade Runner	1982	0	-	-	0	0	Final Cut
+2001.A.Space.Odyssey.1968.1080p.BluRay.x264-AMIABLE.mkv	movie	2001 A Space Odyssey	1968	0	-	-	0	0	-
+1917.2019.1080p.BluRay.x264-SPARKS.mkv	movie	1917	2019	0	-	-	0	0	-
+Avengers.Endgame.2019.2160p.DSNP.WEB-DL.DDP5.1.Atmos.HDR.HEVC-EVO.mkv	movie	Avengers Endgame	2019	0	-	-	0	0	-
+Spider-Man.No.Way.Home.2021.1080p.WEB-DL.DDP5.1.H.264-EVO.mkv	movie	Spider-Man No Way Home	2021	0	-	-	0	0	-
+Mission.Impossible.Dead.Reckoning.Part.One.2023.1080p.AMZN.WEB-DL.DDP5.1.H.264-FLUX.mkv	movie	Mission Impossible Dead Reckoning Part One	2023	0	-	-	0	0	-
+Dune.Part.Two.2024.2160p.MA.WEB-DL.DDP5.1.Atmos.DV.HDR.H.265-FLUX.mkv	movie	Dune Part Two	2024	0	-	-	0	0	-
+Oppenheimer.2023.1080p.BluRay.DD5.1.x264-ZoroSenpai.mkv	movie	Oppenheimer	2023	0	-	-	0	0	-
+Everything.Everywhere.All.at.Once.2022.1080p.WEBRip.x264-RARBG.mp4	movie	Everything Everywhere All at Once	2022	0	-	-	0	0	-
+The.Lord.of.the.Rings.The.Fellowship.of.the.Ring.2001.EXTENDED.1080p.BluRay.x264-SiNNERS.mkv	movie	The Lord of the Rings The Fellowship of the Ring	2001	0	-	-	0	0	Extended Cut
+Star.Wars.Episode.IV.A.New.Hope.1977.1080p.BluRay.x264-OFT.mkv	movie	Star Wars Episode IV A New Hope	1977	0	-	-	0	0	-
+Alien.1979.Directors.Cut.1080p.BluRay.x264-AMIABLE.mkv	movie	Alien	1979	0	-	-	0	0	Director's Cut
+Apocalypse.Now.1979.Final.Cut.2160p.UHD.BluRay.x265-TERMiNAL.mkv	movie	Apocalypse Now	1979	0	-	-	0	0	Final Cut
+Back.to.the.Future.1985.720p.BluRay.x264-SiNNERS.mkv	movie	Back to the Future	1985	0	-	-	0	0	-
+Mad.Max.Fury.Road.2015.1080p.BluRay.x264-SPARKS.mkv	movie	Mad Max Fury Road	2015	0	-	-	0	0	-
+WALL-E.2008.1080p.BluRay.x264-HDMaNiAcS.mkv	movie	WALL-E	2008	0	-	-	0	0	-
+Kill.Bill.Vol.1.2003.1080p.BluRay.x264-HD1080.mkv	movie	Kill Bill Vol 1	2003	0	-	-	0	0	-
+Amores.Perros.2000.SPANISH.1080p.BluRay.x264-USURY.mkv	movie	Amores Perros	2000	0	-	-	0	0	-
+Cidade.de.Deus.2002.1080p.BluRay.x264-DUAL.mkv	movie	Cidade de Deus	2002	0	-	-	0	0	-
+Tropa.de.Elite.2007.1080p.BluRay.x264.DUAL-WWW.BLUDV.TV.mkv	movie	Tropa de Elite	2007	0	-	-	0	0	-
+www.Torrenting.com - The.Matrix.1999.1080p.BluRay.x264-ETRG.mp4	movie	The Matrix	1999	0	-	-	0	0	-
+[ www.Speed.cd ] - Gladiator.2000.720p.BluRay.x264-CtrlHD.mkv	movie	Gladiator	2000	0	-	-	0	0	-
+The Matrix (1999)/The Matrix (1999).mkv	movie	The Matrix	1999	0	-	-	0	0	-
+Up (2009)/Up.2009.1080p.BluRay.x264.mkv	movie	Up	2009	0	-	-	0	0	-
+Her.2013.1080p.BluRay.x264-SPARKS.mkv	movie	Her	2013	0	-	-	0	0	-
+It.2017.1080p.BluRay.x264-SPARKS.mkv	movie	It	2017	0	-	-	0	0	-
+Arrival.2016.1080p.BluRay.x264-SPARKS/Arrival.2016.1080p.BluRay.x264-SPARKS.mkv	movie	Arrival	2016	0	-	-	0	0	-
+Coco.2017.720p.WEB-DL.x264-[MW].mkv	movie	Coco	2017	0	-	-	0	0	-
+Joker.2019.1080p.WEBRip.x264-RARBG/Joker.2019.1080p.WEBRip.x264-RARBG.mp4	movie	Joker	2019	0	-	-	0	0	-
+Gravity.2013.3D.HSBS.1080p.BluRay.x264-YIFY.mp4	movie	Gravity	2013	0	-	-	0	0	-
+The.Thing.1982.1080p.BluRay.DTS.x264-ESiR.mkv	movie	The Thing	1982	0	-	-	0	0	-
+The.Thing.2011.1080p.BluRay.x264-SPARKS.mkv	movie	The Thing	2011	0	-	-	0	0	-
+Ghostbusters.Afterlife.2021.1080p.WEB-DL.x264.AAC5.1-[YTS.MX].mp4	movie	Ghostbusters Afterlife	2021	0	-	-	0	0	-
+Breaking.Bad.S01E01.720p.BluRay.x264-DEMAND.mkv	episode	Breaking Bad	0	1	1	-	0	0	-
+Breaking.Bad.S05E16.Felina.1080p.WEB-DL.DD5.1.H.264-BS.mkv	episode	Breaking Bad	0	5	16	-	0	0	-
+Game.of.Thrones.S08E06.The.Iron.Throne.1080p.AMZN.WEB-DL.DDP5.1.H.264-GoT.mkv	episode	Game of Thrones	0	8	6	-	0	0	-
+The.Office.US.S02E01.The.Dundies.720p.WEB-DL.x264-NTb.mkv	episode	The Office US	0	2	1	-	0	0	-
+The.Office.S01E01.720p.BluRay.x264-SHORTBREHD.mkv	episode	The Office	0	1	1	-	0	0	-
+Stranger.Things.S04E09.Chapter.Nine.The.Piggyback.2160p.NF.WEB-DL.DDP5.1.Atmos.DV.HDR.H.265-SMURF.mkv	episode	Stranger Things	0	4	9	-	0	0	-
+Dark.S01E01.Secrets.1080p.NF.WEB-DL.DDP5.1.x264-NTG.mkv	episode	Dark	0	1	1	-	0	0	-
+Dark.S01.1080p.NF.WEB-DL.DDP5.1.x264-NTG/Dark.S01E02.Lies.1080p.NF.WEB-DL.DDP5.1.x264-NTG.mkv	episode	Dark	0	1	2	-	0	0	-
+The.Mandalorian.S03E08.1080p.WEB.H264-NAISU.mkv	episode	The Mandalorian	0	3	8	-	0	0	-
+Severance.S02E10.Cold.Harbor.2160p.ATVP.WEB-DL.DDP5.1.Atmos.DV.HDR.H.265-FLUX.mkv	episode	Severance	0	2	10	-	0	0	-
+Shogun.2024.S01E01.Anjin.1080p.DSNP.WEB-DL.DDP5.1.H.264-NTb.mkv	episode	Shogun	2024	1	1	-	0	0	-
+Doctor.Who.2005.S01E01.Rose.720p.BluRay.x264-SHORTBREHD.mkv	episode	Doctor Who	2005	1	1	-	0	0	-
+Doctor.Who.2023.S01E01.1080p.DSNP.WEB-DL.DDP5.1.H.264-NTb.mkv	episode	Doctor Who	2023	1	1	-	0	0	-
+House.of.the.Dragon.S02E08.1080p.MAX.WEB-DL.DDP5.1.Atmos.H.264-FLUX.mkv	episode	House of the Dragon	0	2	8	-	0	0	-
+The.Last.of.Us.S01E03.Long.Long.Time.1080p.HMAX.WEB-DL.DDP5.1.Atmos.H.264-SMURF.mkv	episode	The Last of Us	0	1	3	-	0	0	-
+Friends.S03E25.The.One.at.the.Beach.1080p.BluRay.x265-RARBG.mp4	episode	Friends	0	3	25	-	0	0	-
+Seinfeld.S04E11.The.Contest.720p.WEB-DL.AAC2.0.H.264-NTb.mkv	episode	Seinfeld	0	4	11	-	0	0	-
+Arrested.Development.S01E01-E02.720p.WEB-DL.x264.mkv	episode	Arrested Development	0	1	1,2	-	0	0	-
+The.Simpsons.S35E01.1080p.WEB.h264-ETHEL.mkv	episode	The Simpsons	0	35	1	-	0	0	-
+Grey's.Anatomy.S20E01.1080p.WEB.h264-ETHEL.mkv	episode	Grey's Anatomy	0	20	1	-	0	0	-
+Marvels.Agents.of.S.H.I.E.L.D.S07E13.1080p.WEB.x264-XLF.mkv	episode	Marvels Agents of SHIELD	0	7	13	-	0	0	-
+Law.and.Order.SVU.S25E01.1080p.WEB.h264-ETHEL.mkv	episode	Law and Order SVU	0	25	1	-	0	0	-
+Shameless.US.S11E12.1080p.WEB.H264-GGEZ.mkv	episode	Shameless US	0	11	12	-	0	0	-
+Its.Always.Sunny.in.Philadelphia.S16E01.1080p.WEB.H264-GLHF.mkv	episode	Its Always Sunny in Philadelphia	0	16	1	-	0	0	-
+The.Daily.Show.2024.03.15.1080p.WEB.h264-EDITH.mkv	episode	The Daily Show	0	2024	-	2024-03-15	0	0	-
+Last.Week.Tonight.with.John.Oliver.2024.02.18.1080p.WEB.h264-EDITH.mkv	episode	Last Week Tonight with John Oliver	0	2024	-	2024-02-18	0	0	-
+Planet.Earth.II.Part.1.of.6.Islands.1080p.BluRay.x264.mkv	episode	Planet Earth II	0	1	1	-	0	0	-
+Chernobyl.Part.3.of.5.720p.WEB-DL.mkv	episode	Chernobyl	0	1	3	-	0	0	-
+Sherlock.3x02.The.Sign.of.Three.720p.HDTV.x264-FoV.mkv	episode	Sherlock	0	3	2	-	0	0	-
+Lost.1x01.Pilot.Part1.DVDRip.XviD-FoV.avi	episode	Lost	0	1	1	-	0	0	-
+Twin Peaks/Season 1/Twin Peaks - S01E03 - Zen, or the Skill to Catch a Killer.mkv	episode	Twin Peaks	0	1	3	-	0	0	-
+Twin Peaks/Season 2/02x01 - May the Giant Be with You.mkv	episode	Twin Peaks	0	2	1	-	0	0	-
+The Wire/Season 03/The Wire S03E11 Middle Ground.mkv	episode	The Wire	0	3	11	-	0	0	-
+Fargo (2014)/Season 2/Fargo.2014.S02E05.720p.mkv	episode	Fargo	2014	2	5	-	0	0	-
+Westworld.S01.COMPLETE.1080p.BluRay.x264-ROVERS/Westworld.S01E01.The.Original.1080p.BluRay.x264-ROVERS.mkv	episode	Westworld	0	1	1	-	0	0	-
+True.Detective.S01.1080p.BluRay.x264-ROVERS/E05.mkv	episode	True Detective	0	1	5	-	0	0	-
+Better.Call.Saul.Season.6.1080p/Better.Call.Saul.E13.Saul.Gone.mkv	episode	Better Call Saul	0	6	13	-	0	0	-
+La.Casa.de.Papel.S01E01.SPANISH.1080p.NF.WEB-DL.x264.mkv	episode	La Casa de Papel	0	1	1	-	0	0	-
+Narcos.Temporada.1.Episodio.3.720p.mkv	episode	Narcos	0	1	3	-	0	0	-
+Les.Revenants.S01E01.FRENCH.720p.HDTV.x264-DiAMOND.mkv	episode	Les Revenants	0	1	1	-	0	0	-
+Peaky.Blinders.S06E06.Lock.and.Key.1080p.iP.WEB-DL.AAC2.0.H.264-playWEB.mkv	episode	Peaky Blinders	0	6	6	-	0	0	-
+Taskmaster.S16E01.1080p.WEB.h264-WEBTUBE.mkv	episode	Taskmaster	0	16	1	-	0	0	-
+Bluey.2018.S03E01.720p.WEB.h264.mkv	episode	Bluey	2018	3	1	-	0	0	-
+[SubsPlease] One Piece - 1100 (1080p) [ABCDEF12].mkv	episode	One Piece	0	1	1100	-	1100	0	-
+[Erai-raws] Jujutsu Kaisen - 47 [1080p][Multiple Subtitle].mkv	episode	Jujutsu Kaisen	0	1	47	-	47	0	-
+[HorribleSubs] Shingeki no Kyojin - 59 [720p].mkv	episode	Shingeki no Kyojin	0	1	59	-	59	0	-
+[Judas] Vinland Saga - S02E24 [1080p][HEVC x265 10bit][Multi-Subs].mkv	episode	Vinland Saga	0	2	24	-	0	0	-
+[SubsPlease] Frieren - 28 (1080p) [B1C2D3E4].mkv	episode	Frieren	0	1	28	-	28	0	-
+[Commie] Steins;Gate - 01 [BD 1080p AAC] [5ABAD8F0].mkv	episode	Steins;Gate	0	1	1	-	1	0	-
+[EMBER] Chainsaw Man (2022) (Season 1) [1080p] [Dual Audio HEVC WEBRip]/[EMBER] Chainsaw Man - 01.mkv	episode	Chainsaw Man	0	1	1	-	1	0	-
+Cowboy.Bebop.S01E01.Asteroid.Blues.1080p.BluRay.x264.mkv	episode	Cowboy Bebop	0	1	1	-	0	0	-
+Avatar.The.Last.Airbender.S01E01.The.Boy.in.the.Iceberg.1080p.NF.WEB-DL.mkv	episode	Avatar The Last Airbender	0	1	1	-	0	0	-
+Avatar.2009.EXTENDED.1080p.BluRay.x264-SPARKS.mkv	movie	Avatar	2009	0	-	-	0	0	Extended Cut
+The.Avengers.2012.1080p.BluRay.x264-SPARKS.mkv	movie	The Avengers	2012	0	-	-	0	0	-
+Avengers.Age.of.Ultron.2015.1080p.BluRay.x264-SPARKS.mkv	movie	Avengers Age of Ultron	2015	0	-	-	0	0	-
+Black.Mirror.S06E01.Joan.Is.Awful.1080p.NF.WEB-DL.DDP5.1.Atmos.H.264-FLUX.mkv	episode	Black Mirror	0	6	1	-	0	0	-
+Sense8.S02E00.A.Christmas.Special.1080p.NF.WEB-DL.mkv	episode	Sense8	0	2	0	-	0	0	-
+Top.Gear.S22E00.Patagonia.Special.720p.HDTV.x264.mkv	episode	Top Gear	0	22	0	-	0	0	-
+Firefly.S01E01.Serenity.Part.1.720p.BluRay.x264.mkv	episode	Firefly	0	1	1	-	0	0	-
+Twin.Peaks.The.Return.S03E08.1080p.mkv	episode	Twin Peaks The Return	0	3	8	-	0	0	-
+24.S01E01.12.00.AM-1.00.AM.720p.BluRay.x264.mkv	episode	24	0	1	1	-	0	0	-
+9-1-1.S07E01.1080p.WEB.h264-ETHEL.mkv	episode	9-1-1	0	7	1	-	0	0	-
+Brooklyn.Nine-Nine.S08E10.1080p.WEB.H264-GGEZ.mkv	episode	Brooklyn Nine-Nine	0	8	10	-	0	0	-
+Ted.Lasso.S03E12.So.Long.Farewell.2160p.ATVP.WEB-DL.DDP5.1.Atmos.HDR.H.265-FLUX.mkv	episode	Ted Lasso	0	3	12	-	0	0	-
+Rome.S01E01.The.Stolen.Eagle.1080p.BluRay.x264-DON.mkv	episode	Rome	0	1	1	-	0	0	-
+The.Crown.S06E10.Sleep.Dearie.Sleep.1080p.NF.WEB-DL.mkv	episode	The Crown	0	6	10	-	0	0	-
+Mr.Robot.S04E13.Hello.Elliot.1080p.AMZN.WEB-DL.mkv	episode	Mr Robot	0	4	13	-	0	0	-
+Halt.and.Catch.Fire.S04E10.Ten.of.Swords.720p.AMZN.WEB-DL.mkv	episode	Halt and Catch Fire	0	4	10	-	0	0	-
+The.Matrix.Reloaded.2003.1080p.BluRay.x264.mkv	movie	The Matrix Reloaded	2003	0	-	-	0	0	-
+The.Matrix.Revolutions.2003.CD1.DVDRip.XviD.avi	movie	The Matrix Revolutions	2003	0	-	-	0	1	-
+The.Matrix.Revolutions.2003.CD2.DVDRip.XviD.avi	movie	The Matrix Revolutions	2003	0	-	-	0	2	-
+Lawrence.of.Arabia.1962.Restored.Version.Disc.1.1080p.mkv	movie	Lawrence of Arabia	1962	0	-	-	0	1	-
+Nosferatu.1922.720p.BluRay.x264.mkv	movie	Nosferatu	1922	0	-	-	0	0	-
+Nosferatu.2024.1080p.WEB-DL.DDP5.1.H.264-FLUX.mkv	movie	Nosferatu	2024	0	-	-	0	0	-
+Metropolis.1927.The.Complete.Metropolis.1080p.BluRay.mkv	movie	Metropolis	1927	0	-	-	0	0	-
+The.Good.the.Bad.and.the.Ugly.1966.EXTENDED.REMASTERED.1080p.BluRay.x264.mkv	movie	The Good the Bad and the Ugly	1966	0	-	-	0	0	Extended Cut
+Once.Upon.a.Time.in.Hollywood.2019.1080p.BluRay.x264-SPARKS.mkv	movie	Once Upon a Time in Hollywood	2019	0	-	-	0	0	-
+Once.Upon.a.Time.S01E01.Pilot.720p.WEB-DL.mkv	episode	Once Upon a Time	0	1	1	-	0	0	-
+Love.Actually.2003.1080p.BluRay.x264.mkv	movie	Love Actually	2003	0	-	-	0	0	-
+O.Auto.da.Compadecida.2000.1080p.WEB-DL.mkv	movie	O Auto da Compadecida	2000	0	-	-	0	0	-
+Bacurau.2019.1080p.BluRay.x264.mkv	movie	Bacurau	2019	0	-	-	0	0	-
+Central.do.Brasil.1998.720p.BluRay.x264.mkv	movie	Central do Brasil	1998	0	-	-	0	0	-
+Sintonia.S01E01.1080p.NF.WEB-DL.mkv	episode	Sintonia	0	1	1	-	0	0	-
+3.Body.Problem.S01E01.1080p.NF.WEB-DL.mkv	episode	3 Body Problem	0	1	1	-	0	0	-
+The.100.S01E01.Pilot.720p.WEB-DL.mkv	episode	The 100	0	1	1	-	0	0	-
+Movie.43.2013.720p.BluRay.x264.mkv	movie	Movie 43	2013	0	-	-	0	0	-
+Se7en.1995.REMASTERED.1080p.BluRay.x264.mkv	movie	Se7en	1995	0	-	-	0	0	Remastered
+M3GAN.2022.1080p.WEB-DL.mkv	movie	M3GAN	2022	0	-	-	0	0	-
+Tenet.2020.IMAX.1080p.BluRay.x264.mkv	movie	Tenet	2020	0	-	-	0	0	IMAX
+X.2022.1080p.WEB-DL.x264.mkv	movie	X	2022	0	-	-	0	0	-
+Us.2019.1080p.BluRay.x264-SPARKS.mkv	movie	Us	2019	0	-	-	0	0	-
+a1b2c3d4e5f60718.mkv	none	-	0	0	-	-	0	0	-
+movie.mkv	none	-	0	0	-	-	0	0	-
+video/movie.mkv	none	-	0	0	-	-	0	0	-

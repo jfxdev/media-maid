@@ -59,6 +59,38 @@ type PlatformSpec struct {
 	// ListItems pages through the server library using the generic requester and
 	// decodes the platform response into ServerItems.
 	ListItems func(ctx context.Context, r Requester) ([]ServerItem, error)
+	// ExtrasDirs maps an extras folder found in a release (lower-cased, dots,
+	// underscores and dashes read as spaces) to the folder the server reads
+	// extras from, inside the movie or show folder. Folders it does not list
+	// are never linked.
+	ExtrasDirs map[string]string
+}
+
+// ExtrasDir returns the library folder for a release's extras folder.
+func (s PlatformSpec) ExtrasDir(category string) (string, bool) {
+	d, ok := s.ExtrasDirs[category]
+	return d, ok
+}
+
+// embyExtras are the extras folders Emby reads; clips go to the generic
+// Extras folder.
+var embyExtras = map[string]string{
+	"extras": "Extras", "bonus": "Extras", "clips": "Extras", "featurettes": "Featurettes", "trailers": "Trailers",
+	"behind the scenes": "Behind The Scenes", "deleted scenes": "Deleted Scenes",
+	"interviews": "Interviews", "scenes": "Scenes", "shorts": "Shorts",
+}
+
+// jellyfinExtras adds the Clips folder.
+// https://jellyfin.org/docs/general/server/media/movies/#extras
+var jellyfinExtras = withExtra(embyExtras, "clips", "Clips")
+
+func withExtra(m map[string]string, k, v string) map[string]string {
+	out := make(map[string]string, len(m)+1)
+	for a, b := range m {
+		out[a] = b
+	}
+	out[k] = v
+	return out
 }
 
 // IDTag returns the folder/file tag for a TMDB id, or "" when id is zero.
@@ -90,6 +122,7 @@ var platforms = map[string]PlatformSpec{
 		SyncPaths:   mediaUpdated("/Library/Media/Updated"),
 		DeleteItem:  Endpoint{http.MethodDelete, "/Items/{id}"},
 		ListItems:   listEmbyStyle("/Items"),
+		ExtrasDirs:  jellyfinExtras,
 	},
 	"emby": {
 		Name:        "emby",
@@ -99,6 +132,7 @@ var platforms = map[string]PlatformSpec{
 		SyncPaths:   mediaUpdated("/emby/Library/Media/Updated"),
 		DeleteItem:  Endpoint{http.MethodDelete, "/emby/Items/{id}"},
 		ListItems:   listEmbyStyle("/emby/Items"),
+		ExtrasDirs:  embyExtras,
 	},
 	"plex": {
 		Name:        "plex",
@@ -110,6 +144,13 @@ var platforms = map[string]PlatformSpec{
 		SyncPaths:        plexRefreshPaths,
 		DeleteItem:       Endpoint{http.MethodDelete, "/library/metadata/{id}"},
 		ListItems:        listPlex,
+		// https://support.plex.tv/articles/local-files-for-trailers-and-extras/
+		ExtrasDirs: map[string]string{
+			"extras": "Other", "bonus": "Other", "clips": "Other", "featurettes": "Featurettes",
+			"trailers": "Trailers", "behind the scenes": "Behind The Scenes",
+			"deleted scenes": "Deleted Scenes", "interviews": "Interviews", "scenes": "Scenes",
+			"shorts": "Shorts",
+		},
 	},
 }
 

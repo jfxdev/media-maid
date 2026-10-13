@@ -101,6 +101,12 @@ paths:
         Handy as a qBittorrent "run external program" hook. An explicit
         request ignores the ledger: the files are identified again and
         re-linked even if their library copy was deleted.
+
+        `kind` with `tmdb_id` and/or `title` (and `year`) replaces automatic
+        identification for every video of the request (`resolved_by:
+        manual`). When the file was placed before under another name, that
+        earlier placement is removed once the new one is in place, but only
+        while it still is the same file (`previous` names it).
       operationId: organize
       requestBody: { $ref: "#/components/requestBodies/PathRequest" }
       responses:
@@ -110,6 +116,7 @@ paths:
         "403": { $ref: "#/components/responses/UnauthorizedVolume" }
         "404": { $ref: "#/components/responses/NotFound" }
         "500": { $ref: "#/components/responses/InternalError" }
+        "502": { $ref: "#/components/responses/MetadataUnavailable" }
   /api/v1/preview:
     post:
       tags: [organize]
@@ -123,6 +130,32 @@ paths:
         "403": { $ref: "#/components/responses/UnauthorizedVolume" }
         "404": { $ref: "#/components/responses/NotFound" }
         "500": { $ref: "#/components/responses/InternalError" }
+        "502": { $ref: "#/components/responses/MetadataUnavailable" }
+  /api/v1/pending:
+    get:
+      tags: [organize]
+      summary: Downloads that need a decision
+      description: |
+        Videos that are not in the library because of a `conflict`, a
+        `duplicate`, a title that could not be identified (`skipped`) or an
+        `error`, oldest first. An item goes away when the file is placed
+        (for example with a manual identification or `overwrite`) or leaves
+        the downloads folder. Kept across restarts. With `NOTIFY_URL`, each
+        new or changed item is notified once.
+      operationId: pending
+      responses:
+        "200":
+          description: Pending items.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/PendingItem" }
+                required: [items]
+        "401": { $ref: "#/components/responses/Unauthorized" }
   /api/v1/history:
     get:
       tags: [sync]
@@ -253,12 +286,40 @@ components:
                 default: false
                 description: |
                   Atomically replace an existing, different regular file at the
-                  destination (for example a 720p release with a 1080p one)
-                  instead of reporting `conflict`. Directories and symlinks are
-                  never replaced, nor a file that changed after it was checked.
-                  Requires a filesystem with atomic exchange (renameat2
-                  RENAME_EXCHANGE); elsewhere the result is `error`. The
-                  watcher and scans never overwrite.
+                  destination, or the same title under another video extension
+                  (for example a 720p release with a 1080p one), instead of
+                  reporting `conflict` or `duplicate`. Directories and symlinks
+                  are never replaced, nor a file that changed after it was
+                  checked. Requires a filesystem with atomic exchange
+                  (renameat2); elsewhere the result is `error`. The watcher and
+                  scans never overwrite; they upgrade only with `AUTO_UPGRADE`.
+              kind:
+                type: string
+                enum: [movie, episode]
+                description: |
+                  Manual identification. Required with `title`, `year` or
+                  `tmdb_id`. `episode` keeps the season and episode numbers
+                  found in the name (a name without them is `skipped`).
+              tmdb_id:
+                type: integer
+                minimum: 1
+                maximum: 1073741824
+                description: |
+                  TMDB id of the movie or series; its title and year are used
+                  unless `title` / `year` are given. Unknown ids answer
+                  `tmdb_not_found`. Without `TMDB_API_KEY` it is only used as
+                  the ID tag and `title` is required (`invalid_override`).
+              title:
+                type: string
+                maxLength: 200
+                description: |
+                  Title to use. Without `tmdb_id` it is searched on TMDB (when
+                  enabled) and used as typed when there is no confident match.
+                  Sanitized before it becomes a folder name.
+              year:
+                type: integer
+                minimum: 1870
+                maximum: 2100
             required: [path]
   responses:
     Results:
@@ -278,7 +339,7 @@ components:
         application/json:
           schema: { $ref: "#/components/schemas/Report" }
     BadRequest:
-      description: "`invalid_request` (malformed JSON, unknown fields, duplicate keys, trailing data, body over 64 KiB) or `invalid_path`."
+      description: "`invalid_request` (malformed JSON, unknown fields, duplicate keys, trailing data, body over 64 KiB), `invalid_path` or `invalid_override`."
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
@@ -293,7 +354,12 @@ components:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
     NotFound:
-      description: "`not_found`: nothing exists at that path."
+      description: "`not_found`: nothing exists at that path; `tmdb_not_found`: no TMDB entry with that `tmdb_id` and `kind`."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    MetadataUnavailable:
+      description: "`metadata_unavailable`: TMDB could not be reached to check a manual identification."
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
@@ -314,6 +380,9 @@ components:
             - unauthorized
             - unauthorized_volume
             - not_found
+            - invalid_override
+            - tmdb_not_found
+            - metadata_unavailable
             - no_report
             - sync_disabled
             - sync_failed
@@ -332,33 +401,62 @@ components:
           description: Destination inside the library.
         kind:
           type: string
-          enum: [movie, episode, subtitle]
-        status:
-          type: string
-          enum: [linked, copied, replaced, exists, conflict, duplicate, planned, skipped, error]
-          description: |
-            `linked` hardlink created; `copied` fallback when on another filesystem;
-            `replaced` existing destination replaced (only with `overwrite`);
-            `exists` already in place; `conflict` destination holds different content
-            (not overwritten without `overwrite`); `duplicate` another release of the
-            same title in the same request has better quality (see `error`);
-            `planned` preview/dry run; `skipped` not identified, no matching video,
-            or previously organized and since removed from the library; `error`
-            see `error`. Two unidentified releases of equal quality under the same
-            name are `conflict` rather than `duplicate`: they may be different titles.
+          enum: [movie, episode, subtitle, extra]
+          description: "`extra`: a video from a release's extras folder (`LINK_EXTRAS`)."
+        status: { $ref: "#/components/schemas/OrganizeStatus" }
         error: { type: string }
         replaces:
           type: boolean
           description: On a `planned` result, the destination exists and would be replaced.
+        previous:
+          type: string
+          description: |
+            Library file this result removed (or would remove, in a preview):
+            the release it upgraded or replaced under another extension, or
+            the earlier placement of the same file corrected by a manual
+            identification.
         resolved_by:
           type: string
-          enum: [parser, tmdb, llm]
+          enum: [parser, tmdb, llm, manual]
           description: Layer that identified a video (see "How titles are resolved" in the README).
         title_source:
           type: string
           enum: [tmdb_translation, llm_localized, original]
           description: Origin of the folder title when `PREFERRED_LANGUAGE` is set.
       required: [source, status]
+    OrganizeStatus:
+      type: string
+      enum: [linked, copied, replaced, upgraded, exists, conflict, duplicate, planned, skipped, error]
+      description: |
+        `linked` hardlink created; `copied` fallback when on another filesystem;
+        `replaced` existing release replaced (only with `overwrite`);
+        `upgraded` a lower-quality release placed by Media Maid replaced
+        automatically (`AUTO_UPGRADE`); `exists` already in place; `conflict`
+        the destination holds a file Media Maid did not place, or a release
+        this one would upgrade while `AUTO_UPGRADE` is off; `duplicate` the
+        title is already in the library (or in the same request) at the same
+        or better quality (see `error`); `planned` preview/dry run; `skipped`
+        not identified, no matching video, or previously organized and since
+        removed from (or replaced in) the library; `error` see `error`. Two
+        unidentified releases of equal quality under the same name are
+        `conflict` rather than `duplicate`: they may be different titles.
+    PendingItem:
+      type: object
+      properties:
+        source:
+          type: string
+          description: Path relative to `DOWNLOADS_DIR`.
+        dest: { type: string }
+        kind:
+          type: string
+          enum: [movie, episode]
+        status:
+          type: string
+          enum: [conflict, duplicate, skipped, error]
+        error: { type: string }
+        since: { type: string, format: date-time }
+        updated: { type: string, format: date-time }
+      required: [source, status, since, updated]
     HistoryEntry:
       type: object
       properties:

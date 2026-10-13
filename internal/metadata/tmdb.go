@@ -4,6 +4,7 @@ package metadata
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -56,7 +57,12 @@ type Provider interface {
 	Titles(ctx context.Context, kind Kind, id int) ([]Title, error)
 	// Seasons returns the regular seasons (no specials) of a series in order.
 	Seasons(ctx context.Context, id int) ([]Season, error)
+	// Lookup returns the entry with a TMDB id, or ErrNotFound.
+	Lookup(ctx context.Context, kind Kind, id int) (Result, error)
 }
+
+// ErrNotFound is returned by Lookup when TMDB has no entry with that id.
+var ErrNotFound = errors.New("tmdb: not found")
 
 // MaxCandidates bounds how many search results are considered.
 const MaxCandidates = 5
@@ -67,6 +73,7 @@ type Noop struct{}
 func (Noop) Search(context.Context, Kind, string, int) ([]Result, error) { return nil, nil }
 func (Noop) Titles(context.Context, Kind, int) ([]Title, error)          { return nil, nil }
 func (Noop) Seasons(context.Context, int) ([]Season, error)              { return nil, nil }
+func (Noop) Lookup(context.Context, Kind, int) (Result, error)           { return Result{}, ErrNotFound }
 
 // Cache lifetimes. An empty search result expires quickly so that a title
 // added to TMDB after a release came out is found on a later run.
@@ -75,6 +82,7 @@ const (
 	negativeTTL = 24 * time.Hour
 	titlesTTL   = 30 * 24 * time.Hour
 	seasonsTTL  = 24 * time.Hour
+	detailsTTL  = 30 * 24 * time.Hour
 	// maxCacheEntries bounds each cache; the oldest entries go first.
 	maxCacheEntries = 20000
 )
@@ -120,6 +128,9 @@ type TMDB struct {
 	searches cache[[]Result]
 	titles   cache[[]Title]
 	seasons  cache[[]Season]
+	details  cache[Result]
+	// wait sleeps before a retry (replaced in tests).
+	wait func(ctx context.Context, d time.Duration) error
 	// OnChange, when set, is called (without locks held) after a cache update,
 	// so the caller can persist Export.
 	OnChange func()
@@ -141,6 +152,19 @@ func NewTMDB(key, baseURL string) *TMDB {
 		searches: cache[[]Result]{},
 		titles:   cache[[]Title]{},
 		seasons:  cache[[]Season]{},
+		details:  cache[Result]{},
+		wait:     sleepCtx,
+	}
+}
+
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
 	}
 }
 
@@ -149,13 +173,14 @@ type cacheFile struct {
 	Searches cache[[]Result] `json:"searches"`
 	Titles   cache[[]Title]  `json:"titles"`
 	Seasons  cache[[]Season] `json:"seasons"`
+	Details  cache[Result]   `json:"details,omitempty"`
 }
 
 // Export returns the caches as JSON. It never contains the API key.
 func (t *TMDB) Export() ([]byte, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return json.Marshal(cacheFile{Searches: t.searches, Titles: t.titles, Seasons: t.seasons})
+	return json.Marshal(cacheFile{Searches: t.searches, Titles: t.titles, Seasons: t.seasons, Details: t.details})
 }
 
 // Import loads caches saved by Export; expired entries are dropped.
@@ -180,6 +205,11 @@ func (t *TMDB) Import(data []byte) error {
 	for k, e := range f.Seasons {
 		if now.Sub(e.At) < seasonsTTL {
 			t.seasons[k] = e
+		}
+	}
+	for k, e := range f.Details {
+		if now.Sub(e.At) < detailsTTL {
+			t.details[k] = e
 		}
 	}
 	return nil
@@ -361,6 +391,54 @@ func (t *TMDB) Seasons(ctx context.Context, id int) ([]Season, error) {
 	return out, nil
 }
 
+// Lookup fetches /{movie,tv}/{id}: the entry a user named by its TMDB id.
+func (t *TMDB) Lookup(ctx context.Context, kind Kind, id int) (Result, error) {
+	if id <= 0 {
+		return Result{}, ErrNotFound
+	}
+	key := string(kind) + "|" + strconv.Itoa(id)
+	now := t.now()
+	t.mu.Lock()
+	if c, ok := t.details.get(key, detailsTTL, now); ok {
+		t.mu.Unlock()
+		return c, nil
+	}
+	t.mu.Unlock()
+
+	var body struct {
+		ID            int      `json:"id"`
+		Title         string   `json:"title"`
+		Name          string   `json:"name"`
+		OriginalTitle string   `json:"original_title"`
+		OriginalName  string   `json:"original_name"`
+		ReleaseDate   string   `json:"release_date"`
+		FirstAirDate  string   `json:"first_air_date"`
+		OriginCountry []string `json:"origin_country"`
+	}
+	if err := t.get(ctx, "/"+string(kind)+"/"+strconv.Itoa(id), url.Values{}, &body); err != nil {
+		return Result{}, err
+	}
+	name, orig, date := body.Title, body.OriginalTitle, body.ReleaseDate
+	if kind == Series {
+		name, orig, date = body.Name, body.OriginalName, body.FirstAirDate
+	}
+	if name == "" || body.ID != id {
+		return Result{}, ErrNotFound
+	}
+	res := Result{Title: name, OriginalTitle: orig, TMDBID: id}
+	if len(body.OriginCountry) > 0 {
+		res.OriginCountry = body.OriginCountry[0]
+	}
+	if len(date) >= 4 {
+		res.Year, _ = strconv.Atoi(date[:4])
+	}
+	t.mu.Lock()
+	t.details.put(key, res, now)
+	t.mu.Unlock()
+	t.changed()
+	return res, nil
+}
+
 // AbsoluteToSeason maps an absolute episode number onto regular seasons. ok is
 // false when the number lies beyond the known episodes.
 func AbsoluteToSeason(seasons []Season, abs int) (season, episode int, ok bool) {
@@ -377,24 +455,52 @@ func AbsoluteToSeason(seasons []Season, abs int) (season, episode int, ok bool) 
 	return 0, 0, false
 }
 
+// Rate limiting: a 429 is retried up to maxRetries times, waiting what
+// Retry-After asks (at most maxRetryWait) or 1s, 2s, 4s without it.
+const (
+	maxRetries   = 3
+	maxRetryWait = 10 * time.Second
+)
+
+// retryAfter reads a Retry-After header in seconds.
+func retryAfter(h string, attempt int) time.Duration {
+	if n, err := strconv.Atoi(strings.TrimSpace(h)); err == nil && n >= 0 {
+		return min(time.Duration(n)*time.Second, maxRetryWait)
+	}
+	return min(time.Second<<attempt, maxRetryWait)
+}
+
 func (t *TMDB) get(ctx context.Context, path string, q url.Values, into any) error {
 	bearer := strings.HasPrefix(t.key, "eyJ")
 	if !bearer {
 		q.Set("api_key", t.key)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, t.baseURL+path+"?"+q.Encode(), nil)
-	if err != nil {
-		return err
-	}
-	if bearer {
-		req.Header.Set("Authorization", "Bearer "+t.key)
-	}
-	req.Header.Set("Accept", "application/json")
-	resp, err := t.http.Do(req)
-	if err != nil {
-		return fmt.Errorf("tmdb request failed")
+	var resp *http.Response
+	for attempt := 0; ; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, t.baseURL+path+"?"+q.Encode(), nil)
+		if err != nil {
+			return err
+		}
+		if bearer {
+			req.Header.Set("Authorization", "Bearer "+t.key)
+		}
+		req.Header.Set("Accept", "application/json")
+		resp, err = t.http.Do(req)
+		if err != nil {
+			return fmt.Errorf("tmdb request failed")
+		}
+		if resp.StatusCode != http.StatusTooManyRequests || attempt == maxRetries {
+			break
+		}
+		resp.Body.Close()
+		if err := t.wait(ctx, retryAfter(resp.Header.Get("Retry-After"), attempt)); err != nil {
+			return err
+		}
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return ErrNotFound
+	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("tmdb status %d", resp.StatusCode)
 	}

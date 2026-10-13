@@ -39,6 +39,33 @@ func (f Filter) IsSubtitle(path string) bool {
 	return f.Subtitle[ext(path)] && !partialRe.MatchString(path)
 }
 
+// reSampleName matches sample files, which are never linked as extras.
+var reSampleName = regexp.MustCompile(`(?i)(^|[ ._\-\[(])sample([ ._\-\])]|$)`)
+
+// Extra reports whether path (relative to the downloads folder) is a video in
+// an extras folder of a release, other than a sample. category is the
+// normalized folder name ("behind the scenes") and release the folder above
+// it, relative to the downloads folder.
+func (f Filter) Extra(path string) (category, release string, ok bool) {
+	base := filepath.Base(path)
+	if !f.Video[ext(path)] || partialRe.MatchString(base) || strings.HasPrefix(base, ".") ||
+		reSampleName.MatchString(strings.TrimSuffix(base, filepath.Ext(base))) {
+		return "", "", false
+	}
+	parts := strings.Split(filepath.Dir(path), string(filepath.Separator))
+	for i := len(parts) - 1; i >= 0; i-- {
+		name := strings.ToLower(dirSeparators.Replace(parts[i]))
+		if !junkDirs[name] {
+			continue
+		}
+		if name == "sample" || name == "samples" {
+			return "", "", false
+		}
+		return name, filepath.Join(parts[:i]...), true
+	}
+	return "", "", false
+}
+
 func isJunk(path string) bool {
 	base := filepath.Base(path)
 	if partialRe.MatchString(base) || strings.HasPrefix(base, ".") {

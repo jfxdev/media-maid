@@ -9,11 +9,14 @@ import (
 
 // Status values used across history entries.
 const (
-	StatusLinked    = "linked"
-	StatusCopied    = "copied"
-	StatusExists    = "exists"
-	StatusConflict  = "conflict"
-	StatusReplaced  = "replaced"
+	StatusLinked   = "linked"
+	StatusCopied   = "copied"
+	StatusExists   = "exists"
+	StatusConflict = "conflict"
+	StatusReplaced = "replaced"
+	// StatusUpgraded is an automatic replacement of a lower-quality release
+	// already in the library (AUTO_UPGRADE).
+	StatusUpgraded  = "upgraded"
 	StatusDuplicate = "duplicate"
 	StatusPlanned   = "planned"
 	StatusSkipped   = "skipped"

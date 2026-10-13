@@ -196,7 +196,7 @@ func Analyze(path string) (Analysis, bool) {
 			a.add(SigTitleFromDir)
 		}
 	}
-	if m.Title == "" {
+	if m.Title == "" || isGeneric(m.Title) {
 		return Analysis{}, false
 	}
 	m.Part, m.Edition = part, ed
