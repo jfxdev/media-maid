@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -44,12 +45,30 @@ type Ledger struct {
 	// byDest maps "lib/dest" to the key of the entry placed there (the most
 	// recent one), so a library file can be traced back to its source.
 	byDest map[string]string
+	// byAlt maps an entry's device-independent identity (inode, size and
+	// mtime, see altKey) to its key: the device number of a filesystem can
+	// change across reboots or remounts (btrfs subvolumes, mergerfs, ZFS),
+	// and the entry must still be found then.
+	byAlt map[string]string
 	// OnChange, when set, is called (without locks held) after an update.
 	OnChange func()
 }
 
 // NewLedger returns an empty ledger.
-func NewLedger() *Ledger { return &Ledger{m: map[string]LedgerEntry{}, byDest: map[string]string{}} }
+func NewLedger() *Ledger {
+	return &Ledger{m: map[string]LedgerEntry{}, byDest: map[string]string{}, byAlt: map[string]string{}}
+}
+
+// altKey is the device-independent identity of the entry e stored under key.
+func altKey(key string, e LedgerEntry) string {
+	_, ino, _ := strings.Cut(key, ":")
+	return ino + ":" + strconv.FormatInt(e.Size, 10) + ":" + strconv.FormatInt(e.MTime.UnixNano(), 10)
+}
+
+// fileAltKey is altKey for a file on disk.
+func fileAltKey(fi os.FileInfo) string {
+	return strconv.FormatUint(Inode(fi), 10) + ":" + strconv.FormatInt(fi.Size(), 10) + ":" + strconv.FormatInt(fi.ModTime().UnixNano(), 10)
+}
 
 func destKey(lib, dest string) string { return lib + "/" + dest }
 
@@ -76,6 +95,7 @@ func (l *Ledger) setLocked(key string, e LedgerEntry) {
 	}
 	l.m[key] = e
 	l.byDest[destKey(e.Lib, e.Dest)] = key
+	l.byAlt[altKey(key, e)] = key
 }
 
 func (l *Ledger) deleteLocked(key string) {
@@ -89,6 +109,20 @@ func (l *Ledger) dropDestLocked(key string, e LedgerEntry) {
 	if dk := destKey(e.Lib, e.Dest); l.byDest[dk] == key {
 		delete(l.byDest, dk)
 	}
+	if ak := altKey(key, e); l.byAlt[ak] == key {
+		delete(l.byAlt, ak)
+	}
+}
+
+// rekeyLocked moves the entry stored under old to key (the same file seen
+// under a new device number). l.mu must be held.
+func (l *Ledger) rekeyLocked(old, key string) {
+	e := l.m[old]
+	l.deleteLocked(old)
+	if prev, ok := l.m[key]; ok {
+		l.dropDestLocked(key, prev)
+	}
+	l.setLocked(key, e)
 }
 
 // fileKey identifies a file by device and inode.
@@ -119,7 +153,19 @@ func (l *Ledger) Lookup(fi os.FileInfo) (LedgerEntry, bool) {
 	}
 	l.mu.Lock()
 	e, ok := l.m[key]
+	moved := false
+	if !ok {
+		// Same inode, size and mtime under another device number: the
+		// filesystem was remounted. The entry follows the file.
+		if old, found := l.byAlt[fileAltKey(fi)]; found && old != key {
+			l.rekeyLocked(old, key)
+			e, ok, moved = l.m[key], true, true
+		}
+	}
 	l.mu.Unlock()
+	if moved {
+		l.changed()
+	}
 	if !ok || e.Size != fi.Size() || !e.MTime.Equal(fi.ModTime()) {
 		return LedgerEntry{}, false
 	}
@@ -157,15 +203,31 @@ func (l *Ledger) Put(fi os.FileInfo, e LedgerEntry) {
 	l.changed()
 }
 
-// Prune keeps only the entries whose key is in keep.
-func (l *Ledger) Prune(keep map[string]bool) {
+// Prune keeps the entries of files (the downloads folder as listed at since),
+// following any file whose device number changed, and the entries recorded
+// at or after since (placed while the folder was being listed). Every other
+// entry is dropped: its file left the downloads folder.
+func (l *Ledger) Prune(files []os.FileInfo, since time.Time) {
 	if l == nil {
 		return
 	}
+	keys := make(map[string]bool, len(files))
+	alts := make(map[string]string, len(files))
+	for _, fi := range files {
+		if k, ok := fileKey(fi); ok {
+			keys[k] = true
+			alts[fileAltKey(fi)] = k
+		}
+	}
 	n := 0
 	l.mu.Lock()
-	for k := range l.m {
-		if !keep[k] {
+	for k, e := range l.m {
+		switch nk, moved := alts[altKey(k, e)]; {
+		case keys[k], !e.At.Before(since):
+		case moved && nk != k:
+			l.rekeyLocked(k, nk)
+			n++
+		default:
 			l.deleteLocked(k)
 			n++
 		}
@@ -195,14 +257,15 @@ func (l *Ledger) Import(data []byte) error {
 	if err := json.Unmarshal(data, &m); err != nil {
 		return err
 	}
-	byDest := map[string]string{}
+	byDest, byAlt := map[string]string{}, map[string]string{}
 	for k, e := range m {
 		if cur, ok := byDest[destKey(e.Lib, e.Dest)]; !ok || m[cur].At.Before(e.At) {
 			byDest[destKey(e.Lib, e.Dest)] = k
 		}
+		byAlt[altKey(k, e)] = k
 	}
 	l.mu.Lock()
-	l.m, l.byDest = m, byDest
+	l.m, l.byDest, l.byAlt = m, byDest, byAlt
 	l.mu.Unlock()
 	return nil
 }

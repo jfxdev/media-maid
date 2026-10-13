@@ -117,15 +117,16 @@ func (p *Pending) Resolve(source string) {
 	}
 }
 
-// Prune keeps only the items whose source is in keep.
-func (p *Pending) Prune(keep map[string]bool) {
+// Prune keeps only the items whose source is in keep, or that changed at or
+// after since (recorded while the downloads folder was being listed).
+func (p *Pending) Prune(keep map[string]bool, since time.Time) {
 	if p == nil {
 		return
 	}
 	n := 0
 	p.mu.Lock()
-	for k := range p.m {
-		if !keep[k] {
+	for k, it := range p.m {
+		if !keep[k] && it.Updated.Before(since) {
 			delete(p.m, k)
 			n++
 		}

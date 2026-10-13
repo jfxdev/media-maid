@@ -277,13 +277,16 @@ func (o *Organizer) Organize(ctx context.Context, input string, opts OrganizeOpt
 		}
 		files = []string{p}
 	} else if lst.IsDir() {
+		// Entries recorded from here on (another run placing a file this
+		// listing missed) are never pruned.
+		listed := time.Now()
 		files, err = o.collect(ctx, p)
 		if err != nil {
 			return nil, err
 		}
 		if p == o.downloads && !dry && ctx.Err() == nil {
-			o.pruneLedger(files)
-			o.prunePending(files)
+			o.pruneLedger(files, listed)
+			o.prunePending(files, listed)
 		}
 	} else {
 		files = []string{p}
@@ -336,26 +339,26 @@ func settled(files []string, minAge time.Duration) []string {
 	return out
 }
 
-// pruneLedger drops entries for files no longer in the downloads folder.
-func (o *Organizer) pruneLedger(files []string) {
-	keep := map[string]bool{}
+// pruneLedger drops entries for files no longer in the downloads folder
+// (listed at since).
+func (o *Organizer) pruneLedger(files []string, since time.Time) {
+	infos := make([]os.FileInfo, 0, len(files))
 	for _, f := range files {
 		if fi, err := os.Stat(f); err == nil {
-			if k, ok := fileKey(fi); ok {
-				keep[k] = true
-			}
+			infos = append(infos, fi)
 		}
 	}
-	o.ledger.Prune(keep)
+	o.ledger.Prune(infos, since)
 }
 
-// prunePending drops pending items whose file left the downloads folder.
-func (o *Organizer) prunePending(files []string) {
+// prunePending drops pending items whose file left the downloads folder
+// (listed at since).
+func (o *Organizer) prunePending(files []string, since time.Time) {
 	keep := make(map[string]bool, len(files))
 	for _, f := range files {
 		keep[o.rel(f)] = true
 	}
-	o.pending.Prune(keep)
+	o.pending.Prune(keep, since)
 }
 
 func (o *Organizer) record(dry bool, r Result) {
