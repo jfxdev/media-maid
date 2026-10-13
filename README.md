@@ -192,6 +192,14 @@ Release shapes the parser understands besides plain names:
 - **Origin markers** (`The Office US`): TMDB is searched for `The Office` and
   the series from that country is preferred.
 
+Compressed releases (RAR, including `.partNN.rar`/`.rNN` volumes, ZIP and 7z)
+are not extracted. When a video release holds only archives, its first volume
+is reported as an `error` (`archive: extract it first`) in
+`/api/v1/pending` and notified once; extract it next to the archive (for
+example with [unpackerr](https://github.com/Unpackerr/unpackerr)) and the
+video is organized as usual while the archive leaves the pending list. Archives whose name does not look like a video
+release (software, music) are ignored like any other file.
+
 What the LLM receives: the file name and at most two parent folders, the
 parser's reading and the TMDB candidates. Nothing else leaves the container.
 Calls are cached, and after five consecutive failures the layer pauses for

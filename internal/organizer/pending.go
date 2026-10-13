@@ -102,6 +102,21 @@ func (p *Pending) Update(r Result) bool {
 	return changed
 }
 
+// Resolve drops the item for source, if any: it no longer needs a decision
+// although it was not placed (an archive extracted next to itself).
+func (p *Pending) Resolve(source string) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	_, had := p.m[source]
+	delete(p.m, source)
+	p.mu.Unlock()
+	if had && p.OnChange != nil {
+		p.OnChange()
+	}
+}
+
 // Prune keeps only the items whose source is in keep.
 func (p *Pending) Prune(keep map[string]bool) {
 	if p == nil {

@@ -138,7 +138,9 @@ paths:
       description: |
         Videos that are not in the library because of a `conflict`, a
         `duplicate`, a title that could not be identified (`skipped`) or an
-        `error`, oldest first. An item goes away when the file is placed
+        `error`, oldest first. A compressed video release (RAR, ZIP, 7z)
+        with no extracted video next to it is an `error` too: it must be
+        extracted first. An item goes away when the file is placed
         (for example with a manual identification or `overwrite`) or leaves
         the downloads folder. Kept across restarts. With `NOTIFY_URL`, each
         new or changed item is notified once.
@@ -437,7 +439,8 @@ components:
         title is already in the library (or in the same request) at the same
         or better quality (see `error`); `planned` preview/dry run; `skipped`
         not identified, no matching video, or previously organized and since
-        removed from (or replaced in) the library; `error` see `error`. Two
+        removed from (or replaced in) the library; `error` see `error` (a
+        compressed release that must be extracted first is one). Two
         unidentified releases of equal quality under the same name are
         `conflict` rather than `duplicate`: they may be different titles.
     PendingItem:

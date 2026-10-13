@@ -19,6 +19,10 @@ var (
 	}
 	dirSeparators = strings.NewReplacer(".", " ", "_", " ", "-", " ")
 	partialRe     = regexp.MustCompile(`(?i)\.(part|!qb|crdownload|tmp|partial|aria2)$`)
+	// reArchive matches RAR, ZIP and 7z archives, optionally split into
+	// numbered volumes ("x.7z.001"); reRarPart matches "x.part01.rar".
+	reArchive = regexp.MustCompile(`(?i)\.(?:rar|zip|7z)(?:\.(\d{2,4}))?$`)
+	reRarPart = regexp.MustCompile(`(?i)\.part(\d{1,4})\.rar$`)
 )
 
 // Filter decides which files are eligible, based on the extension allowlists.
@@ -64,6 +68,24 @@ func (f Filter) Extra(path string) (category, release string, ok bool) {
 		return name, filepath.Join(parts[:i]...), true
 	}
 	return "", "", false
+}
+
+// Archive reports whether path is the first volume of a RAR, ZIP or 7z
+// archive outside sample and extras folders. Later volumes ("x.part02.rar",
+// "x.r00", "x.7z.002") are not reported, so a split archive counts once.
+func (f Filter) Archive(path string) bool {
+	if isJunk(path) {
+		return false
+	}
+	base := filepath.Base(path)
+	m := reArchive.FindStringSubmatch(base)
+	if m == nil || (m[1] != "" && atoi(m[1]) != 1) {
+		return false
+	}
+	if p := reRarPart.FindStringSubmatch(base); p != nil && atoi(p[1]) != 1 {
+		return false
+	}
+	return true
 }
 
 func isJunk(path string) bool {
