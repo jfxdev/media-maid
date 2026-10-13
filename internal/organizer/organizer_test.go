@@ -527,10 +527,12 @@ func TestDecisionLayers(t *testing.T) {
 			"movies/Inception (2010) [tmdbid-27205]/Inception (2010) [tmdbid-27205].mkv", ByTMDB, false},
 		{"tie settled by llm", "Dune.1080p.mkv", &fakeAssist{decision: dune2021}, false,
 			"movies/Dune (2021) [tmdbid-438631]/Dune (2021) [tmdbid-438631].mkv", ByLLM, true},
-		{"llm failure keeps tmdb pick", "Dune.1080p.mkv", &fakeAssist{err: errors.New("llm status 500")}, false,
-			"movies/Dune (1984) [tmdbid-841]/Dune (1984) [tmdbid-841].mkv", ByTMDB, true},
+		// An unsure TMDB pick is not a decision: the file waits for a
+		// manual identification instead of getting a possibly wrong ID.
+		{"llm failure leaves tie pending", "Dune.1080p.mkv", &fakeAssist{err: errors.New("llm status 500")}, false,
+			"", "", true},
 		{"llm kind mismatch ignored", "Dune.1080p.mkv", &fakeAssist{decision: assist.Decision{Kind: "episode", Title: "Dune", Season: 1, Episodes: []int{1}, Choice: 1, Confidence: 0.9}}, false,
-			"movies/Dune (1984) [tmdbid-841]/Dune (1984) [tmdbid-841].mkv", ByTMDB, true},
+			"", "", true},
 		{"llm title unknown to tmdb rejected", "Some.Obscure.Film.mkv", &fakeAssist{decision: assist.Decision{Kind: "movie", Title: "Invented", Choice: -1, Confidence: 0.9}}, false,
 			"movies/Some Obscure Film/Some Obscure Film.mkv", ByParser, true},
 		{"llm free title without tmdb", "Some.Obscure.Film.mkv", &fakeAssist{decision: assist.Decision{Kind: "movie", Title: "Some Obscure Film", Year: 0, Choice: -1, Confidence: 0.9}}, true,
@@ -555,10 +557,26 @@ func TestDecisionLayers(t *testing.T) {
 		})
 	}
 
-	// Without the LLM layer the pipeline behaves as before.
+	// Without the LLM layer a tie is pending, naming the candidates.
 	e := newEnv(t, "jellyfin")
-	if r := organizeOne(t, e, "Dune.1080p.mkv"); r.Dest != "movies/Dune (1984) [tmdbid-841]/Dune (1984) [tmdbid-841].mkv" || r.ResolvedBy != ByTMDB {
+	r := organizeOne(t, e, "Dune.1080p.mkv")
+	if r.Status != jobs.StatusSkipped || r.Error != "ambiguous title: Dune (1984) [tmdb 841], Dune (2021) [tmdb 438631]; identify it manually" {
 		t.Errorf("no llm: %+v", r)
+	}
+	if _, err := e.org.Scan(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if items := e.org.Pending(); len(items) != 1 || items[0].Source != "Dune.1080p.mkv" {
+		t.Errorf("pending = %+v", items)
+	}
+	// A year settles it.
+	if r := organizeOne(t, e, "Dune.2021.1080p.mkv"); r.Dest != "movies/Dune (2021) [tmdbid-438631]/Dune (2021) [tmdbid-438631].mkv" {
+		t.Errorf("with year: %+v", r)
+	}
+	// AMBIGUOUS_MATCH=best keeps the previous behavior.
+	e = newEnv(t, "jellyfin", func(o *Options) { o.AmbiguousBest = true })
+	if r := organizeOne(t, e, "Dune.1080p.mkv"); r.Dest != "movies/Dune (1984) [tmdbid-841]/Dune (1984) [tmdbid-841].mkv" || r.ResolvedBy != ByTMDB {
+		t.Errorf("best: %+v", r)
 	}
 	if r := organizeOne(t, e, "1080p.mkv"); r.Status != jobs.StatusSkipped {
 		t.Errorf("unparseable without llm: %+v", r)

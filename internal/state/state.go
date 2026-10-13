@@ -16,8 +16,9 @@ import (
 	"time"
 )
 
-// maxDocument bounds what Load reads back.
-const maxDocument = 64 << 20
+// MaxDocument bounds what Load reads back. The organize ledger is the
+// largest document: a full ledger must fit (see the organizer's tests).
+const MaxDocument = 256 << 20
 
 var reName = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,63}$`)
 
@@ -69,11 +70,11 @@ func (s *Store) Load(name string) ([]byte, error) {
 		return nil, err
 	}
 	defer f.Close()
-	data, err := io.ReadAll(io.LimitReader(f, maxDocument+1))
+	data, err := io.ReadAll(io.LimitReader(f, MaxDocument+1))
 	if err != nil {
 		return nil, err
 	}
-	if len(data) > maxDocument {
+	if len(data) > MaxDocument {
 		return nil, fmt.Errorf("state document %s is too large", name)
 	}
 	return data, nil

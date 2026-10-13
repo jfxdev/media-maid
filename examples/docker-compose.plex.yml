@@ -41,7 +41,9 @@ services:
       # LLM_MODEL: claude-haiku-5-5
       # ORPHAN_SCAN_INTERVAL: 24h
       # SCAN_INTERVAL: 15m                           # fallback when inotify misses events (NFS/SMB)
-      # COPY_FALLBACK: "false"                       # fail instead of copying when hardlinks are impossible
+      # COPY_FALLBACK: "true"                        # copy (extra disk space) when hardlinks are impossible
+      # ORGANIZE_TRIGGER: hook                       # organize only from the torrent client's completion hook
+      # AMBIGUOUS_MATCH: best                        # take TMDB's best candidate even when it is unsure
       # AUTO_UPGRADE: "true"                         # replace a release with a better one of the same title
       # LINK_EXTRAS: "false"                         # keep extras folders (Featurettes, Trailers...) out
       # NOTIFY_URL: ${NOTIFY_URL}                     # e.g. https://ntfy.sh/<topic> or http://apprise:8000/notify/<key>

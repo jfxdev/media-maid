@@ -31,7 +31,10 @@ paths:
       description: >-
         Answers 200 while the process serves requests and the downloads
         watcher is running; 503 when the watcher stopped or its event loop
-        stalled for more than 30 seconds.
+        stalled for more than 30 seconds. A 200 with `"watcher": "degraded"`
+        means some folders could not be watched (usually the inotify watch
+        limit): a periodic scan covers them. With `ORGANIZE_TRIGGER=hook`
+        there is no watcher and the probe only checks the process.
       operationId: health
       security: []
       responses:
@@ -43,6 +46,7 @@ paths:
                 type: object
                 properties:
                   status: { type: string, const: ok }
+                  watcher: { type: string, const: degraded }
                 required: [status]
         "503":
           description: The downloads watcher is not running.
@@ -194,6 +198,7 @@ paths:
                 type: object
                 properties:
                   status: { type: string, const: ok }
+                  watcher: { type: string, const: degraded }
                 required: [status]
         "401": { $ref: "#/components/responses/Unauthorized" }
         "409":
@@ -438,7 +443,8 @@ components:
         this one would upgrade while `AUTO_UPGRADE` is off; `duplicate` the
         title is already in the library (or in the same request) at the same
         or better quality (see `error`); `planned` preview/dry run; `skipped`
-        not identified, no matching video, or previously organized and since
+        not identified, an ambiguous TMDB match (`error` names the candidates;
+        identify it manually), no matching video, or previously organized and since
         removed from (or replaced in) the library; `error` see `error` (a
         compressed release that must be extracted first is one). Two
         unidentified releases of equal quality under the same name are
@@ -504,10 +510,13 @@ components:
           enum: [server_item_missing_file, orphan_directory, unlinked_download]
           description: |
             `server_item_missing_file`: the media server lists the item but none of its
-            files exist. `orphan_directory`: a library folder with no video in it.
-            `unlinked_download`: a downloaded video with no other hard link, so it is
-            not in the library but still uses disk space; report-only (removal
-            returns `error` / `not_removable`), the torrent client owns it.
+            files exist (removal checks the item's current paths first).
+            `orphan_directory`: a library folder that is empty or holds only
+            metadata (artwork, nfo, subtitles); any other file keeps it.
+            `unlinked_download`: a downloaded video that is not in the library
+            but still uses disk space (no other hard link, or its recorded
+            library copy is gone); report-only (removal returns `error` /
+            `not_removable`), the torrent client owns it.
         path:
           type: string
           description: Library path (`movies/...`, `tv/...`) or `downloads/...`.

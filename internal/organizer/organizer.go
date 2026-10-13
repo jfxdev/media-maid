@@ -94,6 +94,8 @@ type Organizer struct {
 	notify    func(Result)
 	upgrade   bool
 	extras    bool
+	// ambiguousBest accepts an unsure TMDB pick (AMBIGUOUS_MATCH=best).
+	ambiguousBest bool
 
 	// mu serializes placement (dedupe and writes). Identification, which
 	// may wait on TMDB or the LLM, runs outside it.
@@ -136,6 +138,9 @@ type Options struct {
 	// LinkExtras links videos from a release's extras folders into the
 	// server's extras folders (LINK_EXTRAS).
 	LinkExtras bool
+	// AmbiguousBest accepts the best TMDB candidate when it is weak or tied
+	// (AMBIGUOUS_MATCH=best); by default such a file waits as pending.
+	AmbiguousBest bool
 }
 
 // New builds an Organizer.
@@ -151,7 +156,7 @@ func New(o Options) *Organizer {
 		o.Pending = NewPending()
 	}
 	return &Organizer{
-		pending: o.Pending, notify: o.Notify, upgrade: o.AutoUpgrade, extras: o.LinkExtras,
+		pending: o.Pending, notify: o.Notify, upgrade: o.AutoUpgrade, extras: o.LinkExtras, ambiguousBest: o.AmbiguousBest,
 		hasMeta: hasMeta, assist: o.Assist, minConf: o.MinConfidence, language: o.Language,
 		downloads: o.DownloadsDir, movies: o.Movies, tv: o.TV, filter: o.Filter,
 		guard: o.Guard, meta: o.Meta, platform: o.Platform, syncer: o.Syncer,
@@ -216,6 +221,14 @@ type Override struct {
 
 func (o *Organizer) DownloadsDir() string { return o.downloads }
 
+// Exclusive runs fn while no placement is in progress (orphan removal uses it
+// so a folder is never deleted while a file is being linked into it).
+func (o *Organizer) Exclusive(fn func()) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	fn()
+}
+
 // Ledger returns the organize ledger.
 func (o *Organizer) Ledger() *Ledger { return o.ledger }
 
@@ -264,13 +277,16 @@ func (o *Organizer) Organize(ctx context.Context, input string, opts OrganizeOpt
 		}
 		files = []string{p}
 	} else if lst.IsDir() {
+		// Entries recorded from here on (another run placing a file this
+		// listing missed) are never pruned.
+		listed := time.Now()
 		files, err = o.collect(ctx, p)
 		if err != nil {
 			return nil, err
 		}
 		if p == o.downloads && !dry && ctx.Err() == nil {
-			o.pruneLedger(files)
-			o.prunePending(files)
+			o.pruneLedger(files, listed)
+			o.prunePending(files, listed)
 		}
 	} else {
 		files = []string{p}
@@ -323,26 +339,26 @@ func settled(files []string, minAge time.Duration) []string {
 	return out
 }
 
-// pruneLedger drops entries for files no longer in the downloads folder.
-func (o *Organizer) pruneLedger(files []string) {
-	keep := map[string]bool{}
+// pruneLedger drops entries for files no longer in the downloads folder
+// (listed at since).
+func (o *Organizer) pruneLedger(files []string, since time.Time) {
+	infos := make([]os.FileInfo, 0, len(files))
 	for _, f := range files {
 		if fi, err := os.Stat(f); err == nil {
-			if k, ok := fileKey(fi); ok {
-				keep[k] = true
-			}
+			infos = append(infos, fi)
 		}
 	}
-	o.ledger.Prune(keep)
+	o.ledger.Prune(infos, since)
 }
 
-// prunePending drops pending items whose file left the downloads folder.
-func (o *Organizer) prunePending(files []string) {
+// prunePending drops pending items whose file left the downloads folder
+// (listed at since).
+func (o *Organizer) prunePending(files []string, since time.Time) {
 	keep := make(map[string]bool, len(files))
 	for _, f := range files {
 		keep[o.rel(f)] = true
 	}
-	o.pending.Prune(keep)
+	o.pending.Prune(keep, since)
 }
 
 func (o *Organizer) record(dry bool, r Result) {
@@ -468,13 +484,14 @@ func (o *Organizer) process(ctx context.Context, files []string, dry bool, opts 
 
 	// Plan every video before touching the disk, so releases of the same title
 	// in different qualities can be compared first.
+	anchors := map[string]anchorIndex{}
 	var planned, all []*videoPlan
 	for _, k := range keys {
 		for _, v := range groups[k].videos {
 			if ctx.Err() != nil {
 				return results
 			}
-			v.result = o.planVideo(ctx, v, opts, man)
+			v.result = o.planVideo(ctx, v, opts, man, anchors)
 			if v.result.Status == "" {
 				planned = append(planned, v)
 			}
@@ -561,7 +578,8 @@ func (o *Organizer) archive(src string) (Result, bool) {
 func stem(dest string) string { return strings.TrimSuffix(dest, path.Ext(dest)) }
 
 // dedupe keeps a single video per destination: the best quality, then the
-// largest file. The others are reported as duplicates and left untouched.
+// largest file (placeVideo ranks a release already in the library the same
+// way). The others are reported as duplicates and left untouched.
 func (o *Organizer) dedupe(videos []*videoPlan) {
 	best := map[string]*videoPlan{}
 	for _, v := range videos {
@@ -638,15 +656,15 @@ func (o *Organizer) findPeer(v *videoPlan, src os.FileInfo) *peer {
 		}
 		rel := path.Join(dir, name)
 		fi, err := v.lib.Root.Lstat(rel)
-		if err != nil || !fi.Mode().IsRegular() || samePlaced(fi, src) {
+		if err != nil || !fi.Mode().IsRegular() || os.SameFile(fi, src) || o.copyOf(v.lib, rel, fi, src) {
 			continue
 		}
 		p := &peer{rel: rel, fi: fi}
 		if le, ok := o.ledger.Lookup(fi); ok && le.Lib == v.lib.Name && le.Dest == rel {
 			p.entry, p.tracked = le, true // a hardlink: same inode as its source
 		} else if le, ok := o.ledger.ByDest(v.lib.Name, rel); ok && le.Status == jobs.StatusCopied &&
-			le.Size == fi.Size() && le.MTime.Equal(fi.ModTime()) {
-			p.entry, p.tracked = le, true // a copy, recognised by size and mtime
+			le.Size == fi.Size() && le.MTime.Equal(fi.ModTime()) && (le.DestIno == 0 || le.DestIno == Inode(fi)) {
+			p.entry, p.tracked = le, true // our copy: the recorded file, same size and mtime
 		}
 		return p
 	}
@@ -672,13 +690,16 @@ func (o *Organizer) placeVideo(v *videoPlan, dry bool, opts OrganizeOptions) Res
 	overwrite, upgrade := false, false
 	if p != nil {
 		inLib := v.lib.Name + "/" + p.rel
+		// The same ranking as dedupe within a run (see better): quality,
+		// then file size.
 		rank, known := v.quality.Rank(), p.tracked && p.entry.Quality > 0
+		wins := known && (rank > p.entry.Quality || (rank == p.entry.Quality && srcFi.Size() > p.fi.Size()))
 		switch {
 		case opts.Overwrite:
 			overwrite = true
-		case known && rank > p.entry.Quality && o.upgrade:
+		case wins && o.upgrade:
 			overwrite, upgrade = true, true
-		case known && rank <= p.entry.Quality:
+		case known && !wins:
 			base.Status, base.Error = jobs.StatusDuplicate, "the library already has "+inLib+" at the same or better quality"
 			return base
 		case known:
@@ -733,7 +754,7 @@ func (o *Organizer) movePrevious(v *videoPlan, src os.FileInfo, dry bool, r *Res
 	if err != nil || !cur.Mode().IsRegular() {
 		return
 	}
-	if !os.SameFile(cur, src) && !(prev.Status == jobs.StatusCopied && samePlaced(cur, src)) {
+	if !os.SameFile(cur, src) && !o.copyOf(lib, prev.Dest, cur, src) {
 		return // something else lives there now
 	}
 	old := lib.Name + "/" + prev.Dest
@@ -795,6 +816,11 @@ func (o *Organizer) rememberFile(src string, lib Library, dest, status string, e
 			status = jobs.StatusCopied
 		}
 	}
+	if status == jobs.StatusCopied {
+		if dfi, err := lib.Root.Lstat(dest); err == nil {
+			e.DestIno = Inode(dfi)
+		}
+	}
 	e.Lib, e.Dest, e.Status = lib.Name, dest, status
 	o.ledger.Put(fi, e)
 }
@@ -830,13 +856,30 @@ func (o *Organizer) placementGone(lib Library, e LedgerEntry, src os.FileInfo) s
 	if err != nil {
 		return errRemovedMsg
 	}
-	if !os.SameFile(cur, src) && !(e.Status == jobs.StatusCopied && samePlaced(cur, src)) {
+	if !os.SameFile(cur, src) && !o.copyOf(lib, e.Dest, cur, src) {
 		return errSupersededMsg
 	}
 	return ""
 }
 
-func (o *Organizer) planVideo(ctx context.Context, v *videoPlan, opts OrganizeOptions, man *manual) Result {
+// copyOf reports whether cur, the file at dest in lib, is the copy of src
+// Media Maid made: the ledger records a copy of src at dest, cur still has
+// src's size and mtime, and it is the library file recorded then (entries
+// from before DestIno existed are trusted on the ledger record alone). An
+// inode number reused by a later file with the same size and mtime is not
+// told apart: that needs a content check, which costs a full read.
+func (o *Organizer) copyOf(lib Library, dest string, cur, src os.FileInfo) bool {
+	if !cur.Mode().IsRegular() || cur.Size() != src.Size() || !cur.ModTime().Equal(src.ModTime()) {
+		return false
+	}
+	e, ok := o.ledger.Lookup(src)
+	if !ok || e.Status != jobs.StatusCopied || e.Lib != lib.Name || e.Dest != dest {
+		return false
+	}
+	return e.DestIno == 0 || e.DestIno == Inode(cur)
+}
+
+func (o *Organizer) planVideo(ctx context.Context, v *videoPlan, opts OrganizeOptions, man *manual, anchors map[string]anchorIndex) Result {
 	rel := o.rel(v.src)
 	a, ok := parser.Analyze(rel)
 	// The parser's reading is kept for subtitle matching even when the
@@ -858,8 +901,11 @@ func (o *Organizer) planVideo(ctx context.Context, v *videoPlan, opts OrganizeOp
 		if id, why = o.manualIdentity(ctx, a, ok, man); why != "" {
 			return Result{Source: rel, Status: jobs.StatusSkipped, Error: why}
 		}
-	} else if id, ok = o.identify(ctx, rel, a, ok); !ok {
-		return Result{Source: rel, Status: jobs.StatusSkipped, Error: "could not identify title"}
+	} else {
+		var why string
+		if id, why = o.identify(ctx, rel, a, ok); why != "" {
+			return Result{Source: rel, Status: jobs.StatusSkipped, Error: why}
+		}
 	}
 	m := id.media
 	var tag string
@@ -874,8 +920,71 @@ func (o *Organizer) planVideo(ctx context.Context, v *videoPlan, opts OrganizeOp
 		v.lib = o.movies
 		v.dest = naming.MoviePath(m, tag, o.platform.EditionTag(m.Edition), filepath.Ext(v.src))
 	}
+	if id.match != nil {
+		v.dest = o.anchor(v.lib, v.dest, m, id.match.TMDBID, anchors)
+	}
 	v.media, v.resolvedBy, v.titleSource, v.identified = m, id.by, id.titleSource, id.match != nil
 	return Result{}
+}
+
+var (
+	// reTMDBTag finds a TMDB id tag in a folder name, in any server's format
+	// ("[tmdbid-1]", "[tmdbid=1]", "{tmdb-1}", "[tmdb-1]").
+	reTMDBTag = regexp.MustCompile(`(?i)[\[{]tmdb(?:id)?[-=](\d+)[\]}]`)
+	// reEditionTag finds a Plex edition tag: editions of one movie live in
+	// folders of their own, sharing the TMDB id.
+	reEditionTag = regexp.MustCompile(`(?i)\{edition-[^}]*\}`)
+)
+
+// anchorIndex maps a TMDB id (plus edition tag) to the top-level library
+// folders tagged with it.
+type anchorIndex map[string][]string
+
+func anchorKey(tmdbID, edition string) string { return tmdbID + "|" + strings.ToLower(edition) }
+
+// anchorsOf indexes the tagged top-level folders of lib, once per run.
+func (o *Organizer) anchorsOf(lib Library, cache map[string]anchorIndex) anchorIndex {
+	if idx, ok := cache[lib.Name]; ok {
+		return idx
+	}
+	idx := anchorIndex{}
+	if entries, err := fs.ReadDir(lib.Root.FS(), "."); err == nil {
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			if m := reTMDBTag.FindStringSubmatch(e.Name()); m != nil {
+				k := anchorKey(m[1], reEditionTag.FindString(e.Name()))
+				idx[k] = append(idx[k], e.Name())
+			}
+		}
+	}
+	cache[lib.Name] = idx
+	return idx
+}
+
+// anchor keeps a title in the folder the library already has for its TMDB id
+// (created earlier under another title or year, by a translation that
+// changed, or by another tool), instead of opening a parallel folder the
+// server would show as a second entry. A movie's file name follows the
+// folder. Nothing changes when no folder, or more than one, has the id.
+func (o *Organizer) anchor(lib Library, dest string, m parser.Media, tmdbID int, cache map[string]anchorIndex) string {
+	folder, rest, ok := strings.Cut(dest, "/")
+	if !ok {
+		return dest
+	}
+	dirs := o.anchorsOf(lib, cache)[anchorKey(strconv.Itoa(tmdbID), o.platform.EditionTag(m.Edition))]
+	switch {
+	case len(dirs) > 1:
+		o.log.Warn("several library folders have the same TMDB id; not choosing one", "library", lib.Name, "tmdb_id", tmdbID, "folders", dirs)
+		return dest
+	case len(dirs) == 0 || dirs[0] == folder:
+		return dest
+	}
+	if m.Kind != parser.Episode && strings.HasPrefix(rest, folder) {
+		rest = dirs[0] + rest[len(folder):]
+	}
+	return dirs[0] + "/" + rest
 }
 
 // extra links a video from a release's extras folder into the extras folder
@@ -955,11 +1064,12 @@ func (o *Organizer) apply(src string, lib Library, dest string, dry, overwrite b
 		return r
 	}
 	defer f.Close()
+	ourCopy := func(cur os.FileInfo) bool { return o.copyOf(lib, dest, cur, fi) }
 
 	if dry {
 		if existing, err := lib.Root.Lstat(dest); err == nil {
 			switch {
-			case samePlaced(existing, fi):
+			case samePlaced(existing, fi, ourCopy):
 				r.Status = jobs.StatusExists
 			case overwrite && existing.Mode().IsRegular():
 				r.Status, r.Replaces = jobs.StatusPlanned, true
@@ -972,7 +1082,7 @@ func (o *Organizer) apply(src string, lib Library, dest string, dry, overwrite b
 		return r
 	}
 
-	status, err := place(lib.Root, dest, f, fi, overwrite, o.noCopy)
+	status, err := place(lib.Root, dest, f, fi, overwrite, o.noCopy, ourCopy)
 	r.Status = status
 	if err != nil {
 		r.Error = describe(err)

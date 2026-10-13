@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -104,8 +105,15 @@ type Config struct {
 	ListenAddr     string
 	DryRun         bool
 	// CopyFallback copies a file that cannot be hardlinked (another
-	// filesystem or mount); false makes that an error.
+	// filesystem or mount); false (the default) makes that an error.
 	CopyFallback bool
+	// OrganizeTrigger is TriggerWatch (the watcher and SCAN_INTERVAL
+	// organize finished downloads) or TriggerHook (only API requests, e.g.
+	// a torrent client's "download finished" hook).
+	OrganizeTrigger string
+	// AmbiguousBest accepts the best TMDB candidate when it is weak or tied
+	// (AMBIGUOUS_MATCH=best) instead of leaving the file pending.
+	AmbiguousBest bool
 	// AutoUpgrade lets automatic runs replace a release Media Maid placed
 	// with a better one of the same title.
 	AutoUpgrade bool
@@ -116,6 +124,12 @@ type Config struct {
 	// Warnings are non-fatal configuration notes to log at startup.
 	Warnings []string
 }
+
+// ORGANIZE_TRIGGER values.
+const (
+	TriggerWatch = "watch"
+	TriggerHook  = "hook"
+)
 
 // NotifyConfig configures the notification webhook. URL may carry a token:
 // it is a secret.
@@ -277,7 +291,13 @@ func Load(getenv func(string) string, environ []string) (*Config, error) {
 
 	c.DryRun = parseBool("DRY_RUN", getenv, false, fail)
 
-	c.CopyFallback = parseBool("COPY_FALLBACK", getenv, true, fail)
+	// Copying uses as much disk space again: opt-in only.
+	c.CopyFallback = parseBool("COPY_FALLBACK", getenv, false, fail)
+	c.OrganizeTrigger = parseChoice("ORGANIZE_TRIGGER", getenv, TriggerWatch, fail, TriggerWatch, TriggerHook)
+	if c.OrganizeTrigger == TriggerHook && c.ScanInterval > 0 {
+		fail("SCAN_INTERVAL has no effect with ORGANIZE_TRIGGER=hook: leave it empty")
+	}
+	c.AmbiguousBest = parseChoice("AMBIGUOUS_MATCH", getenv, "pending", fail, "pending", "best") == "best"
 	c.AutoUpgrade = parseBool("AUTO_UPGRADE", getenv, false, fail)
 	c.LinkExtras = parseBool("LINK_EXTRAS", getenv, true, fail)
 	c.Notify = loadNotify(getenv, fail)
@@ -286,6 +306,19 @@ func Load(getenv func(string) string, environ []string) (*Config, error) {
 		return nil, errors.Join(errs...)
 	}
 	return c, nil
+}
+
+// parseChoice reads name as one of choices (case-insensitive), def when empty.
+func parseChoice(name string, getenv func(string) string, def string, fail func(string, ...any), choices ...string) string {
+	v := strings.ToLower(strings.TrimSpace(getenv(name)))
+	if v == "" {
+		return def
+	}
+	if !slices.Contains(choices, v) {
+		fail("%s must be one of %s", name, strings.Join(choices, ", "))
+		return def
+	}
+	return v
 }
 
 func parseBool(name string, getenv func(string) string, def bool, fail func(string, ...any)) bool {

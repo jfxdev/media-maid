@@ -124,6 +124,17 @@ var ErrInvalidItemID = errors.New("invalid item id")
 
 var reItemID = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
+// GetItem returns one item as the server knows it now, or ErrNotFound.
+func (c *Client) GetItem(ctx context.Context, id string) (ServerItem, error) {
+	if !reItemID.MatchString(id) {
+		return ServerItem{}, ErrInvalidItemID
+	}
+	if c.spec.GetItem == nil {
+		return ServerItem{}, fmt.Errorf("%s: fetching one item is not supported", c.spec.Name)
+	}
+	return c.spec.GetItem(ctx, c, id)
+}
+
 // DeleteItem removes an item from the server library (never touches files).
 func (c *Client) DeleteItem(ctx context.Context, id string) error {
 	if !reItemID.MatchString(id) {

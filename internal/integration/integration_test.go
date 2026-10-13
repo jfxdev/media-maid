@@ -255,3 +255,43 @@ func TestSyncMaxWait(t *testing.T) {
 		t.Error("a steady stream of requests postponed the refresh indefinitely")
 	}
 }
+
+// GetItem fetches the item as the server knows it now; a missing item (an
+// empty result or a 404) is ErrNotFound, and ids are validated first.
+func TestGetItem(t *testing.T) {
+	embyOne := `{"Items":[{"Id":"a1","Name":"Inception","Type":"Movie","Path":"/media/movies/Inception (2010)/Inception (2010).mkv"}],"TotalRecordCount":1}`
+	plexOne := `{"MediaContainer":{"Metadata":[{"ratingKey":"a1","title":"Inception","type":"movie","Media":[{"Part":[{"file":"/m/a.mkv"}]}]}]}}`
+	tests := []struct {
+		mode, header, path string
+		routes             map[string]string
+		wantPath           string
+	}{
+		{"jellyfin", "X-Emby-Token", "/Items", map[string]string{"GET /Items": embyOne}, "/media/movies/Inception (2010)/Inception (2010).mkv"},
+		{"emby", "X-Emby-Token", "/emby/Items", map[string]string{"GET /emby/Items": embyOne}, "/media/movies/Inception (2010)/Inception (2010).mkv"},
+		{"plex", "X-Plex-Token", "/library/metadata/a1", map[string]string{"GET /library/metadata/a1": plexOne}, "/m/a.mkv"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.mode, func(t *testing.T) {
+			spec, _ := Lookup(tt.mode)
+			f := newFake(t, tt.header, tt.routes)
+			c, _ := NewClient(spec, f.srv.URL, "tok")
+			it, err := c.GetItem(context.Background(), "a1")
+			if err != nil || it.ID != "a1" || len(it.Paths) != 1 || it.Paths[0] != tt.wantPath {
+				t.Fatalf("GetItem = %+v, %v", it, err)
+			}
+			if r := f.last(); r.path != tt.path || r.token != "tok" {
+				t.Errorf("request = %+v", r)
+			}
+			if tt.mode != "plex" && !strings.Contains(f.last().query, "Ids=a1") {
+				t.Errorf("query = %s", f.last().query)
+			}
+			// Another id in the answer, or a 404, means the item is gone.
+			if _, err := c.GetItem(context.Background(), "b2"); !errors.Is(err, ErrNotFound) {
+				t.Errorf("missing item err = %v", err)
+			}
+			if _, err := c.GetItem(context.Background(), "../x"); !errors.Is(err, ErrInvalidItemID) {
+				t.Errorf("invalid id err = %v", err)
+			}
+		})
+	}
+}

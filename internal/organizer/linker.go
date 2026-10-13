@@ -25,7 +25,9 @@ import (
 // An existing different destination is a conflict, unless overwrite is set and
 // the destination is a regular file: it is then atomically replaced. With
 // noCopy, a file that cannot be hardlinked is an error instead of a copy.
-func place(root *os.Root, rel string, src *os.File, srcInfo os.FileInfo, overwrite, noCopy bool) (string, error) {
+// ourCopy (may be nil) tells whether a destination that is not src's inode is
+// the copy of src recorded earlier (see samePlaced).
+func place(root *os.Root, rel string, src *os.File, srcInfo os.FileInfo, overwrite, noCopy bool, ourCopy func(os.FileInfo) bool) (string, error) {
 	dir, name := path.Split(rel)
 	dir = strings.TrimSuffix(dir, "/")
 	if dir == "" {
@@ -38,7 +40,7 @@ func place(root *os.Root, rel string, src *os.File, srcInfo os.FileInfo, overwri
 		return jobs.StatusError, mapRootErr(err)
 	}
 	if existing, err := root.Lstat(rel); err == nil {
-		if samePlaced(existing, srcInfo) {
+		if samePlaced(existing, srcInfo, ourCopy) {
 			return jobs.StatusExists, nil
 		}
 		if !overwrite || !existing.Mode().IsRegular() {
@@ -264,12 +266,15 @@ func unchanged(cur, checked os.FileInfo) bool {
 }
 
 // samePlaced reports whether dest already holds src: the same inode for a
-// hardlink, or a regular file of identical size and mtime for a copy.
-func samePlaced(dest, src os.FileInfo) bool {
+// hardlink, or, for a copy, a file ourCopy confirms is the copy of src that
+// was recorded when it was made. Equal size and mtime alone never prove two
+// files are the same: a different release may share both.
+func samePlaced(dest, src os.FileInfo, ourCopy func(os.FileInfo) bool) bool {
 	if os.SameFile(dest, src) {
 		return true
 	}
-	return dest.Mode().IsRegular() && dest.Size() == src.Size() && dest.ModTime().Equal(src.ModTime())
+	return ourCopy != nil && dest.Mode().IsRegular() && dest.Size() == src.Size() &&
+		dest.ModTime().Equal(src.ModTime()) && ourCopy(dest)
 }
 
 // checkEscape reports ErrUnauthorizedVolume when an existing component of dir

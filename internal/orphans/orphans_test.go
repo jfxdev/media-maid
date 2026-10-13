@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 
@@ -25,6 +26,17 @@ type fakeServer struct {
 
 func (f *fakeServer) ListItems(context.Context) ([]integration.ServerItem, error) {
 	return f.items, nil
+}
+
+func (f *fakeServer) GetItem(_ context.Context, id string) (integration.ServerItem, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, it := range f.items {
+		if it.ID == id {
+			return it, nil
+		}
+	}
+	return integration.ServerItem{}, integration.ErrNotFound
 }
 
 func (f *fakeServer) DeleteItem(_ context.Context, id string) error {
@@ -317,6 +329,34 @@ func TestUnlinkedDownloads(t *testing.T) {
 	write(t, filepath.Join(movies, "Replaced (2004)", "Replaced (2004).mkv"))
 	rfi, _ := os.Stat(replaced)
 	ledger.Put(rfi, organizer.LedgerEntry{Lib: "movies", Dest: "Replaced (2004)/Replaced (2004).mkv", Status: jobs.StatusCopied})
+	// Same size and mtime, but not the library file recorded for the copy.
+	swapped := filepath.Join(downloads, "Swapped.2005.mkv")
+	write(t, swapped)
+	sfi, _ := os.Stat(swapped)
+	libSwap := filepath.Join(movies, "Swapped (2005)", "Swapped (2005).mkv")
+	os.MkdirAll(filepath.Dir(libSwap), 0o755)
+	sdata, _ := os.ReadFile(swapped)
+	os.WriteFile(libSwap, sdata, 0o644)
+	os.Chtimes(libSwap, sfi.ModTime(), sfi.ModTime())
+	lfi, _ := os.Stat(libSwap)
+	ledger.Put(sfi, organizer.LedgerEntry{Lib: "movies", Dest: "Swapped (2005)/Swapped (2005).mkv", Status: jobs.StatusCopied, DestIno: organizer.Inode(lfi) + 1})
+
+	// Linked elsewhere too (a cross-seed folder), but its library link was
+	// deleted: still not in the library.
+	seeded := filepath.Join(downloads, "Seeded.2006.mkv")
+	write(t, seeded)
+	os.MkdirAll(filepath.Join(vol, "cross-seed"), 0o755)
+	if err := os.Link(seeded, filepath.Join(vol, "cross-seed", "Seeded.2006.mkv")); err != nil {
+		t.Fatal(err)
+	}
+	seededFi, _ := os.Stat(seeded)
+	ledger.Put(seededFi, organizer.LedgerEntry{Lib: "movies", Dest: "Seeded (2006)/Seeded (2006).mkv", Status: jobs.StatusLinked})
+	// Linked elsewhere and never organized by Media Maid: doubt, not reported.
+	foreign := filepath.Join(downloads, "Foreign.2007.mkv")
+	write(t, foreign)
+	if err := os.Link(foreign, filepath.Join(vol, "cross-seed", "Foreign.2007.mkv")); err != nil {
+		t.Fatal(err)
+	}
 
 	mr, _ := os.OpenRoot(movies)
 	defer mr.Close()
@@ -342,7 +382,8 @@ func TestUnlinkedDownloads(t *testing.T) {
 		}
 	}
 	sort.Strings(got)
-	if len(got) != 2 || got[0] != "downloads/Gone.2002/Gone.2002.mkv" || got[1] != "downloads/Replaced.2004.mkv" {
+	want := []string{"downloads/Gone.2002/Gone.2002.mkv", "downloads/Replaced.2004.mkv", "downloads/Seeded.2006.mkv", "downloads/Swapped.2005.mkv"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("unlinked = %v (report %+v)", got, rep)
 	}
 	if res := det.Remove(context.Background(), []string{id}); res[0].Status != jobs.StatusError || res[0].Error != errNotRemovable {
@@ -377,5 +418,93 @@ func TestReportPersistence(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(e.movies, "Empty (2000)")); err == nil {
 		t.Error("directory not removed")
+	}
+}
+
+// Only folders holding nothing but metadata are orphans: an ISO, a Blu-ray
+// stream or a .strm keeps the folder, in the report and on removal. Removal
+// runs under the organizer's exclusive lock.
+func TestOrphanDirsKeepContent(t *testing.T) {
+	e := newEnv(t, false, false)
+	var locked int
+	e.det.exclusive = func(f func()) { locked++; f() }
+	for _, p := range []string{
+		filepath.Join(e.movies, "Disc (2000)", "Disc (2000).iso"),
+		filepath.Join(e.movies, "BD (2001)", "BDMV", "STREAM", "00001.m2ts"),
+		filepath.Join(e.movies, "Stream (2002)", "Stream (2002).strm"),
+		filepath.Join(e.movies, "Meta (2003)", "poster.jpg"),
+		filepath.Join(e.movies, "Meta (2003)", "movie.nfo"),
+		filepath.Join(e.movies, "Meta (2003)", "Meta (2003).pt-BR.srt"),
+		filepath.Join(e.movies, "Meta (2003)", "Thumbs.db"),
+	} {
+		write(t, p)
+	}
+	rep, err := e.det.Scan(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dirs []string
+	for _, o := range byType(rep)[TypeOrphanDirectory] {
+		dirs = append(dirs, o.Path)
+	}
+	if len(dirs) != 1 || dirs[0] != "movies/Meta (2003)" {
+		t.Fatalf("orphan dirs = %v", dirs)
+	}
+	id := byType(rep)[TypeOrphanDirectory][0].ID
+
+	// Content added after the report keeps the folder.
+	write(t, filepath.Join(e.movies, "Meta (2003)", "Meta (2003).iso"))
+	if res := e.det.Remove(context.Background(), []string{id}); res[0].Status != jobs.StatusStale {
+		t.Errorf("remove with content = %+v", res)
+	}
+	if _, err := os.Stat(filepath.Join(e.movies, "Meta (2003)", "Meta (2003).iso")); err != nil {
+		t.Error("content removed")
+	}
+	if locked != 1 {
+		t.Errorf("exclusive lock taken %d times, want 1", locked)
+	}
+}
+
+// Removal checks the item as the server has it now, not the report's paths:
+// an item that moved outside the managed libraries, got its file back, or
+// disappeared is stale and never deleted.
+func TestRemoveServerItemRefetches(t *testing.T) {
+	e := newEnv(t, false, true)
+	e.server.items = []integration.ServerItem{
+		{ID: "1", Title: "Moved", Paths: []string{"/media/movies/Moved (2000)/Moved (2000).mkv"}},
+		{ID: "2", Title: "Back", Paths: []string{"/media/movies/Back (2001)/Back (2001).mkv"}},
+		{ID: "3", Title: "Gone", Paths: []string{"/media/movies/Gone (2002)/Gone (2002).mkv"}},
+		{ID: "4", Title: "Still", Paths: []string{"/media/movies/Still (2003)/Still (2003).mkv"}},
+	}
+	rep, err := e.det.Scan(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := map[string]string{}
+	for _, o := range byType(rep)[TypeServerItemMissingFile] {
+		ids[o.ServerItemID] = o.ID
+	}
+	if len(ids) != 4 {
+		t.Fatalf("orphans = %+v", rep.Orphans)
+	}
+
+	e.server.mu.Lock()
+	e.server.items = []integration.ServerItem{
+		{ID: "1", Title: "Moved", Paths: []string{"/elsewhere/Moved (2000).mkv"}},
+		{ID: "2", Title: "Back", Paths: []string{"/media/movies/Back (2001)/Back (2001).mkv"}},
+		{ID: "4", Title: "Still", Paths: []string{"/media/movies/Still (2003)/Still (2003).mkv"}},
+	}
+	e.server.mu.Unlock()
+	write(t, filepath.Join(e.movies, "Back (2001)", "Back (2001).mkv"))
+
+	res := e.det.Remove(context.Background(), []string{ids["1"], ids["2"], ids["3"], ids["4"]})
+	want := []string{jobs.StatusStale, jobs.StatusStale, jobs.StatusStale, jobs.StatusRemoved}
+	for i, r := range res {
+		if r.Status != want[i] {
+			t.Errorf("result %d = %+v, want %s", i, r, want[i])
+		}
+	}
+	if len(e.server.deleted) != 1 || e.server.deleted[0] != "4" {
+		t.Errorf("deleted = %v, want [4]", e.server.deleted)
 	}
 }

@@ -42,7 +42,10 @@ func TestUpgradeAcrossRuns(t *testing.T) {
 		{"better release without AUTO_UPGRADE", false, high, jobs.StatusConflict, low},
 		{"better release with AUTO_UPGRADE", true, high, jobs.StatusUpgraded, high},
 		{"worse release", true, bad, jobs.StatusDuplicate, low},
-		{"same release quality", true, "The.Matrix.1999.720p.WEB-DL-OTHER.mkv", jobs.StatusDuplicate, low},
+		{"same quality, smaller file", true, "The.Matrix.1999.720p.WEBDL.mkv", jobs.StatusDuplicate, low},
+		// Within a run and across runs, equal quality is settled by size.
+		{"same quality, larger file", true, "The.Matrix.1999.720p.WEB-DL-A-MUCH-LONGER-GROUP-NAME.mkv", jobs.StatusUpgraded, "The.Matrix.1999.720p.WEB-DL-A-MUCH-LONGER-GROUP-NAME.mkv"},
+		{"same quality, larger file, no AUTO_UPGRADE", false, "The.Matrix.1999.720p.WEB-DL-A-MUCH-LONGER-GROUP-NAME.mkv", jobs.StatusConflict, low},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -50,6 +53,7 @@ func TestUpgradeAcrossRuns(t *testing.T) {
 			if r := organizeAuto(t, e, low); r.Status != jobs.StatusLinked {
 				t.Fatalf("first = %+v", r)
 			}
+			// write stores the path as content: sizes follow name lengths.
 			r := organizeAuto(t, e, tt.second)
 			if r.Status != tt.status {
 				t.Fatalf("second = %+v, want %s", r, tt.status)

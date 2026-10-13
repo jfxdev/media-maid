@@ -63,7 +63,8 @@ use the peeled `^{}` commit of annotated tags).
    reuse a recorded placement) → a manual `Override` (explicit requests) or
    `metadata` (candidates + `metadata.PickIn`) → `assist` only when ambiguous
    (`identify.go`) → absolute episode mapping → optional localization
-   (`PREFERRED_LANGUAGE`) → `naming` → dedupe by quality within the run (key:
+   (`PREFERRED_LANGUAGE`) → `naming` → `anchor` (the library folder already
+   tagged with the TMDB id) → dedupe by quality within the run (key:
    destination without extension) → `placeVideo` compares with the release
    already in the library (`findPeer`: same name, any video extension; its
    quality from the ledger) → `linker` (hardlink, copy fallback, atomic
@@ -79,7 +80,8 @@ use the peeled `^{}` commit of annotated tags).
    climbs season/subs/extras folders, a folder holding other releases is a
    category and its loose files are units), waits `STABLE_SECONDS`, organizes
    on a single worker goroutine. `SCAN_INTERVAL` adds a periodic scan with
-   `MinAge`.
+   `MinAge` (every 15m anyway once `Degraded`: a folder could not be
+   watched). `ORGANIZE_TRIGGER=hook` runs neither: only the API organizes.
 10. `internal/api`: stdlib `ServeMux`; `/api/v1/*` behind bearer auth;
    `/healthz`, `/openapi.yaml`, `/docs` are public; `/healthz` answers 503
    when `watcher.Healthy` is false (`Run` returned or its loop stalled).
@@ -112,16 +114,24 @@ All platform-specific data lives in `internal/integration/platforms.go`
 - **Never overwrite by default**: an existing different destination is
   `conflict`. Only an explicit `"overwrite": true` API request replaces it,
   or, with `AUTO_UPGRADE=true`, an automatic run replacing a release the
-  **ledger** says Media Maid placed with a strictly better `parser.Quality`
-  (`upgraded`; unknown quality or a file not in the ledger is never
+  **ledger** says Media Maid placed with one that ranks strictly higher
+  (`parser.Quality`, then size; `upgraded`; unknown quality or a file not in the ledger is never
   upgraded). Regular files only: unique temp name,
   `renameat2(RENAME_EXCHANGE)` inside the `os.Root` directory, undone if the
   swapped-out entry is not the file that was checked; no plain-rename
   fallback. A file is only deleted through `removeChecked` (moved aside with
   `RENAME_NOREPLACE`, verified, else moved back) or when it is our staged
   file. Releases sharing a destination stem (any extension) in one run are
-  deduplicated by `parser.Quality` before anything is written (`duplicate`;
-  `conflict` when neither is identified by TMDB and qualities are equal).
+  deduplicated by `parser.Quality`, then size, before anything is written
+  (`duplicate`; `conflict` when neither is identified by TMDB and qualities
+  are equal); a release already in the library is ranked the same way.
+- **Same file means same inode**: a library file that is not the source's
+  inode is "already placed" only when `copyOf` confirms the ledger's copy of
+  that source (status `copied`, same size/mtime, `DestIno`). Equal size and
+  mtime alone never make two files the same.
+- **Doubt is not a decision**: a weak or tied TMDB pick that no layer settles
+  is `skipped` (`ambiguous title: ...`, pending) unless `AMBIGUOUS_MATCH=best`;
+  it never gets an ID tag by default.
 - **Manual identification** (`kind`/`tmdb_id`/`title`/`year` on organize or
   preview) only comes from an explicit API request, is validated in
   `api.override`, and its title is sanitized like any other. The earlier
@@ -135,8 +145,11 @@ All platform-specific data lives in `internal/integration/platforms.go`
   and trailing data (hooks interpolate untrusted names into JSON).
 - **Orphans are report-only**: removal happens only via
   `POST /api/v1/orphans/remove`, after revalidation; doubt means keep
-  (`containsVideo` treats walk errors as "has video"). Server items with any
-  path outside the managed libraries are ignored. `unlinked_download` is never
+  (`containsContent` treats walk errors as content). An orphan folder holds
+  only metadata (`isMetadata`); it is removed under `Organizer.Exclusive`.
+  A server item is fetched again (`GetItem`) and its current paths checked
+  before it is deleted. Server items with any path outside the managed
+  libraries are ignored. `unlinked_download` is never
   removable: downloads belong to the torrent client.
 - **State is data**: documents in `STATE_DIR` never hold secrets; cached LLM
   answers are validated again on every use.
@@ -148,8 +161,8 @@ All platform-specific data lives in `internal/integration/platforms.go`
 - **Single tenant**: one media server per process.
 - `DRY_RUN` must make every mutating path a no-op (`planned` / `dry_run`).
 - **Copies are the exception**: a file that cannot be hardlinked (EXDEV,
-  EPERM, EMLINK) is copied only while `COPY_FALLBACK` is on (default); with it
-  off, `place` returns `errNoCopy` and writes nothing.
+  EPERM, EMLINK) is copied only while `COPY_FALLBACK` is on (off by
+  default); with it off, `place` returns `errNoCopy` and writes nothing.
 - Server item IDs are validated (`reItemID`) before being put in URLs.
 - **The LLM layer is optional**: the pipeline must behave the same with
   `LLM_PROVIDER` unset, and every LLM failure falls back to the parser/TMDB
@@ -163,7 +176,8 @@ All platform-specific data lives in `internal/integration/platforms.go`
 ## Conventions
 
 - **New platform**: add a `PlatformSpec` entry in `platforms.go` (a
-  `ListItems` decoder if the format differs, `SyncPaths` if it can refresh
+  `ListItems` decoder if the format differs, `GetItem` for one item (orphan
+  removal needs it), `SyncPaths` if it can refresh
   single folders, `EditionTagFormat` if it has an edition tag, `ExtrasDirs`
   for the extras folders it reads); add a compose file in `examples/`; update
   the table above.

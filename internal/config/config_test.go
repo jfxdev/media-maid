@@ -35,14 +35,16 @@ func TestLoadValid(t *testing.T) {
 	if c.Mode != "jellyfin" || c.ServerURL != "http://jellyfin:8096" || !c.SyncEnabled() {
 		t.Errorf("unexpected config: %+v", c)
 	}
-	if !c.VideoExts[".mkv"] || !c.SubtitleExts[".srt"] || c.SyncDebounce.Seconds() != 30 || !c.CopyFallback ||
-		c.AutoUpgrade || !c.LinkExtras || c.Notify.URL != "" {
+	if !c.VideoExts[".mkv"] || !c.SubtitleExts[".srt"] || c.SyncDebounce.Seconds() != 30 || c.CopyFallback ||
+		c.AutoUpgrade || !c.LinkExtras || c.Notify.URL != "" || c.OrganizeTrigger != TriggerWatch || c.AmbiguousBest {
 		t.Errorf("defaults not applied")
 	}
 	env := baseEnv()
-	env["COPY_FALLBACK"] = "false"
-	if c, err := load(env); err != nil || c.CopyFallback {
-		t.Errorf("COPY_FALLBACK=false: %+v %v", c, err)
+	env["COPY_FALLBACK"] = "true"
+	env["ORGANIZE_TRIGGER"] = "Hook"
+	env["AMBIGUOUS_MATCH"] = "best"
+	if c, err := load(env); err != nil || !c.CopyFallback || c.OrganizeTrigger != TriggerHook || !c.AmbiguousBest {
+		t.Errorf("opt-ins: %+v %v", c, err)
 	}
 	for _, mode := range []string{"emby", "plex", "PLEX"} {
 		env := baseEnv()
@@ -156,6 +158,9 @@ func TestLoadInvalid(t *testing.T) {
 		{"multi path map", func(e map[string]string) { e["SERVER_PATH_MAP"] = "/a=/b,/c=/d" }, nil, "SERVER_PATH_MAP"},
 		{"relative path map", func(e map[string]string) { e["SERVER_PATH_MAP"] = "media=/b" }, nil, "SERVER_PATH_MAP"},
 		{"copy fallback not bool", func(e map[string]string) { e["COPY_FALLBACK"] = "maybe" }, nil, "COPY_FALLBACK"},
+		{"bad trigger", func(e map[string]string) { e["ORGANIZE_TRIGGER"] = "cron" }, nil, "ORGANIZE_TRIGGER must be one of watch, hook"},
+		{"scan interval with hook", func(e map[string]string) { e["ORGANIZE_TRIGGER"] = "hook"; e["SCAN_INTERVAL"] = "15m" }, nil, "SCAN_INTERVAL has no effect"},
+		{"bad ambiguous match", func(e map[string]string) { e["AMBIGUOUS_MATCH"] = "guess" }, nil, "AMBIGUOUS_MATCH must be one of pending, best"},
 		{"tiny orphan interval", func(e map[string]string) { e["ORPHAN_SCAN_INTERVAL"] = "5s" }, nil, "ORPHAN_SCAN_INTERVAL"},
 		{"no state dir", func(e map[string]string) { delete(e, "STATE_DIR") }, nil, "STATE_DIR is required"},
 		{"auto upgrade not bool", func(e map[string]string) { e["AUTO_UPGRADE"] = "sometimes" }, nil, "AUTO_UPGRADE"},

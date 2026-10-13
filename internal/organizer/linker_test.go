@@ -1,6 +1,7 @@
 package organizer
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -41,9 +42,15 @@ func TestCopyFallback(t *testing.T) {
 	if st != jobs.StatusConflict {
 		t.Errorf("second copy = %s, want conflict", st)
 	}
-	// place recognises the earlier copy as already done.
-	if st, err := place(root, "Movie (2000)/Movie (2000).mkv", f, fi, false, false); st != jobs.StatusExists || err != nil {
-		t.Errorf("place over copy = %s, %v; want exists", st, err)
+	// place recognises the earlier copy as already done, but only when the
+	// caller confirms it is the recorded copy: equal size and mtime alone are
+	// a conflict (another release may share both).
+	ours := func(os.FileInfo) bool { return true }
+	if st, err := place(root, "Movie (2000)/Movie (2000).mkv", f, fi, false, false, ours); st != jobs.StatusExists || err != nil {
+		t.Errorf("place over recorded copy = %s, %v; want exists", st, err)
+	}
+	if st, err := place(root, "Movie (2000)/Movie (2000).mkv", f, fi, false, false, nil); st != jobs.StatusConflict || err != nil {
+		t.Errorf("place over unrecorded file = %s, %v; want conflict", st, err)
 	}
 }
 
@@ -62,10 +69,10 @@ func TestPlaceOverwrite(t *testing.T) {
 	defer f.Close()
 	fi, _ := f.Stat()
 
-	if st, _ := place(root, rel, f, fi, false, false); st != jobs.StatusConflict {
+	if st, _ := place(root, rel, f, fi, false, false, nil); st != jobs.StatusConflict {
 		t.Fatalf("without overwrite = %s, want conflict", st)
 	}
-	if st, err := place(root, rel, f, fi, true, false); st != jobs.StatusReplaced || err != nil {
+	if st, err := place(root, rel, f, fi, true, false, nil); st != jobs.StatusReplaced || err != nil {
 		t.Fatalf("overwrite = %s, %v; want replaced", st, err)
 	}
 	got, _ := os.Stat(old)
@@ -76,19 +83,19 @@ func TestPlaceOverwrite(t *testing.T) {
 	if len(entries) != 1 {
 		t.Errorf("temp file left behind: %v", entries)
 	}
-	if st, _ := place(root, rel, f, fi, true, false); st != jobs.StatusExists {
+	if st, _ := place(root, rel, f, fi, true, false, nil); st != jobs.StatusExists {
 		t.Errorf("second overwrite = %s, want exists", st)
 	}
 
 	// Directories and symlinks at the destination are never replaced.
 	os.Remove(old)
 	os.Mkdir(old, 0o755)
-	if st, _ := place(root, rel, f, fi, true, false); st != jobs.StatusConflict {
+	if st, _ := place(root, rel, f, fi, true, false, nil); st != jobs.StatusConflict {
 		t.Errorf("overwrite of a directory = %s, want conflict", st)
 	}
 	os.Remove(old)
 	os.Symlink("/etc/passwd", old)
-	if st, _ := place(root, rel, f, fi, true, false); st != jobs.StatusConflict {
+	if st, _ := place(root, rel, f, fi, true, false, nil); st != jobs.StatusConflict {
 		t.Errorf("overwrite of a symlink = %s, want conflict", st)
 	}
 	if b, _ := os.ReadFile("/etc/passwd"); string(b) == "1080p" {
@@ -113,7 +120,7 @@ func TestPlaceKeepsForeignTemp(t *testing.T) {
 	f, _ := os.Open(src)
 	defer f.Close()
 	fi, _ := f.Stat()
-	if st, err := place(root, "Movie (2000)/Movie (2000).mkv", f, fi, true, false); st != jobs.StatusReplaced || err != nil {
+	if st, err := place(root, "Movie (2000)/Movie (2000).mkv", f, fi, true, false, nil); st != jobs.StatusReplaced || err != nil {
 		t.Fatalf("overwrite = %s, %v", st, err)
 	}
 	if b, _ := os.ReadFile(foreign); string(b) != "not ours" {
@@ -230,7 +237,7 @@ func TestPlaceNoCopy(t *testing.T) {
 	root, _ := os.OpenRoot(dst)
 	defer root.Close()
 
-	st, err := place(root, "New (2000)/New (2000).mkv", f, fi, false, true)
+	st, err := place(root, "New (2000)/New (2000).mkv", f, fi, false, true, nil)
 	if st != jobs.StatusError || !errors.Is(err, errNoCopy) {
 		t.Errorf("new destination = %s, %v; want error %v", st, err, errNoCopy)
 	}
@@ -241,7 +248,7 @@ func TestPlaceNoCopy(t *testing.T) {
 	old := filepath.Join(dst, "Old (2000)", "Old (2000).mkv")
 	os.MkdirAll(filepath.Dir(old), 0o755)
 	os.WriteFile(old, []byte("720p"), 0o644)
-	st, err = place(root, "Old (2000)/Old (2000).mkv", f, fi, true, true)
+	st, err = place(root, "Old (2000)/Old (2000).mkv", f, fi, true, true, nil)
 	if st != jobs.StatusError || !errors.Is(err, errNoCopy) {
 		t.Errorf("overwrite = %s, %v; want error %v", st, err, errNoCopy)
 	}
@@ -253,7 +260,7 @@ func TestPlaceNoCopy(t *testing.T) {
 	}
 
 	// The default still copies.
-	if st, err := place(root, "New (2000)/New (2000).mkv", f, fi, false, false); st != jobs.StatusCopied || err != nil {
+	if st, err := place(root, "New (2000)/New (2000).mkv", f, fi, false, false, nil); st != jobs.StatusCopied || err != nil {
 		t.Errorf("with copy fallback = %s, %v; want copied", st, err)
 	}
 }
@@ -287,5 +294,45 @@ func TestRemoveChecked(t *testing.T) {
 	}
 	if entries, _ := os.ReadDir(dst); len(entries) != 1 {
 		t.Errorf("temp entry left behind: %v", entries)
+	}
+}
+
+// A library file is only "already placed" when it is the source's inode or
+// the copy recorded in the ledger: a different file sharing size and mtime is
+// a conflict, and a recorded copy later swapped for such a file is no longer
+// recognised.
+func TestSameSizeAndMTimeIsNotSameFile(t *testing.T) {
+	e := newEnv(t, "jellyfin")
+	src := filepath.Join(e.downloads, "Heat.1995.1080p.mkv")
+	dest := filepath.Join(e.movies, "Heat (1995)", "Heat (1995).mkv")
+	os.MkdirAll(filepath.Dir(dest), 0o755)
+	os.WriteFile(src, []byte("AAAA"), 0o644)
+	os.WriteFile(dest, []byte("BBBB"), 0o644)
+	fi, _ := os.Stat(src)
+	os.Chtimes(dest, fi.ModTime(), fi.ModTime())
+	res, err := e.org.Scan(context.Background())
+	if err != nil || len(res) != 1 || res[0].Status != jobs.StatusConflict {
+		t.Fatalf("different content, same size and mtime = %+v, %v", res, err)
+	}
+
+	// A real copy (no hardlink possible) is recognised on the next run.
+	os.Remove(dest)
+	linkat = func(int, string, int, string, int) error { return unix.EXDEV }
+	defer func() { linkat = unix.Linkat }()
+	if res, _ := e.org.Scan(context.Background()); len(res) != 1 || res[0].Status != jobs.StatusCopied {
+		t.Fatalf("copy = %+v", res)
+	}
+	if res, _ := e.org.Organize(context.Background(), "Heat.1995.1080p.mkv", OrganizeOptions{Explicit: true}); len(res) != 1 || res[0].Status != jobs.StatusExists {
+		t.Fatalf("recorded copy = %+v", res)
+	}
+
+	// Swapped for another file with the same size and mtime: not our copy.
+	// (Written next to it first, so the old inode number is not reused.)
+	other := dest + ".new"
+	os.WriteFile(other, []byte("CCCC"), 0o644)
+	os.Chtimes(other, fi.ModTime(), fi.ModTime())
+	os.Rename(other, dest)
+	if res, _ := e.org.Organize(context.Background(), "Heat.1995.1080p.mkv", OrganizeOptions{Explicit: true}); len(res) != 1 || res[0].Status != jobs.StatusConflict {
+		t.Fatalf("swapped copy = %+v", res)
 	}
 }

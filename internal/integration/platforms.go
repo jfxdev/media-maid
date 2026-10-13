@@ -59,6 +59,9 @@ type PlatformSpec struct {
 	// ListItems pages through the server library using the generic requester and
 	// decodes the platform response into ServerItems.
 	ListItems func(ctx context.Context, r Requester) ([]ServerItem, error)
+	// GetItem fetches one item (already validated id) as the server knows it
+	// now; ErrNotFound when it no longer exists or has no file.
+	GetItem func(ctx context.Context, r Requester, id string) (ServerItem, error)
 	// ExtrasDirs maps an extras folder found in a release (lower-cased, dots,
 	// underscores and dashes read as spaces) to the folder the server reads
 	// extras from, inside the movie or show folder. Folders it does not list
@@ -122,6 +125,7 @@ var platforms = map[string]PlatformSpec{
 		SyncPaths:   mediaUpdated("/Library/Media/Updated"),
 		DeleteItem:  Endpoint{http.MethodDelete, "/Items/{id}"},
 		ListItems:   listEmbyStyle("/Items"),
+		GetItem:     getEmbyStyle("/Items"),
 		ExtrasDirs:  jellyfinExtras,
 	},
 	"emby": {
@@ -132,6 +136,7 @@ var platforms = map[string]PlatformSpec{
 		SyncPaths:   mediaUpdated("/emby/Library/Media/Updated"),
 		DeleteItem:  Endpoint{http.MethodDelete, "/emby/Items/{id}"},
 		ListItems:   listEmbyStyle("/emby/Items"),
+		GetItem:     getEmbyStyle("/emby/Items"),
 		ExtrasDirs:  embyExtras,
 	},
 	"plex": {
@@ -144,6 +149,7 @@ var platforms = map[string]PlatformSpec{
 		SyncPaths:        plexRefreshPaths,
 		DeleteItem:       Endpoint{http.MethodDelete, "/library/metadata/{id}"},
 		ListItems:        listPlex,
+		GetItem:          getPlex,
 		// https://support.plex.tv/articles/local-files-for-trailers-and-extras/
 		ExtrasDirs: map[string]string{
 			"extras": "Other", "bonus": "Other", "clips": "Other", "featurettes": "Featurettes",
@@ -256,29 +262,66 @@ func listEmbyStyle(path string) func(context.Context, Requester) ([]ServerItem, 
 			if err != nil {
 				return nil, err
 			}
-			var page struct {
-				Items []struct {
-					ID   string `json:"Id"`
-					Name string `json:"Name"`
-					Type string `json:"Type"`
-					Path string `json:"Path"`
-				} `json:"Items"`
-				TotalRecordCount int `json:"TotalRecordCount"`
+			items, n, total, err := decodeEmbyItems(body)
+			if err != nil {
+				return nil, err
 			}
-			if err := json.Unmarshal(body, &page); err != nil {
-				return nil, fmt.Errorf("decode items: %w", err)
-			}
-			for _, it := range page.Items {
-				if it.Path == "" {
-					continue
-				}
-				out = append(out, ServerItem{ID: it.ID, Type: it.Type, Title: it.Name, Paths: []string{it.Path}})
-			}
-			if len(page.Items) < pageSize || start+len(page.Items) >= page.TotalRecordCount {
+			out = append(out, items...)
+			if n < pageSize || start+n >= total {
 				return out, nil
 			}
 		}
 	}
+}
+
+// decodeEmbyItems decodes a Jellyfin/Emby /Items page: the items with a path,
+// how many items the page held and the server's total.
+func decodeEmbyItems(body []byte) (items []ServerItem, n, total int, err error) {
+	var page struct {
+		Items []struct {
+			ID   string `json:"Id"`
+			Name string `json:"Name"`
+			Type string `json:"Type"`
+			Path string `json:"Path"`
+		} `json:"Items"`
+		TotalRecordCount int `json:"TotalRecordCount"`
+	}
+	if err := json.Unmarshal(body, &page); err != nil {
+		return nil, 0, 0, fmt.Errorf("decode items: %w", err)
+	}
+	for _, it := range page.Items {
+		if it.Path == "" {
+			continue
+		}
+		items = append(items, ServerItem{ID: it.ID, Type: it.Type, Title: it.Name, Paths: []string{it.Path}})
+	}
+	return items, len(page.Items), page.TotalRecordCount, nil
+}
+
+// getEmbyStyle fetches one item from Jellyfin/Emby's /Items endpoint.
+func getEmbyStyle(path string) func(context.Context, Requester, string) (ServerItem, error) {
+	return func(ctx context.Context, r Requester, id string) (ServerItem, error) {
+		q := url.Values{"Ids": {id}, "Recursive": {"true"}, "Fields": {"Path"}}
+		body, err := r.Request(ctx, http.MethodGet, path, q)
+		if err != nil {
+			return ServerItem{}, err
+		}
+		items, _, _, err := decodeEmbyItems(body)
+		if err != nil {
+			return ServerItem{}, err
+		}
+		return findItem(items, id)
+	}
+}
+
+// findItem returns the item with id, or ErrNotFound.
+func findItem(items []ServerItem, id string) (ServerItem, error) {
+	for _, it := range items {
+		if it.ID == id {
+			return it, nil
+		}
+	}
+	return ServerItem{}, ErrNotFound
 }
 
 // listPlex lists movies (type=1) and episodes (type=4) from every Plex section.
@@ -319,42 +362,65 @@ func listPlex(ctx context.Context, r Requester) ([]ServerItem, error) {
 			if err != nil {
 				return nil, err
 			}
-			var page struct {
-				MediaContainer struct {
-					TotalSize int `json:"totalSize"`
-					Metadata  []struct {
-						RatingKey string `json:"ratingKey"`
-						Title     string `json:"title"`
-						Type      string `json:"type"`
-						Media     []struct {
-							Part []struct {
-								File string `json:"file"`
-							} `json:"Part"`
-						} `json:"Media"`
-					} `json:"Metadata"`
-				} `json:"MediaContainer"`
+			items, n, total, err := decodePlexMetadata(body)
+			if err != nil {
+				return nil, err
 			}
-			if err := json.Unmarshal(body, &page); err != nil {
-				return nil, fmt.Errorf("decode section items: %w", err)
-			}
-			for _, md := range page.MediaContainer.Metadata {
-				item := ServerItem{ID: md.RatingKey, Type: md.Type, Title: md.Title}
-				for _, m := range md.Media {
-					for _, p := range m.Part {
-						if p.File != "" {
-							item.Paths = append(item.Paths, p.File)
-						}
-					}
-				}
-				if len(item.Paths) > 0 {
-					out = append(out, item)
-				}
-			}
-			n := len(page.MediaContainer.Metadata)
-			if n < pageSize || (page.MediaContainer.TotalSize > 0 && start+n >= page.MediaContainer.TotalSize) {
+			out = append(out, items...)
+			if n < pageSize || (total > 0 && start+n >= total) {
 				break
 			}
 		}
 	}
 	return out, nil
+}
+
+// decodePlexMetadata decodes a Plex MediaContainer of items: those with at
+// least one file, how many the page held and the server's total.
+func decodePlexMetadata(body []byte) (items []ServerItem, n, total int, err error) {
+	var page struct {
+		MediaContainer struct {
+			TotalSize int `json:"totalSize"`
+			Metadata  []struct {
+				RatingKey string `json:"ratingKey"`
+				Title     string `json:"title"`
+				Type      string `json:"type"`
+				Media     []struct {
+					Part []struct {
+						File string `json:"file"`
+					} `json:"Part"`
+				} `json:"Media"`
+			} `json:"Metadata"`
+		} `json:"MediaContainer"`
+	}
+	if err := json.Unmarshal(body, &page); err != nil {
+		return nil, 0, 0, fmt.Errorf("decode section items: %w", err)
+	}
+	for _, md := range page.MediaContainer.Metadata {
+		item := ServerItem{ID: md.RatingKey, Type: md.Type, Title: md.Title}
+		for _, m := range md.Media {
+			for _, p := range m.Part {
+				if p.File != "" {
+					item.Paths = append(item.Paths, p.File)
+				}
+			}
+		}
+		if len(item.Paths) > 0 {
+			items = append(items, item)
+		}
+	}
+	return items, len(page.MediaContainer.Metadata), page.MediaContainer.TotalSize, nil
+}
+
+// getPlex fetches one item from /library/metadata/{id}.
+func getPlex(ctx context.Context, r Requester, id string) (ServerItem, error) {
+	body, err := r.Request(ctx, http.MethodGet, "/library/metadata/"+url.PathEscape(id), nil)
+	if err != nil {
+		return ServerItem{}, err
+	}
+	items, _, _, err := decodePlexMetadata(body)
+	if err != nil {
+		return ServerItem{}, err
+	}
+	return findItem(items, id)
 }
