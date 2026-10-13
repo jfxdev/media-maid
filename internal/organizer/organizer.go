@@ -663,7 +663,7 @@ func (o *Organizer) findPeer(v *videoPlan, src os.FileInfo) *peer {
 		if le, ok := o.ledger.Lookup(fi); ok && le.Lib == v.lib.Name && le.Dest == rel {
 			p.entry, p.tracked = le, true // a hardlink: same inode as its source
 		} else if le, ok := o.ledger.ByDest(v.lib.Name, rel); ok && le.Status == jobs.StatusCopied &&
-			le.Size == fi.Size() && le.MTime.Equal(fi.ModTime()) && (le.DestIno == 0 || le.DestIno == Inode(fi)) {
+			le.Size == fi.Size() && le.MTime.Equal(fi.ModTime()) && le.DestIno != 0 && le.DestIno == Inode(fi) {
 			p.entry, p.tracked = le, true // our copy: the recorded file, same size and mtime
 		}
 		return p
@@ -864,9 +864,9 @@ func (o *Organizer) placementGone(lib Library, e LedgerEntry, src os.FileInfo) s
 
 // copyOf reports whether cur, the file at dest in lib, is the copy of src
 // Media Maid made: the ledger records a copy of src at dest, cur still has
-// src's size and mtime, and it is the library file recorded then (entries
-// from before DestIno existed are trusted on the ledger record alone). An
-// inode number reused by a later file with the same size and mtime is not
+// src's size and mtime, and it is the library file recorded then (an entry
+// without DestIno never vouches for a file: size and mtime alone prove
+// nothing). An inode number reused by a later file with the same size and mtime is not
 // told apart: that needs a content check, which costs a full read.
 func (o *Organizer) copyOf(lib Library, dest string, cur, src os.FileInfo) bool {
 	if !cur.Mode().IsRegular() || cur.Size() != src.Size() || !cur.ModTime().Equal(src.ModTime()) {
@@ -876,7 +876,7 @@ func (o *Organizer) copyOf(lib Library, dest string, cur, src os.FileInfo) bool 
 	if !ok || e.Status != jobs.StatusCopied || e.Lib != lib.Name || e.Dest != dest {
 		return false
 	}
-	return e.DestIno == 0 || e.DestIno == Inode(cur)
+	return e.DestIno != 0 && e.DestIno == Inode(cur)
 }
 
 func (o *Organizer) planVideo(ctx context.Context, v *videoPlan, opts OrganizeOptions, man *manual, anchors map[string]anchorIndex) Result {

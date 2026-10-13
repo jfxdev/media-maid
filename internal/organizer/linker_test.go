@@ -336,3 +336,20 @@ func TestSameSizeAndMTimeIsNotSameFile(t *testing.T) {
 		t.Fatalf("swapped copy = %+v", res)
 	}
 }
+
+// A ledger copy entry without the library file's inode does not make a file
+// with the source's size and mtime "already placed".
+func TestCopyWithoutDestInoIsNotPlaced(t *testing.T) {
+	e := newEnv(t, "jellyfin")
+	src := filepath.Join(e.downloads, "Ronin.1998.1080p.mkv")
+	dest := filepath.Join(e.movies, "Ronin (1998)", "Ronin (1998).mkv")
+	os.MkdirAll(filepath.Dir(dest), 0o755)
+	os.WriteFile(src, []byte("AAAA"), 0o644)
+	os.WriteFile(dest, []byte("BBBB"), 0o644)
+	fi, _ := os.Stat(src)
+	os.Chtimes(dest, fi.ModTime(), fi.ModTime())
+	e.org.ledger.Put(fi, LedgerEntry{Lib: "movies", Dest: "Ronin (1998)/Ronin (1998).mkv", Status: jobs.StatusCopied})
+	if res, _ := e.org.Organize(context.Background(), "Ronin.1998.1080p.mkv", OrganizeOptions{Explicit: true}); len(res) != 1 || res[0].Status != jobs.StatusConflict {
+		t.Fatalf("copy without DestIno = %+v", res)
+	}
+}

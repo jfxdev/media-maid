@@ -28,8 +28,8 @@ type LedgerEntry struct {
 	// decides automatic upgrades.
 	Quality int `json:"quality,omitempty"`
 	// DestIno is the inode of the library file when Status is "copied": a
-	// copy is only recognized while it is still that file. Zero in entries
-	// recorded before it existed.
+	// copy is only recognized while it is still that file; zero (the library
+	// file could not be inspected) never recognizes one.
 	DestIno uint64    `json:"dest_ino,omitempty"`
 	At      time.Time `json:"at"`
 }
