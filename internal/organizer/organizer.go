@@ -54,6 +54,10 @@ const (
 	errSupersededMsg = "previously organized; replaced in the library by another release"
 )
 
+// errMetadataUnavailableMsg explains a file left pending because TMDB could
+// not be reached; RetryUnavailable organizes it again later.
+const errMetadataUnavailableMsg = "metadata unavailable: TMDB could not be reached; retried automatically"
+
 // errArchiveMsg reports a compressed release, which Media Maid does not
 // extract: it needs attention instead of being ignored silently.
 const errArchiveMsg = "archive: extract it first (compressed releases are not supported)"
@@ -310,6 +314,26 @@ func (o *Organizer) Organize(ctx context.Context, input string, opts OrganizeOpt
 		o.syncer.Request(changed...)
 	}
 	return results, nil
+}
+
+// RetryUnavailable organizes again the pending downloads that were left
+// alone because TMDB could not be reached, as an automatic run, and returns
+// how many it retried.
+func (o *Organizer) RetryUnavailable(ctx context.Context) int {
+	n := 0
+	for _, it := range o.pending.List() {
+		if it.Status != jobs.StatusSkipped || it.Error != errMetadataUnavailableMsg {
+			continue
+		}
+		if ctx.Err() != nil {
+			break
+		}
+		if _, err := o.Organize(ctx, it.Source, OrganizeOptions{}); err != nil && !errors.Is(err, ErrNotFound) {
+			o.log.Warn("retry failed", "source", it.Source, "err", err)
+		}
+		n++
+	}
+	return n
 }
 
 // lib returns the library named name ("movies" or "tv").

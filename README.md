@@ -152,7 +152,10 @@ disabled, the previous decision stands.
    the candidates, and waits in `/api/v1/pending` for a manual
    identification, instead of getting a possibly wrong ID
    (`AMBIGUOUS_MATCH=best` takes the best candidate anyway). When TMDB finds
-   nothing or is unreachable, the parser's reading is used without an ID.
+   nothing, the parser's reading is used without an ID. When TMDB cannot be
+   reached, the file is `skipped` (`metadata unavailable: ...`, pending) and
+   organized again every 10 minutes until TMDB answers, so a short outage
+   never leaves an episode in a folder without the ID next to the tagged one.
 3. **LLM** (optional, `LLM_PROVIDER`, off by default). Consulted only when
    the parser's confidence is below `LLM_MIN_CONFIDENCE`, TMDB found nothing,
    or the candidates are too close to call. It acts as a tie-breaker: it picks

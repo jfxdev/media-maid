@@ -131,7 +131,9 @@ All platform-specific data lives in `internal/integration/platforms.go`
   mtime alone never make two files the same.
 - **Doubt is not a decision**: a weak or tied TMDB pick that no layer settles
   is `skipped` (`ambiguous title: ...`, pending) unless `AMBIGUOUS_MATCH=best`;
-  it never gets an ID tag by default.
+  it never gets an ID tag by default. A TMDB that cannot be reached is not
+  "not found" either: the file is `skipped` (`metadata unavailable: ...`,
+  pending) and `Organizer.RetryUnavailable` organizes it again later.
 - **Manual identification** (`kind`/`tmdb_id`/`title`/`year` on organize or
   preview) only comes from an explicit API request, is validated in
   `api.override`, and its title is sanitized like any other. The earlier

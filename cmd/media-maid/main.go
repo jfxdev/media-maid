@@ -253,6 +253,25 @@ func run(log *slog.Logger) error {
 		log.Info("downloads are organized only through the API (ORGANIZE_TRIGGER=hook)")
 	}
 
+	// A download seen while TMDB was unreachable waits in the pending list;
+	// it is organized again once TMDB answers, in either trigger mode.
+	if meta != nil {
+		go func() {
+			t := time.NewTicker(metadataRetryInterval)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					if n := org.RetryUnavailable(ctx); n > 0 {
+						log.Info("retried downloads waiting for TMDB", "count", n)
+					}
+				}
+			}
+		}()
+	}
+
 	if cfg.OrphanScanInterval > 0 {
 		go func() {
 			t := time.NewTicker(cfg.OrphanScanInterval)
@@ -292,6 +311,10 @@ func run(log *slog.Logger) error {
 	defer cancel()
 	return srv.Shutdown(shutdownCtx)
 }
+
+// metadataRetryInterval is how often downloads left pending because TMDB
+// could not be reached are organized again.
+const metadataRetryInterval = 10 * time.Minute
 
 // degradedScanInterval is how often the downloads folder is scanned when
 // SCAN_INTERVAL is off but some folders could not be watched.
