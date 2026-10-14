@@ -231,6 +231,20 @@ func TestDocs(t *testing.T) {
 	}
 }
 
+// TestDocsSubresourceIntegrity: the token may be typed into /docs, so every
+// file it loads from the CDN must be pinned by hash.
+func TestDocsSubresourceIntegrity(t *testing.T) {
+	tags := regexp.MustCompile(`<(?:script|link)\b[^>]*https://[^>]*>`).FindAllString(docsPage, -1)
+	if len(tags) != 2 {
+		t.Fatalf("found %d external assets, want 2: %q", len(tags), tags)
+	}
+	for _, tag := range tags {
+		if !regexp.MustCompile(`integrity="sha384-[A-Za-z0-9+/]{64}"`).MatchString(tag) || !strings.Contains(tag, `crossorigin="anonymous"`) {
+			t.Errorf("external asset without integrity: %s", tag)
+		}
+	}
+}
+
 // TestSpecCoversRoutes keeps openapi.yaml in sync with the routes in Handler.
 func TestSpecCoversRoutes(t *testing.T) {
 	src, err := os.ReadFile("server.go")

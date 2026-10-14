@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/jfxdev/media-maid/internal/assist"
+	"github.com/jfxdev/media-maid/internal/jobs"
 	"github.com/jfxdev/media-maid/internal/metadata"
 	"github.com/jfxdev/media-maid/internal/parser"
 )
@@ -42,11 +43,12 @@ func metaKind(k parser.Kind) metadata.Kind {
 // identify runs the layers in order: parser (always), TMDB (optional), then
 // the LLM (optional) only when the first two are unsure. A failure of the LLM
 // falls back to what the previous layers decided. Two outcomes are not
-// decisions: a TMDB pick that is itself unsure (a tie or a weak score) waits
-// for a manual identification unless AMBIGUOUS_MATCH=best, and a TMDB that
-// cannot be reached leaves the file pending until RetryUnavailable succeeds.
+// decisions: a TMDB pick that is itself unsure (a tie or a weak score), or an
+// unsure reading of the name that TMDB has no entry for, waits for a manual
+// identification unless AMBIGUOUS_MATCH=best, and a TMDB that cannot be
+// reached leaves the file pending until RetryUnavailable succeeds.
 // why is set when nothing was identified.
-func (o *Organizer) identify(ctx context.Context, rel string, a parser.Analysis, parsed bool) (identity, string) {
+func (o *Organizer) identify(ctx context.Context, rel string, a parser.Analysis, parsed bool) (identity, skip) {
 	id := identity{media: a.Media, by: ByParser}
 
 	var cands []metadata.Result
@@ -60,7 +62,7 @@ func (o *Organizer) identify(ctx context.Context, rel string, a parser.Analysis,
 		if cands, err = o.meta.Search(ctx, metaKind(a.Kind), query, a.Year); err != nil {
 			// Placing it without the ID now would leave it in a folder of
 			// its own once TMDB answers again: it waits and is retried.
-			return identity{}, errMetadataUnavailableMsg
+			return identity{}, skipMetadataUnavailable
 		}
 		best, score, margin, found = metadata.PickIn(query, a.Year, a.Country, cands)
 	}
@@ -79,11 +81,17 @@ func (o *Organizer) identify(ctx context.Context, rel string, a parser.Analysis,
 	}
 	if !decided {
 		if !parsed {
-			return identity{}, errUnidentifiedMsg
+			return identity{}, skipUnidentified
+		}
+		// TMDB answered with nothing for a reading the parser itself doubts
+		// ("One.Piece.E1080" read as a movie): placing it would create a
+		// library entry under a guessed name.
+		if o.hasMeta && !found && a.Confidence < o.minConf && !o.ambiguousBest {
+			return identity{}, skip{jobs.ReasonUnidentified, uncertainMsg(a)}
 		}
 		if found && score >= metadata.MinScore {
 			if unsure && !o.ambiguousBest {
-				return identity{}, ambiguousMsg(cands)
+				return identity{}, skip{jobs.ReasonAmbiguous, ambiguousMsg(cands)}
 			}
 			id.match, id.by = &best, ByTMDB
 		}
@@ -98,11 +106,20 @@ func (o *Organizer) identify(ctx context.Context, rel string, a parser.Analysis,
 	if o.language != "" {
 		o.localize(ctx, &id)
 	}
-	return id, ""
+	return id, skip{}
 }
 
 // errUnidentifiedMsg explains a file whose title could not be read.
 const errUnidentifiedMsg = "could not identify title"
+
+// uncertainMsg explains an unsure reading that TMDB could not confirm.
+func uncertainMsg(a parser.Analysis) string {
+	s := "uncertain title: read as " + string(a.Kind) + " \"" + a.Title + "\""
+	if a.Year > 0 {
+		s += " (" + strconv.Itoa(a.Year) + ")"
+	}
+	return s + " with confidence " + strconv.FormatFloat(a.Confidence, 'f', 2, 64) + " and TMDB has no match; identify it manually"
+}
 
 // maxListedCandidates bounds the candidates named in an ambiguous result.
 const maxListedCandidates = 5
@@ -194,7 +211,7 @@ func (o *Organizer) resolveOverride(ctx context.Context, ov *Override) (*manual,
 
 // manualIdentity applies a resolved override to one parsed file. why is set
 // when the file cannot take it.
-func (o *Organizer) manualIdentity(ctx context.Context, a parser.Analysis, parsed bool, man *manual) (identity, string) {
+func (o *Organizer) manualIdentity(ctx context.Context, a parser.Analysis, parsed bool, man *manual) (identity, skip) {
 	m := a.Media
 	if !parsed {
 		m = parser.Media{}
@@ -202,7 +219,7 @@ func (o *Organizer) manualIdentity(ctx context.Context, a parser.Analysis, parse
 	switch man.kind {
 	case parser.Episode:
 		if m.Kind != parser.Episode {
-			return identity{}, "kind episode needs a season and episode number (or air date) in the name"
+			return identity{}, skip{msg: "kind episode needs a season and episode number (or air date) in the name"}
 		}
 	case parser.Movie:
 		if m.Kind == parser.Episode {
@@ -217,7 +234,7 @@ func (o *Organizer) manualIdentity(ctx context.Context, a parser.Analysis, parse
 		m.Year = man.year
 	}
 	if m.Title == "" {
-		return identity{}, errUnidentifiedMsg
+		return identity{}, skipUnidentified
 	}
 	id := identity{media: m, match: man.match, by: ByManual}
 	if id.match != nil && o.hasMeta {
@@ -226,7 +243,7 @@ func (o *Organizer) manualIdentity(ctx context.Context, a parser.Analysis, parse
 	if o.language != "" && !man.fixed {
 		o.localize(ctx, &id)
 	}
-	return id, ""
+	return id, skip{}
 }
 
 // askLLM applies a validated LLM decision to id. It reports false when the

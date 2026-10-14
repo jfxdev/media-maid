@@ -269,3 +269,41 @@ func TestWatcherDegraded(t *testing.T) {
 		t.Error("not degraded after a watch failed")
 	}
 }
+
+// A file that keeps its size and raises no events while its modification time
+// moves (preallocated and written through a memory map) is still being
+// written: it is not organized until the mtime settles too.
+func TestWatcherWaitsForStableMTime(t *testing.T) {
+	root := t.TempDir()
+	f := filepath.Join(root, "Release.1080p", "Release.1080p.mkv")
+	if err := os.MkdirAll(filepath.Dir(f), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(f, make([]byte, 4096), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stable := 200 * time.Millisecond
+	w, err := New(root, stable, func(context.Context, string) {}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.fsw.Close()
+	// Events are never read here: flush sees only what stat reports.
+	mtime := time.Now().Add(-time.Hour)
+	for i := 0; i < 8; i++ {
+		mtime = mtime.Add(time.Second)
+		if err := os.Chtimes(f, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+		w.flush()
+		if len(w.work) != 0 {
+			t.Fatalf("dispatched after %d mtime changes while the size stayed the same", i+1)
+		}
+		time.Sleep(stable / 2)
+	}
+	time.Sleep(stable + 50*time.Millisecond)
+	w.flush()
+	if len(w.work) != 1 || <-w.work != filepath.Dir(f) {
+		t.Error("not dispatched once the mtime settled")
+	}
+}

@@ -533,8 +533,10 @@ func TestDecisionLayers(t *testing.T) {
 			"", "", true},
 		{"llm kind mismatch ignored", "Dune.1080p.mkv", &fakeAssist{decision: assist.Decision{Kind: "episode", Title: "Dune", Season: 1, Episodes: []int{1}, Choice: 1, Confidence: 0.9}}, false,
 			"", "", true},
+		// The rejected answer leaves an unsure reading TMDB does not know:
+		// it waits for a manual identification.
 		{"llm title unknown to tmdb rejected", "Some.Obscure.Film.mkv", &fakeAssist{decision: assist.Decision{Kind: "movie", Title: "Invented", Choice: -1, Confidence: 0.9}}, false,
-			"movies/Some Obscure Film/Some Obscure Film.mkv", ByParser, true},
+			"", "", true},
 		{"llm free title without tmdb", "Some.Obscure.Film.mkv", &fakeAssist{decision: assist.Decision{Kind: "movie", Title: "Some Obscure Film", Year: 0, Choice: -1, Confidence: 0.9}}, true,
 			"movies/Some Obscure Film/Some Obscure Film.mkv", ByLLM, true},
 		// A TMDB outage is not "not found": the file waits for a retry
@@ -582,6 +584,48 @@ func TestDecisionLayers(t *testing.T) {
 	}
 	if r := organizeOne(t, e, "1080p.mkv"); r.Status != jobs.StatusSkipped {
 		t.Errorf("unparseable without llm: %+v", r)
+	}
+}
+
+// An unsure reading that TMDB has no entry for is not placed under the
+// guessed name: it waits as pending. A confident reading TMDB does not know
+// is still placed without an ID, and AMBIGUOUS_MATCH=best places both.
+func TestUnsureReadingNotFound(t *testing.T) {
+	minConf := func(o *Options) { o.MinConfidence = 0.7 }
+	e := newEnv(t, "jellyfin", minConf)
+	write(t, filepath.Join(e.downloads, "One.Piece.E1080.1080p.mkv"))
+	write(t, filepath.Join(e.downloads, "Some.Obscure.Film.2019.1080p.mkv"))
+	res, err := e.org.Scan(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]Result{}
+	for _, r := range res {
+		got[r.Source] = r
+	}
+	unsure := got["One.Piece.E1080.1080p.mkv"]
+	if unsure.Status != jobs.StatusSkipped || unsure.Reason != jobs.ReasonUnidentified ||
+		!strings.HasPrefix(unsure.Error, `uncertain title: read as movie "One Piece E1080" with confidence `) {
+		t.Errorf("unsure reading = %+v", unsure)
+	}
+	if r := got["Some.Obscure.Film.2019.1080p.mkv"]; r.Status != jobs.StatusLinked || r.Dest != "movies/Some Obscure Film (2019)/Some Obscure Film (2019).mkv" {
+		t.Errorf("confident reading = %+v", r)
+	}
+	if items := e.org.Pending(); len(items) != 1 || items[0].Source != "One.Piece.E1080.1080p.mkv" || items[0].Reason != jobs.ReasonUnidentified {
+		t.Errorf("pending = %+v", items)
+	}
+	if _, err := os.Stat(filepath.Join(e.movies, "One Piece E1080")); err == nil {
+		t.Error("a folder was created under the guessed name")
+	}
+
+	// Without TMDB nothing can confirm a reading: the parser decides.
+	e = newEnv(t, "jellyfin", minConf, func(o *Options) { o.Meta = nil })
+	if r := organizeOne(t, e, "One.Piece.E1080.1080p.mkv"); r.Status != jobs.StatusPlanned {
+		t.Errorf("without tmdb: %+v", r)
+	}
+	e = newEnv(t, "jellyfin", minConf, func(o *Options) { o.AmbiguousBest = true })
+	if r := organizeOne(t, e, "One.Piece.E1080.1080p.mkv"); r.Status != jobs.StatusPlanned || r.Dest != "movies/One Piece E1080/One Piece E1080.mkv" {
+		t.Errorf("best: %+v", r)
 	}
 }
 
@@ -880,7 +924,7 @@ func TestTMDBOutageRetried(t *testing.T) {
 	if entries, _ := os.ReadDir(e.movies); len(entries) != 0 {
 		t.Fatalf("library written during the outage: %v", entries)
 	}
-	if items := e.org.Pending(); len(items) != 1 || items[0].Error != errMetadataUnavailableMsg {
+	if items := e.org.Pending(); len(items) != 1 || items[0].Reason != jobs.ReasonMetadataUnavailable {
 		t.Fatalf("pending = %+v", items)
 	}
 	if n := e.org.RetryUnavailable(context.Background()); n != 1 {
@@ -899,5 +943,46 @@ func TestTMDBOutageRetried(t *testing.T) {
 	}
 	if n := e.org.RetryUnavailable(context.Background()); n != 0 {
 		t.Errorf("retried %d with nothing pending", n)
+	}
+}
+
+// A subtitle deleted from the library stays deleted on automatic runs, like a
+// video or an extra; an explicit organize links it again.
+func TestDeletedSubtitleRespected(t *testing.T) {
+	e := newEnv(t, "jellyfin")
+	dir := filepath.Join(e.downloads, "Inception.2010.1080p")
+	write(t, filepath.Join(dir, "Inception.2010.1080p.mkv"))
+	write(t, filepath.Join(dir, "Inception.2010.1080p.en.srt"))
+	sub := filepath.Join(e.movies, "Inception (2010) [tmdbid-27205]", "Inception (2010) [tmdbid-27205].en.srt")
+	if _, err := e.org.Scan(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !sameInode(t, filepath.Join(dir, "Inception.2010.1080p.en.srt"), sub) {
+		t.Fatal("subtitle not linked")
+	}
+	os.Remove(sub)
+	res, _ := e.org.Scan(context.Background())
+	for _, r := range res {
+		if r.Kind == KindSubtitle && (r.Status != jobs.StatusSkipped || r.Reason != jobs.ReasonRemoved) {
+			t.Errorf("after deletion: %+v", r)
+		}
+	}
+	if _, err := os.Stat(sub); err == nil {
+		t.Fatal("a deleted subtitle was linked again by a scan")
+	}
+	if items := e.org.Pending(); len(items) != 0 {
+		t.Errorf("pending = %+v", items)
+	}
+	entries, _ := e.history.Snapshot()
+	for _, h := range entries {
+		if h.Status == jobs.StatusSkipped {
+			t.Errorf("a quiet skip reached the history: %+v", h)
+		}
+	}
+	if _, err := e.org.Organize(context.Background(), "Inception.2010.1080p", OrganizeOptions{Explicit: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(sub); err != nil {
+		t.Errorf("explicit organize did not link the subtitle again: %v", err)
 	}
 }

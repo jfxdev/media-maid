@@ -3,6 +3,7 @@ package organizer
 import (
 	"encoding/json"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -10,8 +11,12 @@ import (
 	"time"
 )
 
-// maxLedgerEntries bounds the ledger; the oldest entries go first.
-const maxLedgerEntries = 200000
+// maxLedgerEntries bounds the ledger; the oldest entries go first, in
+// batches of ledgerEvictBatch so a full ledger is not scanned on every Put.
+const (
+	maxLedgerEntries = 200000
+	ledgerEvictBatch = maxLedgerEntries / 100
+)
 
 // LedgerEntry records where a downloaded video was placed.
 type LedgerEntry struct {
@@ -189,18 +194,24 @@ func (l *Ledger) Put(fi os.FileInfo, e LedgerEntry) {
 		return // nothing new
 	}
 	e.At = time.Now()
-	if len(l.m) >= maxLedgerEntries {
-		oldest, at := "", e.At
-		for k, v := range l.m {
-			if v.At.Before(at) {
-				oldest, at = k, v.At
-			}
-		}
-		l.deleteLocked(oldest)
+	if _, ok := l.m[key]; !ok && len(l.m) >= maxLedgerEntries {
+		l.evictLocked(ledgerEvictBatch)
 	}
 	l.setLocked(key, e)
 	l.mu.Unlock()
 	l.changed()
+}
+
+// evictLocked drops the n oldest entries. l.mu must be held.
+func (l *Ledger) evictLocked(n int) {
+	keys := make([]string, 0, len(l.m))
+	for k := range l.m {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool { return l.m[keys[i]].At.Before(l.m[keys[j]].At) })
+	for _, k := range keys[:min(n, len(keys))] {
+		l.deleteLocked(k)
+	}
 }
 
 // Prune keeps the entries of files (the downloads folder as listed at since),

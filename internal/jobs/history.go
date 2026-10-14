@@ -32,6 +32,26 @@ const (
 	defaultCapacity = 500
 )
 
+// Reasons give a skipped or failed organize result a stable, machine-readable
+// cause next to its human-readable error (Result.Reason). Clients and the
+// organizer itself act on these, never on the error text.
+const (
+	// ReasonRemoved: placed earlier, and its library copy was deleted since.
+	ReasonRemoved = "removed_from_library"
+	// ReasonSuperseded: placed earlier, and its library copy was replaced by
+	// another release since.
+	ReasonSuperseded = "superseded_in_library"
+	// ReasonMetadataUnavailable: TMDB could not be reached; retried later.
+	ReasonMetadataUnavailable = "metadata_unavailable"
+	// ReasonAmbiguous: TMDB's best candidate is weak or tied.
+	ReasonAmbiguous = "ambiguous_title"
+	// ReasonUnidentified: the title could not be read, or the reading is
+	// unsure and TMDB has no match for it.
+	ReasonUnidentified = "unidentified_title"
+	// ReasonArchive: a compressed release that must be extracted first.
+	ReasonArchive = "archive"
+)
+
 // Entry is a single recorded action.
 type Entry struct {
 	Time   time.Time `json:"time"`
