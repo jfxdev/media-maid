@@ -1,6 +1,7 @@
 import { vi } from "vitest"
 
-export type Handler = (url: URL, init?: RequestInit) => { status?: number; body: unknown }
+export type Reply = { status?: number; body: unknown }
+export type Handler = (url: URL, init?: RequestInit) => Reply | Promise<Reply>
 
 /** mockFetch routes fetch calls by pathname and records them. */
 export function mockFetch(routes: Record<string, Handler>) {
@@ -9,7 +10,9 @@ export function mockFetch(routes: Record<string, Handler>) {
     const url = new URL(String(input), "http://media-maid.test")
     calls.push({ url, init })
     const h = routes[url.pathname]
-    const res = h ? h(url, init) : { status: 404, body: { error: "not_found" } }
+    // The signal is ignored on purpose: a reply may arrive after its request
+    // was aborted, as one already received does.
+    const res = h ? await h(url, init) : { status: 404, body: { error: "not_found" } }
     return new Response(JSON.stringify(res.body), {
       status: res.status ?? 200,
       headers: { "Content-Type": "application/json" },
@@ -28,4 +31,13 @@ export const info = {
   tmdb_enabled: true,
   llm_enabled: false,
   roots: ["downloads", "movies", "tv"],
+}
+
+/** deferred returns a promise and the functions that settle it. */
+export function deferred<T>() {
+  let resolve!: (v: T) => void
+  const promise = new Promise<T>((r) => {
+    resolve = r
+  })
+  return { promise, resolve }
 }

@@ -1,9 +1,9 @@
-import { render, screen, within } from "@testing-library/react"
+import { act, render, screen, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import { describe, expect, it } from "vitest"
 
 import { AuthProvider } from "@/auth/auth"
-import { info, mockFetch } from "@/test/fetch"
+import { deferred, info, mockFetch, type Reply } from "@/test/fetch"
 import { Files, filesQuery } from "./Files"
 
 const t = "2026-10-14T10:00:00Z"
@@ -72,5 +72,64 @@ describe("Files", () => {
     expect(await screen.findByRole("link", { name: "Show S01" })).toHaveAttribute("href", "#/files/downloads/Show%20S01")
     expect(screen.getByRole("link", { name: /parent folder/i })).toHaveAttribute("href", "#/files/downloads/Show%20S01")
     expect(screen.getByText("Season 1")).toHaveAttribute("aria-current", "page")
+  })
+
+  it("clears a load-more error when a retry succeeds", async () => {
+    window.sessionStorage.setItem("media-maid.token", "r".repeat(32))
+    let failures = 1
+    mockFetch({
+      "/api/v1/info": () => ({ body: info }),
+      "/api/v1/files": (url) =>
+        url.searchParams.get("offset") !== "0" && failures-- > 0
+          ? { status: 500, body: { error: "internal_error" } }
+          : listing(url),
+    })
+    render(
+      <AuthProvider>
+        <Files root="downloads" path="" />
+      </AuthProvider>,
+    )
+    await userEvent.click(await screen.findByRole("button", { name: /load more/i }))
+    expect(await screen.findByText("Request failed (internal_error).")).toBeInTheDocument()
+    await userEvent.click(screen.getByRole("button", { name: /load more/i }))
+    expect(await screen.findByText(".DS_Store")).toBeInTheDocument()
+    expect(screen.queryByText("Request failed (internal_error).")).not.toBeInTheDocument()
+  })
+
+  it("drops a load-more reply once the folder changed", async () => {
+    window.sessionStorage.setItem("media-maid.token", "r".repeat(32))
+    const pending: ReturnType<typeof deferred<Reply>>[] = []
+    mockFetch({
+      "/api/v1/info": () => ({ body: info }),
+      "/api/v1/files": (url) => {
+        if (url.searchParams.get("offset") === "0") return listing(url)
+        const d = deferred<Reply>()
+        pending.push(d)
+        return d.promise
+      },
+    })
+    const at = (path: string) => (
+      <AuthProvider>
+        <Files root="downloads" path={path} />
+      </AuthProvider>
+    )
+    const { rerender } = render(at(""))
+
+    // Leave and come back while page 2 is loading: the same folder, offset
+    // and length again, but the old page 2 must not be appended.
+    await userEvent.click(await screen.findByRole("button", { name: /load more/i }))
+    rerender(at("Show S01"))
+    await screen.findByRole("link", { name: /parent folder/i })
+    rerender(at(""))
+    await screen.findByRole("button", { name: /load more/i })
+    await act(async () => pending[0].resolve(listing(new URL("http://x/api/v1/files?root=downloads&offset=3"))))
+    expect(screen.queryByText(".DS_Store")).not.toBeInTheDocument()
+
+    // Navigate while page 2 is loading: its failure must not show up there.
+    await userEvent.click(screen.getByRole("button", { name: /load more/i }))
+    rerender(at("Show S01"))
+    await screen.findByRole("link", { name: /parent folder/i })
+    await act(async () => pending[1].resolve({ status: 500, body: { error: "internal_error" } }))
+    expect(screen.queryByText("Request failed (internal_error).")).not.toBeInTheDocument()
   })
 })

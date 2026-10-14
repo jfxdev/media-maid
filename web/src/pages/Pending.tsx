@@ -130,12 +130,15 @@ export function Pending({ tab: tabParam }: { tab?: string }) {
 
   const items = useMemo(() => data?.items ?? [], [data])
   const inTab = useMemo(() => filterPending(items, tab, null, ""), [items, tab])
-  const reasons = useMemo(() => [...new Set(inTab.map((i) => i.reason ?? ""))].sort(), [inTab])
+  const reasons = useMemo<string[]>(() => [...new Set(inTab.map((i) => i.reason ?? ""))].sort(), [inTab])
+  // A reason chosen before a refresh may be gone, and its buttons hidden:
+  // it only filters while it can still be seen and cleared.
+  const activeReason = reason !== null && reasons.length > 1 && reasons.includes(reason) ? reason : null
   const rows = useMemo(() => {
-    const out = filterPending(items, tab, reason, query)
+    const out = filterPending(items, tab, activeReason, query)
     out.sort((a, b) => (newestFirst ? b.updated.localeCompare(a.updated) : a.updated.localeCompare(b.updated)))
     return out
-  }, [items, tab, reason, query, newestFirst])
+  }, [items, tab, activeReason, query, newestFirst])
 
   return (
     <div className="flex flex-col gap-5">
@@ -178,11 +181,11 @@ export function Pending({ tab: tabParam }: { tab?: string }) {
         </div>
         {reasons.length > 1 && (
           <div className="flex flex-wrap gap-1.5" role="group" aria-label="Filter by reason">
-            <Button size="sm" variant={reason === null ? "secondary" : "ghost"} onClick={() => setReason(null)}>
+            <Button size="sm" variant={activeReason === null ? "secondary" : "ghost"} onClick={() => setReason(null)}>
               Any reason
             </Button>
             {reasons.map((r) => (
-              <Button key={r || "none"} size="sm" variant={reason === r ? "secondary" : "ghost"} onClick={() => setReason(r)}>
+              <Button key={r || "none"} size="sm" variant={activeReason === r ? "secondary" : "ghost"} onClick={() => setReason(r)}>
                 {r ? humanize(r) : "no reason"}
               </Button>
             ))}

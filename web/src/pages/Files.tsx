@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 import { ArrowUp, File, FileVideo, Folder, Link2, Loader2, Subtitles, TriangleAlert } from "lucide-react"
 
 import { ApiError, getJSON } from "@/api/client"
@@ -63,10 +63,14 @@ export function Files({ root: rootParam, path }: { root?: string; path: string }
   const [error, setError] = useState<unknown>(undefined)
   const [loading, setLoading] = useState(false)
   const [tick, setTick] = useState(0)
+  // The "Load more" request in flight, cancelled when the folder changes or
+  // is refreshed so its reply never lands on another listing.
+  const moreCtrl = useRef<AbortController | null>(null)
 
   // First page of the folder; reset whenever the folder changes.
   useEffect(() => {
     if (!root) return
+    moreCtrl.current?.abort()
     const ctrl = new AbortController()
     setLoading(true)
     setError(undefined)
@@ -83,26 +87,35 @@ export function Files({ root: rootParam, path }: { root?: string; path: string }
         setLoading(false)
       },
     )
-    return () => ctrl.abort()
+    return () => {
+      ctrl.abort()
+      moreCtrl.current?.abort()
+    }
   }, [root, path, token, logout, tick])
 
   async function loadMore() {
     if (!listing) return
+    moreCtrl.current?.abort()
+    const ctrl = new AbortController()
+    moreCtrl.current = ctrl
     setLoading(true)
+    setError(undefined)
     const offset = listing.entries.length
     try {
-      const next = await getJSON<Listing>(filesQuery(root, path, offset), token)
-      // Append only to the page it continues: the folder may have changed
-      // (navigation) or the page been loaded already (double click).
+      const next = await getJSON<Listing>(filesQuery(root, path, offset), token, ctrl.signal)
+      if (ctrl.signal.aborted) return
+      // Append only to the page it continues (a double click asks twice).
       setListing((cur) =>
         cur && cur.root === next.root && cur.path === next.path && cur.entries.length === offset
           ? { ...next, entries: [...cur.entries, ...next.entries] }
           : cur,
       )
     } catch (err) {
+      if (ctrl.signal.aborted) return
+      if (err instanceof ApiError && err.status === 401) logout()
       setError(err)
     } finally {
-      setLoading(false)
+      if (!ctrl.signal.aborted) setLoading(false)
     }
   }
 

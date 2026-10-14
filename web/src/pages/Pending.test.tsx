@@ -1,4 +1,4 @@
-import { render, screen, within } from "@testing-library/react"
+import { act, render, screen, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import { describe, expect, it } from "vitest"
 
@@ -62,5 +62,25 @@ describe("Pending", () => {
     expect(text).toContain("$API_TOKEN")
     expect(text).not.toContain("r".repeat(32))
     expect(text).toContain('"overwrite":true')
+  })
+
+  it("drops a reason filter whose reason is gone after a refresh", async () => {
+    window.sessionStorage.setItem("media-maid.token", "r".repeat(32))
+    let calls = 0
+    mockFetch({
+      "/api/v1/info": () => ({ body: info }),
+      // The ambiguous item is resolved between the two loads.
+      "/api/v1/pending": () => ({ body: { items: calls++ === 0 ? items : items.filter((i) => i.reason !== "ambiguous_title") } }),
+    })
+    render(
+      <AuthProvider>
+        <Pending tab="unidentified" />
+      </AuthProvider>,
+    )
+    await userEvent.click(await screen.findByRole("button", { name: "ambiguous title" }))
+    expect(screen.queryByText("Unknown.mkv")).not.toBeInTheDocument()
+    await act(async () => userEvent.click(screen.getByRole("button", { name: "Refresh" })))
+    expect(await screen.findByText("Unknown.mkv")).toBeInTheDocument()
+    expect(screen.queryByText("No match")).not.toBeInTheDocument()
   })
 })

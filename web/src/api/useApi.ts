@@ -29,7 +29,11 @@ export function useApi<T>(path: string | null, interval = 30_000): ApiState<T> {
     // A new path starts empty; a refresh keeps showing the previous data.
     setState((s) => (s.path === path ? { ...s, loading: true } : { path, loading: true }))
     getJSON<T>(path, token, ctrl.signal).then(
-      (data) => setState({ path, data, loading: false }),
+      (data) => {
+        // A reply to a superseded request must not replace newer data.
+        if (ctrl.signal.aborted) return
+        setState({ path, data, loading: false })
+      },
       (error: unknown) => {
         if (ctrl.signal.aborted) return
         if (error instanceof ApiError && error.status === 401) logout()
