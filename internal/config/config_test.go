@@ -106,6 +106,8 @@ func TestLoadLLM(t *testing.T) {
 		{map[string]string{"LLM_PROVIDER": "anthropic", "LLM_API_KEY": "k", "LLM_BASE_URL": "ftp://x"}, "LLM_BASE_URL"},
 		{map[string]string{"LLM_PROVIDER": "anthropic", "LLM_API_KEY": "k", "LLM_MIN_CONFIDENCE": "2"}, "LLM_MIN_CONFIDENCE"},
 		{map[string]string{"LLM_MIN_CONFIDENCE": "x"}, "LLM_MIN_CONFIDENCE"},
+		{map[string]string{"LLM_MIN_CONFIDENCE": "NaN"}, "LLM_MIN_CONFIDENCE"},
+		{map[string]string{"LLM_PROVIDER": "anthropic", "LLM_API_KEY": "k", "LLM_MIN_CONFIDENCE": "nan"}, "LLM_MIN_CONFIDENCE"},
 		{map[string]string{"LLM_PROVIDER": "anthropic", "LLM_API_KEY": "k", "LLM_TIMEOUT": "1h"}, "LLM_TIMEOUT"},
 		{map[string]string{"PREFERRED_LANGUAGE": "portuguese"}, "PREFERRED_LANGUAGE"},
 		{map[string]string{"PREFERRED_LANGUAGE": "pt-BR,en"}, "PREFERRED_LANGUAGE"},

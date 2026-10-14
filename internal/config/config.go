@@ -5,6 +5,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net/url"
 	"path/filepath"
 	"regexp"
@@ -392,7 +393,8 @@ func loadLLM(getenv func(string) string, fail func(string, ...any)) LLMConfig {
 	// TMDB has no match for waits as pending.
 	if v := strings.TrimSpace(getenv("LLM_MIN_CONFIDENCE")); v != "" {
 		f, err := strconv.ParseFloat(v, 64)
-		if err != nil || f < 0 || f > 1 {
+		// NaN passes both range checks: every comparison with it is false.
+		if err != nil || math.IsNaN(f) || f < 0 || f > 1 {
 			fail("LLM_MIN_CONFIDENCE must be a number between 0 and 1")
 		}
 		l.MinConfidence = f
