@@ -15,6 +15,7 @@ import (
 
 	"github.com/jfxdev/media-maid/internal/api"
 	"github.com/jfxdev/media-maid/internal/assist"
+	"github.com/jfxdev/media-maid/internal/browse"
 	"github.com/jfxdev/media-maid/internal/config"
 	"github.com/jfxdev/media-maid/internal/integration"
 	"github.com/jfxdev/media-maid/internal/jobs"
@@ -24,6 +25,7 @@ import (
 	"github.com/jfxdev/media-maid/internal/orphans"
 	"github.com/jfxdev/media-maid/internal/safepath"
 	"github.com/jfxdev/media-maid/internal/state"
+	"github.com/jfxdev/media-maid/internal/ui"
 	"github.com/jfxdev/media-maid/internal/watcher"
 )
 
@@ -134,6 +136,12 @@ func run(log *slog.Logger) error {
 		return err
 	}
 	defer tvRoot.Close()
+	// Only used to list the downloads folder (GET /api/v1/files).
+	downloadsRoot, err := os.OpenRoot(downloads)
+	if err != nil {
+		return err
+	}
+	defer downloadsRoot.Close()
 	movies := organizer.Library{Name: "movies", Path: moviesDir, Root: moviesRoot}
 	tv := organizer.Library{Name: "tv", Path: tvDir, Root: tvRoot}
 
@@ -294,6 +302,21 @@ func run(log *slog.Logger) error {
 	if w != nil {
 		apiServer.SetHealth(w.Healthy)
 		apiServer.SetDegraded(w.Degraded)
+	}
+	lister := browse.New(map[string]*os.Root{"downloads": downloadsRoot, "movies": moviesRoot, "tv": tvRoot}, cfg.VideoExts, cfg.SubtitleExts)
+	apiServer.SetFiles(lister)
+	apiServer.SetInfo(api.Info{
+		Version: version, Mode: cfg.Mode, DryRun: cfg.DryRun, OrganizeTrigger: cfg.OrganizeTrigger,
+		SyncEnabled: client != nil, TMDBEnabled: meta != nil, LLMEnabled: resolver != nil, Roots: lister.Roots(),
+	})
+	if cfg.UIEnabled {
+		apiServer.SetUIToken(cfg.UIToken)
+		apiServer.SetUI(ui.Handler())
+		// Never log the token.
+		log.Info("web ui enabled", "path", ui.Prefix, "read_only_token", true)
+		if !ui.Built() {
+			log.Warn("UI_ENABLED is set but this binary was built without the web UI (npm --prefix web run build before go build)")
+		}
 	}
 	srv := api.NewHTTPServer(cfg.ListenAddr, apiServer.Handler())
 	errCh := make(chan error, 1)

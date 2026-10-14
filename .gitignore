@@ -31,3 +31,9 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Web UI: dependencies and the build embedded by internal/ui (only the
+# placeholder is versioned)
+/web/node_modules/
+/internal/ui/dist/*
+!/internal/ui/dist/.keep
