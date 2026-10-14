@@ -54,14 +54,14 @@ function Shell({ children, current }: { children: ReactNode; current: string }) 
             <Logo className="size-5" />
             Media Maid
           </a>
-          <nav className="order-last flex w-full gap-1 overflow-x-auto sm:order-none sm:w-auto" aria-label="Main">
+          <nav className="order-last flex w-full flex-wrap gap-1 sm:order-none sm:w-auto" aria-label="Main">
             {nav.map((n) => (
               <a
                 key={n.id}
                 href={href(n.id)}
                 aria-current={current === n.id ? "page" : undefined}
                 className={cn(
-                  "rounded-md px-3 py-1.5 text-sm font-medium whitespace-nowrap text-muted-foreground transition-colors hover:text-foreground",
+                  "rounded-md px-2.5 py-1.5 text-sm font-medium whitespace-nowrap text-muted-foreground transition-colors hover:text-foreground sm:px-3",
                   current === n.id && "bg-secondary text-foreground",
                 )}
               >

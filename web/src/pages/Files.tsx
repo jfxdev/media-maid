@@ -89,9 +89,16 @@ export function Files({ root: rootParam, path }: { root?: string; path: string }
   async function loadMore() {
     if (!listing) return
     setLoading(true)
+    const offset = listing.entries.length
     try {
-      const next = await getJSON<Listing>(filesQuery(root, path, listing.entries.length), token)
-      setListing({ ...next, entries: [...listing.entries, ...next.entries] })
+      const next = await getJSON<Listing>(filesQuery(root, path, offset), token)
+      // Append only to the page it continues: the folder may have changed
+      // (navigation) or the page been loaded already (double click).
+      setListing((cur) =>
+        cur && cur.root === next.root && cur.path === next.path && cur.entries.length === offset
+          ? { ...next, entries: [...cur.entries, ...next.entries] }
+          : cur,
+      )
     } catch (err) {
       setError(err)
     } finally {

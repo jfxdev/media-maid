@@ -88,7 +88,7 @@ export function Orphans() {
             </p>
           )}
 
-          <div className="grid gap-4 sm:grid-cols-3">
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
             {(Object.keys(types) as Orphan["type"][]).map((t) => {
               const list = orphans.filter((o) => o.type === t)
               const bytes = list.reduce((n, o) => n + (o.size ?? 0), 0)

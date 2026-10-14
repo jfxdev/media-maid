@@ -135,7 +135,7 @@ export function Overview() {
       />
       {pending.error !== undefined && <ErrorState error={pending.error} title="Could not load pending items" />}
 
-      <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <StatCard
           title="Conflicts"
           value={count("conflict", "duplicate")}
@@ -176,8 +176,8 @@ export function Overview() {
         />
       </div>
 
-      <div className="grid gap-4 lg:grid-cols-3">
-        <Card className="gap-2">
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+        <Card className="min-w-0 gap-2">
           <CardHeader>
             <CardTitle>Status</CardTitle>
           </CardHeader>
@@ -208,7 +208,7 @@ export function Overview() {
           </CardContent>
         </Card>
 
-        <Card className="gap-2 lg:col-span-2">
+        <Card className="min-w-0 gap-2 lg:col-span-2">
           <CardHeader>
             <CardTitle>Recent activity</CardTitle>
             <CardDescription>The last actions recorded in the history.</CardDescription>
@@ -251,7 +251,13 @@ export function Overview() {
 
       <p className="flex items-center gap-2 text-xs text-muted-foreground">
         <Files className="size-3.5" />
-        Browse the downloads and libraries under <a className="underline underline-offset-4" href={href("files")}>Files</a>.
+        <span>
+          Browse the downloads and libraries under{" "}
+          <a className="underline underline-offset-4" href={href("files")}>
+            Files
+          </a>
+          .
+        </span>
       </p>
     </div>
   )
