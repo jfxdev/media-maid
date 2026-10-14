@@ -5,6 +5,9 @@ info:
   summary: Organize downloads into a Jellyfin, Emby or Plex library and clean up orphans.
   description: |
     Every `/api/v1/*` route requires `Authorization: Bearer <API_TOKEN>`.
+    With the web UI enabled, `Authorization: Bearer <UI_TOKEN>` is also
+    accepted on `GET` routes, which never change anything; any other method
+    answers `403` `read_only_token`.
     Errors are returned as `{"error": "<code>"}` with a stable code.
   license:
     name: See LICENSE
@@ -22,6 +25,8 @@ tags:
     description: Media server library refresh and history.
   - name: orphans
     description: Detect and remove stale library entries.
+  - name: files
+    description: List the configured folders (names and metadata only, never contents).
   - name: meta
 paths:
   /healthz:
@@ -90,6 +95,7 @@ paths:
                 required: [status]
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/ReadOnlyToken" }
         "409":
           description: "`scan_running`: another scan is in progress."
           content:
@@ -120,7 +126,7 @@ paths:
         "200": { $ref: "#/components/responses/Results" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
-        "403": { $ref: "#/components/responses/UnauthorizedVolume" }
+        "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
         "500": { $ref: "#/components/responses/InternalError" }
         "502": { $ref: "#/components/responses/MetadataUnavailable" }
@@ -134,7 +140,7 @@ paths:
         "200": { $ref: "#/components/responses/Results" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
-        "403": { $ref: "#/components/responses/UnauthorizedVolume" }
+        "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
         "500": { $ref: "#/components/responses/InternalError" }
         "502": { $ref: "#/components/responses/MetadataUnavailable" }
@@ -204,6 +210,7 @@ paths:
                   watcher: { type: string, const: degraded }
                 required: [status]
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/ReadOnlyToken" }
         "409":
           description: "`sync_disabled`: no media server configured."
           content:
@@ -222,6 +229,7 @@ paths:
       responses:
         "200": { $ref: "#/components/responses/Report" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/ReadOnlyToken" }
         "500": { $ref: "#/components/responses/InternalError" }
   /api/v1/orphans:
     get:
@@ -272,12 +280,84 @@ paths:
                 required: [results]
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/ReadOnlyToken" }
+  /api/v1/info:
+    get:
+      tags: [meta]
+      summary: Version, integration mode and enabled layers
+      description: No secrets and no host paths. Used by the web UI.
+      operationId: info
+      responses:
+        "200":
+          description: Instance description.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Info" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/v1/files:
+    get:
+      tags: [files]
+      summary: List one folder of the downloads or a library
+      description: |
+        Names and metadata (type, size, modification time, hard link count)
+        of the entries of one folder, directories first, then by name.
+        Hidden entries (names starting with a dot) are included and marked.
+        Read-only: there is no route that reads or downloads a file. A
+        symlink is listed as such but never followed (listing it answers
+        `not_a_directory`), and its target is never shown. At most 10000
+        entries of a folder are read (`truncated`).
+      operationId: listFiles
+      parameters:
+        - name: root
+          in: query
+          required: true
+          description: Which configured folder.
+          schema:
+            type: string
+            enum: [downloads, movies, tv]
+        - name: path
+          in: query
+          required: false
+          description: Folder relative to the root; empty for the root itself. `..` and absolute paths are refused (`invalid_path`).
+          schema: { type: string, default: "" }
+        - name: offset
+          in: query
+          required: false
+          schema: { type: integer, minimum: 0, default: 0 }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 200 }
+      responses:
+        "200":
+          description: One page of the folder.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Listing" }
+        "400":
+          description: "`invalid_request` (unknown root, bad offset or limit), `invalid_path`, or `not_a_directory` (a file or a symlink)."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: "`unauthorized_volume`: the path leads outside the root through a symlink; `permission_denied`: the folder cannot be read."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: "`not_found`: no such folder."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 components:
   securitySchemes:
     bearerAuth:
       type: http
       scheme: bearer
-      description: The `API_TOKEN` configured on the sidecar (at least 32 characters).
+      description: |
+        The `API_TOKEN` configured on the sidecar (at least 32 characters), or
+        the read-only `UI_TOKEN` (web UI) on `GET` routes.
   requestBodies:
     PathRequest:
       required: true
@@ -374,6 +454,16 @@ components:
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
+    ReadOnlyToken:
+      description: "`read_only_token`: the web UI token (`UI_TOKEN`) only authorizes `GET` requests."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Forbidden:
+      description: "`unauthorized_volume`: the path links outside the mounted volumes; `read_only_token`: the web UI token (`UI_TOKEN`) only authorizes `GET` requests."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
     NotFound:
       description: "`not_found`: nothing exists at that path; `tmdb_not_found`: no TMDB entry with that `tmdb_id` and `kind`."
       content:
@@ -408,6 +498,9 @@ components:
             - sync_disabled
             - sync_failed
             - scan_running
+            - not_a_directory
+            - permission_denied
+            - read_only_token
             - internal_error
       required: [error]
     Result:
@@ -581,3 +674,71 @@ components:
           type: string
           description: "`not_removable` for report-only types, `sync_disabled`, or the failure."
       required: [id, status]
+    Info:
+      type: object
+      properties:
+        version: { type: string }
+        mode:
+          type: string
+          enum: [jellyfin, emby, plex]
+        dry_run: { type: boolean }
+        organize_trigger:
+          type: string
+          enum: [watch, hook]
+        sync_enabled:
+          type: boolean
+          description: A media server is configured (sync and server-side orphan checks).
+        tmdb_enabled: { type: boolean }
+        llm_enabled: { type: boolean }
+        roots:
+          type: array
+          description: Folders `GET /api/v1/files` can list.
+          items:
+            type: string
+            enum: [downloads, movies, tv]
+      required: [version, mode, dry_run, organize_trigger, sync_enabled, tmdb_enabled, llm_enabled, roots]
+    Listing:
+      type: object
+      properties:
+        root:
+          type: string
+          enum: [downloads, movies, tv]
+        path:
+          type: string
+          description: The folder, relative to the root; empty for the root.
+        entries:
+          type: array
+          items: { $ref: "#/components/schemas/FileEntry" }
+        total:
+          type: integer
+          description: Entries read in the folder (all of them unless `truncated`).
+        truncated:
+          type: boolean
+          description: The folder holds more than 10000 entries; only the first ones read are listed.
+      required: [root, path, entries, total, truncated]
+    FileEntry:
+      type: object
+      properties:
+        name: { type: string }
+        type:
+          type: string
+          enum: [dir, file, symlink, other]
+          description: "`other`: a FIFO, socket or device."
+        size:
+          type: integer
+          description: Size in bytes of a regular file.
+        modified: { type: string, format: date-time }
+        hidden:
+          type: boolean
+          description: The name starts with a dot.
+        links:
+          type: integer
+          description: |
+            Hard link count of a regular file. In the downloads, 1 means the
+            file is not linked into the library; in a library, 1 means it is
+            not linked from the downloads (a copy, or added by hand).
+        media:
+          type: string
+          enum: [video, subtitle]
+          description: From `VIDEO_EXTENSIONS` / `SUBTITLE_EXTENSIONS`.
+      required: [name, type, modified, hidden]

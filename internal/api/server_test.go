@@ -7,11 +7,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/jfxdev/media-maid/internal/browse"
 	"github.com/jfxdev/media-maid/internal/integration"
 	"github.com/jfxdev/media-maid/internal/jobs"
 	"github.com/jfxdev/media-maid/internal/organizer"
@@ -57,6 +59,27 @@ func (f *fakeOrphans) Remove(_ context.Context, ids []string) []orphans.RemoveRe
 	return []orphans.RemoveResult{{ID: ids[0], Status: jobs.StatusRemoved}}
 }
 
+type fakeFiles struct{ offset, limit int }
+
+func (f *fakeFiles) List(_ context.Context, root, rel string, offset, limit int) (*browse.Listing, error) {
+	f.offset, f.limit = offset, limit
+	switch {
+	case root != "downloads":
+		return nil, browse.ErrUnknownRoot
+	case rel == "../etc":
+		return nil, safepath.ErrInvalidPath
+	case rel == "a.mkv":
+		return nil, browse.ErrNotDir
+	case rel == "missing":
+		return nil, browse.ErrNotFound
+	case rel == "escape":
+		return nil, safepath.ErrUnauthorizedVolume
+	case rel == "locked":
+		return nil, os.ErrPermission
+	}
+	return &browse.Listing{Root: root, Path: rel, Entries: []browse.Entry{{Name: ".hidden", Type: browse.TypeDir, Hidden: true}}, Total: 1}, nil
+}
+
 type disabledSyncer struct{}
 
 func (disabledSyncer) Request(...string)             {}
@@ -79,7 +102,11 @@ func do(t *testing.T, h http.Handler, method, path, auth, body string) (int, str
 func TestAPI(t *testing.T) {
 	org := &fakeOrg{}
 	orph := &fakeOrphans{}
-	h := New(token, org, orph, disabledSyncer{}, jobs.NewHistory(10), slog.New(slog.NewTextHandler(io.Discard, nil))).Handler()
+	files := &fakeFiles{}
+	srv := New(token, org, orph, disabledSyncer{}, jobs.NewHistory(10), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	srv.SetFiles(files)
+	srv.SetInfo(Info{Version: "1.2.3", Mode: "jellyfin", OrganizeTrigger: "watch", Roots: []string{"downloads", "movies", "tv"}})
+	h := srv.Handler()
 	bearer := "Bearer " + token
 
 	tests := []struct {
@@ -133,6 +160,22 @@ func TestAPI(t *testing.T) {
 		{"orphans remove empty", "POST", "/api/v1/orphans/remove", bearer, `{"ids":[]}`, 400, "invalid_request"},
 		{"orphans remove", "POST", "/api/v1/orphans/remove", bearer, `{"ids":["abc"]}`, 200, "removed"},
 		{"orphans remove no auth", "POST", "/api/v1/orphans/remove", "", `{"ids":["abc"]}`, 401, "unauthorized"},
+		{"info", "GET", "/api/v1/info", bearer, "", 200, `"roots":["downloads","movies","tv"]`},
+		{"info no auth", "GET", "/api/v1/info", "", "", 401, "unauthorized"},
+		{"files", "GET", "/api/v1/files?root=downloads", bearer, "", 200, `"hidden":true`},
+		{"files no auth", "GET", "/api/v1/files?root=downloads", "", "", 401, "unauthorized"},
+		{"files no root", "GET", "/api/v1/files", bearer, "", 400, "invalid_request"},
+		{"files unknown root", "GET", "/api/v1/files?root=state", bearer, "", 400, "invalid_request"},
+		{"files traversal", "GET", "/api/v1/files?root=downloads&path=../etc", bearer, "", 400, "invalid_path"},
+		{"files on a file", "GET", "/api/v1/files?root=downloads&path=a.mkv", bearer, "", 400, "not_a_directory"},
+		{"files missing", "GET", "/api/v1/files?root=downloads&path=missing", bearer, "", 404, "not_found"},
+		{"files escape", "GET", "/api/v1/files?root=downloads&path=escape", bearer, "", 403, "unauthorized_volume"},
+		{"files locked", "GET", "/api/v1/files?root=downloads&path=locked", bearer, "", 403, "permission_denied"},
+		{"files bad offset", "GET", "/api/v1/files?root=downloads&offset=-1", bearer, "", 400, "invalid_request"},
+		{"files bad limit", "GET", "/api/v1/files?root=downloads&limit=1001", bearer, "", 400, "invalid_request"},
+		{"files limit not a number", "GET", "/api/v1/files?root=downloads&limit=ten", bearer, "", 400, "invalid_request"},
+		{"files wrong method", "POST", "/api/v1/files?root=downloads", bearer, "", 405, ""},
+		{"no ui by default", "GET", "/ui/", "", "", 404, ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -141,6 +184,15 @@ func TestAPI(t *testing.T) {
 				t.Errorf("got %d %s, want %d containing %q", code, body, tt.code, tt.contains)
 			}
 		})
+	}
+
+	do(t, h, "GET", "/api/v1/files?root=downloads&offset=40&limit=20", bearer, "")
+	if files.offset != 40 || files.limit != 20 {
+		t.Errorf("files paging = %d/%d, want 40/20", files.offset, files.limit)
+	}
+	do(t, h, "GET", "/api/v1/files?root=downloads", bearer, "")
+	if files.offset != 0 || files.limit != browse.DefaultLimit {
+		t.Errorf("files default paging = %d/%d", files.offset, files.limit)
 	}
 
 	do(t, h, "POST", "/api/v1/preview", bearer, `{"path":"x","overwrite":true}`)
@@ -158,6 +210,120 @@ func TestAPI(t *testing.T) {
 	do(t, h, "POST", "/api/v1/organize", bearer, `{"path":"x","kind":"movie","title":" The Matrix ","year":1999,"tmdb_id":603}`)
 	if ov := org.last.Override; ov == nil || *ov != (organizer.Override{Kind: "movie", Title: "The Matrix", Year: 1999, TMDBID: 603}) {
 		t.Errorf("override = %+v", ov)
+	}
+}
+
+// TestReadOnlyToken: the web UI token reads (GET) and never changes anything.
+func TestReadOnlyToken(t *testing.T) {
+	uiToken := "fedcba9876543210fedcba9876543210"
+	orph := &fakeOrphans{}
+	srv := New(token, &fakeOrg{}, orph, disabledSyncer{}, jobs.NewHistory(10), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	srv.SetFiles(&fakeFiles{})
+	srv.SetUIToken(uiToken)
+	h := srv.Handler()
+	read := "Bearer " + uiToken
+	tests := []struct {
+		name, method, path, auth, body string
+		code                           int
+		contains                       string
+	}{
+		{"pending", "GET", "/api/v1/pending", read, "", 200, `"items"`},
+		{"history", "GET", "/api/v1/history", read, "", 200, `"entries"`},
+		{"orphans", "GET", "/api/v1/orphans", read, "", 404, "no_report"},
+		{"files", "GET", "/api/v1/files?root=downloads", read, "", 200, `"entries"`},
+		{"info", "GET", "/api/v1/info", read, "", 200, `"roots":[]`},
+		{"head", "HEAD", "/api/v1/pending", read, "", 200, ""},
+		{"scan", "POST", "/api/v1/scan", read, "", 403, "read_only_token"},
+		{"organize", "POST", "/api/v1/organize", read, `{"path":"x","overwrite":true}`, 403, "read_only_token"},
+		{"preview", "POST", "/api/v1/preview", read, `{"path":"x"}`, 403, "read_only_token"},
+		{"sync", "POST", "/api/v1/sync", read, "", 403, "read_only_token"},
+		{"orphans scan", "POST", "/api/v1/orphans/scan", read, "", 403, "read_only_token"},
+		{"orphans remove", "POST", "/api/v1/orphans/remove", read, `{"ids":["abc"]}`, 403, "read_only_token"},
+		{"wrong ui token", "GET", "/api/v1/pending", "Bearer " + uiToken[:31] + "x", "", 401, "unauthorized"},
+		{"api token still writes", "POST", "/api/v1/orphans/scan", "Bearer " + token, "", 200, "server_check"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			code, body := do(t, h, tt.method, tt.path, tt.auth, tt.body)
+			if code != tt.code || !strings.Contains(body, tt.contains) {
+				t.Errorf("got %d %s, want %d containing %q", code, body, tt.code, tt.contains)
+			}
+		})
+	}
+	if orph.removed != nil {
+		t.Error("the read-only token removed orphans")
+	}
+
+	// Without a UI token configured, an empty bearer never matches it.
+	h = New(token, &fakeOrg{}, &fakeOrphans{}, disabledSyncer{}, jobs.NewHistory(10), slog.New(slog.NewTextHandler(io.Discard, nil))).Handler()
+	if code, _ := do(t, h, "GET", "/api/v1/pending", "Bearer ", ""); code != 401 {
+		t.Errorf("empty bearer = %d, want 401", code)
+	}
+}
+
+// TestFilesNeverReturnContents is a regression guard: listing a folder, or
+// asking for a file, never returns what the file holds.
+func TestFilesNeverReturnContents(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "Movie.2010"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const marker = "SECRET-CONTENT-MARKER"
+	for _, name := range []string{"Movie.2010/Movie.2010.mkv", "Movie.2010/.hidden.nfo", "notes.txt"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(marker), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	srv := New(token, &fakeOrg{}, &fakeOrphans{}, disabledSyncer{}, jobs.NewHistory(10), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	srv.SetFiles(browse.New(map[string]*os.Root{"downloads": root}, nil, nil))
+	h := srv.Handler()
+	for q, want := range map[string]int{
+		"":                                      200,
+		"&path=Movie.2010":                      200,
+		"&path=notes.txt":                       400,
+		"&path=Movie.2010/Movie.2010.mkv":       400,
+		"&path=Movie.2010/.hidden.nfo":          400,
+		"&path=Movie.2010/Movie.2010.mkv&raw=1": 400,
+	} {
+		code, body := do(t, h, "GET", "/api/v1/files?root=downloads"+q, "Bearer "+token, "")
+		if strings.Contains(body, marker) {
+			t.Errorf("%s: response holds file contents: %d %s", q, code, body)
+		}
+		if code != want || (want == 400 && !strings.Contains(body, "not_a_directory")) {
+			t.Errorf("%s: got %d %s, want %d", q, code, body, want)
+		}
+	}
+	if _, body := do(t, h, "GET", "/api/v1/files?root=downloads&path=Movie.2010", "Bearer "+token, ""); !strings.Contains(body, `".hidden.nfo"`) {
+		t.Errorf("hidden entry not listed: %s", body)
+	}
+}
+
+func TestUIRoutes(t *testing.T) {
+	srv := New(token, &fakeOrg{}, &fakeOrphans{}, disabledSyncer{}, jobs.NewHistory(10), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	srv.SetUI(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "ui:"+r.URL.Path) }))
+	h := srv.Handler()
+	if code, body := do(t, h, "GET", "/ui/", "", ""); code != 200 || body != "ui:/ui/" {
+		t.Errorf("/ui/ = %d %s", code, body)
+	}
+	if code, body := do(t, h, "GET", "/ui/assets/x.js", "", ""); code != 200 || body != "ui:/ui/assets/x.js" {
+		t.Errorf("/ui/assets = %d %s", code, body)
+	}
+	req := httptest.NewRequest("GET", "/", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusFound || rec.Header().Get("Location") != "/ui/" {
+		t.Errorf("/ = %d %s, want a redirect to /ui/", rec.Code, rec.Header().Get("Location"))
+	}
+	if code, _ := do(t, h, "GET", "/elsewhere", "", ""); code != 404 {
+		t.Errorf("/elsewhere = %d, want 404", code)
+	}
+	if code, _ := do(t, h, "POST", "/ui/", "", ""); code != 405 {
+		t.Errorf("POST /ui/ = %d, want 405", code)
 	}
 }
 

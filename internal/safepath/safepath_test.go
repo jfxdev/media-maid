@@ -58,6 +58,30 @@ func TestCleanInput(t *testing.T) {
 	}
 }
 
+func TestCleanRel(t *testing.T) {
+	ok := map[string]string{
+		"":                ".",
+		".":               ".",
+		"Movie.2010":      "Movie.2010",
+		"./a//b/":         "a/b",
+		".hidden/x":       ".hidden/x",
+		"a/./b":           "a/b",
+		"name with ..dot": "name with ..dot",
+	}
+	for in, want := range ok {
+		got, err := CleanRel(in)
+		if err != nil || got != want {
+			t.Errorf("CleanRel(%q) = %q, %v; want %q", in, got, err, want)
+		}
+	}
+	bad := []string{"..", "../etc", "a/../../etc", "a/..", "/etc/passwd", "/", "a\x00b"}
+	for _, in := range bad {
+		if _, err := CleanRel(in); !errors.Is(err, ErrInvalidPath) {
+			t.Errorf("CleanRel(%q) err = %v, want ErrInvalidPath", in, err)
+		}
+	}
+}
+
 func TestResolveAndOpen(t *testing.T) {
 	vol := t.TempDir()
 	vol2 := t.TempDir()
