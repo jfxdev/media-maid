@@ -108,6 +108,8 @@ server (say `PLEX_CLAIM` from a shared env file) are ignored with a warning.
 | `NOTIFY_URL` | no | — | webhook for problems and upgrades (see [Notifications](#notifications)); a secret, never logged |
 | `NOTIFY_FORMAT` | no | `json` | `json` (title, body and events; Apprise API) or `text` (plain body, `Title` header; ntfy) |
 | `NOTIFY_ON` | no | `conflict,error,skipped,upgraded` | statuses to notify: any of `linked`, `copied`, `replaced`, `upgraded`, `conflict`, `duplicate`, `skipped`, `error` |
+| `UI_ENABLED` | no | `false` | serve the read-only [web UI](#web-ui) at `/ui/` |
+| `UI_TOKEN` | with `UI_ENABLED` | — | read-only bearer token of the web UI (≥ 32 chars, different from `API_TOKEN`): accepted on `GET` routes only; a secret, never logged |
 
 ¹ Set both or neither; without them, sync and server-side orphan checks are off.
 ² `LLM_API_KEY` is required with the public endpoints (no `LLM_BASE_URL`);
@@ -121,7 +123,10 @@ mounted volumes.
 Interactive docs are served at **`/docs`** and the OpenAPI spec at
 **`/openapi.yaml`** (both unauthenticated; the spec is embedded in the binary,
 source in [`internal/api/openapi.yaml`](internal/api/openapi.yaml)).
-Every `/api/v1/*` route requires `Authorization: Bearer $API_TOKEN`.
+Every `/api/v1/*` route requires `Authorization: Bearer $API_TOKEN`. With
+the web UI enabled, `UI_TOKEN` is accepted too, on `GET` routes only (any
+other method answers `403` `read_only_token`); `GET` routes never change
+anything.
 
 | Method | Route | Description |
 |---|---|---|
@@ -135,6 +140,8 @@ Every `/api/v1/*` route requires `Authorization: Bearer $API_TOKEN`.
 | `POST` | `/api/v1/orphans/scan` | build an orphan report |
 | `GET` | `/api/v1/orphans` | latest report |
 | `POST` | `/api/v1/orphans/remove` | `{"ids": [...]}` remove reported orphans |
+| `GET` | `/api/v1/info` | version, integration mode and enabled layers (no secrets, no paths) |
+| `GET` | `/api/v1/files` | `?root=downloads\|movies\|tv&path=...&offset=0&limit=200` list one folder: names and metadata only, never contents |
 
 By default the watcher picks up a download once its files stop changing for
 `STABLE_SECONDS`: no filesystem events, and the same size and modification
@@ -164,6 +171,34 @@ recheck) never links again a file you deleted from the library. Mount the downlo
 containers. Never paste the torrent name into a JSON template by hand: the API
 rejects duplicate keys and trailing data, so a crafted name cannot add fields
 such as `overwrite`, but it would still break the request.
+
+## Web UI
+
+An optional, read-only web UI is embedded in the binary. Set
+`UI_ENABLED=true` and a `UI_TOKEN` (`openssl rand -hex 32`, not the
+`API_TOKEN`), then open `http://<host>:8080/ui/` and sign in with that token.
+It shows:
+
+- **Overview**: counts of conflicts, unidentified titles, errors and orphans,
+  the watcher, the last sync and recent activity.
+- **Pending**: conflicts and duplicates, unidentified titles and errors, with
+  the full message and the `curl` call that settles each one (preview,
+  overwrite, identification by TMDB id). The commands read `$API_TOKEN` (and
+  `$TMDB_ID`) from your shell: the UI never has that token.
+- **Errors**: what is failing now (downloads, the last sync, the orphan scan)
+  and the failures in the recent history.
+- **Orphans**: the latest report, by type.
+- **Files**: the downloads, movies and TV folders, hidden entries included
+  (and marked, with a switch to hide them). Only names, sizes, dates and hard
+  link counts are shown: no file can be opened, read or downloaded, symlinks
+  are listed but never followed, and nothing outside those three folders is
+  reachable.
+
+The UI only sends `GET` requests, and the `UI_TOKEN` cannot do anything else:
+removing orphans, organizing and identifying stay API calls made with the
+`API_TOKEN`. The token is kept in the browser tab's session storage, and every
+file the page loads comes from the binary (a `'self'`-only Content Security
+Policy, no CDN). Serve it over HTTPS (a reverse proxy) beyond your LAN.
 
 ## How titles are resolved
 
@@ -429,6 +464,10 @@ returns `stale` if it is no longer an orphan.
 - Names from parsing, TMDB and the LLM are sanitized; server item IDs are
   validated. LLM answers are schema-checked and cross-checked against the
   file name and TMDB; `LLM_API_KEY` never appears in logs or errors.
+- The optional web UI uses its own read-only `UI_TOKEN`, accepted on `GET`
+  routes only (which never change anything). It lists folders of the three
+  roots through `os.Root` (names and metadata, never contents; symlinks are
+  not followed) and loads nothing from outside the binary (CSP `'self'`).
 - Non-root distroless image; examples use `read_only`, `cap_drop: [ALL]` and
   `no-new-privileges`.
 
@@ -439,6 +478,20 @@ go test ./...
 go build ./cmd/media-maid
 docker build -t media-maid .
 ```
+
+The web UI lives in [`web/`](web/) (React, TypeScript, Tailwind and
+shadcn/ui; Node 22). `go build` works without it and serves a short notice at
+`/ui/`; to embed the UI, build it first:
+
+```sh
+npm --prefix web ci
+npm --prefix web run build   # writes internal/ui/dist, embedded by go build
+npm --prefix web test
+npm --prefix web run dev     # dev server; proxies /api to a media-maid on :8080
+```
+
+After changing `internal/api/openapi.yaml`, run `npm --prefix web run gen:api`
+to regenerate the UI's API types.
 
 Requires Go 1.25+. See [`AGENTS.md`](AGENTS.md) for architecture and
 contribution notes. A misread release name is best reported as a line for

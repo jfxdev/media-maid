@@ -8,7 +8,8 @@ A single-binary Go sidecar that runs next to one Jellyfin, Emby or Plex
 container. It watches `DOWNLOADS_DIR`, parses release names, hardlinks videos,
 subtitles and extras into `MOVIES_DIR` / `TV_DIR` with server-friendly names,
 asks the media server to refresh, lists (and optionally notifies) downloads
-that need a decision, and reports (never auto-removes) orphaned entries.
+that need a decision, and reports (never auto-removes) orphaned entries. An
+optional read-only web UI (`UI_ENABLED`) is embedded in the binary.
 User docs: [`README.md`](README.md). API contract: [`internal/api/openapi.yaml`](internal/api/openapi.yaml).
 
 ## Commands
@@ -20,14 +21,24 @@ go test -race ./...        # watcher tests take ~10s; CI runs all of these
 GOOS=darwin go vet ./... # macOS must still compile (renameat2 is Linux only)
 go build ./cmd/media-maid
 docker build -t media-maid .
+
+# web UI (Node 22, web/.nvmrc); go build works without it (placeholder)
+npm --prefix web ci --ignore-scripts
+npm --prefix web run gen:api     # API types from openapi.yaml; CI fails on a diff
+npm --prefix web run typecheck
+npm --prefix web test
+npm --prefix web run build       # into internal/ui/dist, embedded by go build
 ```
 
 Go 1.25+ is required (`os.Root`). Dependencies are stdlib plus `fsnotify` and
-`golang.org/x/sys`; avoid adding more. Linux-only syscalls live in
+`golang.org/x/sys`; avoid adding more. The web UI keeps to React, `radix-ui`
+(through shadcn/ui components copied into `web/src/components/ui`), Tailwind
+and `lucide-react`; no router or data-fetching library. Linux-only syscalls live in
 `*_linux.go` files with a `!linux` stub that fails safely.
 
-CI (`.github/workflows/ci.yml`) runs the commands above; `release.yml`
-publishes a multi-arch image to GHCR on `vX.Y.Z` tags. Every third-party
+CI (`.github/workflows/ci.yml`) runs the commands above (Go, web and Docker
+jobs); the Dockerfile builds the UI in a Node stage before the Go build.
+`release.yml` publishes a multi-arch image to GHCR on `vX.Y.Z` tags. Every third-party
 action is pinned to a full commit SHA with the version as a comment: keep it
 that way when bumping (`git ls-remote --tags https://github.com/<action>`,
 use the peeled `^{}` commit of annotated tags).
@@ -82,16 +93,26 @@ use the peeled `^{}` commit of annotated tags).
    on a single worker goroutine. `SCAN_INTERVAL` adds a periodic scan with
    `MinAge` (every 15m anyway once `Degraded`: a folder could not be
    watched). `ORGANIZE_TRIGGER=hook` runs neither: only the API organizes.
-10. `internal/api`: stdlib `ServeMux`; `/api/v1/*` behind bearer auth;
-   `/healthz`, `/openapi.yaml`, `/docs` are public; `/healthz` answers 503
+10. `internal/api`: stdlib `ServeMux`; `/api/v1/*` behind bearer auth
+   (`API_TOKEN` on every route; the read-only `UI_TOKEN` on GET only, else
+   `403 read_only_token`); `/healthz`, `/openapi.yaml`, `/docs` (and `/ui/`
+   with `UI_ENABLED`) are public; `/healthz` answers 503
    when `watcher.Healthy` is false (`Run` returned or its loop stalled).
+   `GET /api/v1/files` lists a folder through `internal/browse`;
+   `GET /api/v1/info` describes the instance.
+11. `internal/ui`: `go:embed all:dist` of the web app (`web/`, built by
+   `npm run build`; only `dist/.keep` is versioned), served at `/ui/`:
+   `index.html` and regular files of `assets/` only, with a `'self'`-only CSP.
 
 Other packages: `parser` (release name → `Analysis`: `Media` with part,
 edition and absolute episode, `Quality`, country, confidence and signals;
 `Parse` is the `Media`-only wrapper; `testdata/corpus.tsv` holds real-world
 names), `naming` (paths + `Sanitize`), `jobs` (ring-buffer history and **all**
 status/action/reason strings), `state` (atomic JSON documents in `STATE_DIR`),
-`notify` (batched webhook for `NOTIFY_URL`; the URL is a secret).
+`notify` (batched webhook for `NOTIFY_URL`; the URL is a secret), `browse`
+(read-only folder listing of the downloads/movies/tv roots for the UI).
+`web/` is the UI: Vite + React + TypeScript, hash routes, `useApi` polling,
+API types generated from `openapi.yaml` (`src/api/schema.d.ts`).
 
 ## Platform table
 
@@ -168,9 +189,24 @@ All platform-specific data lives in `internal/integration/platforms.go`
   removable: downloads belong to the torrent client.
 - **State is data**: documents in `STATE_DIR` never hold secrets; cached LLM
   answers are validated again on every use.
-- **Secrets**: `API_TOKEN`, `MEDIA_SERVER_TOKEN`, `TMDB_API_KEY`,
+- **Secrets**: `API_TOKEN`, `UI_TOKEN`, `MEDIA_SERVER_TOKEN`, `TMDB_API_KEY`,
   `LLM_API_KEY` and `NOTIFY_URL` (it may embed a token) never reach logs,
   errors or responses; token comparison is constant time.
+- **GET never changes anything**: the read-only `UI_TOKEN` is authorized by
+  method (GET/HEAD), so a GET route must not mutate state, start work or
+  call the media server's write endpoints. `UI_TOKEN` must differ from
+  `API_TOKEN`.
+- **The UI is read-only and lists, never reads**: it only sends GET
+  requests. `browse` takes user paths through `safepath.CleanRel` and the
+  roots' `os.Root`, never follows the final symlink (`Lstat` first), opens
+  folders with `O_DIRECTORY` (a FIFO or file swapped in fails instead of
+  blocking or being read), stats entries through the root (never
+  `DirEntry.Info`), and never opens a regular file. There is no route that
+  returns file contents or downloads; `STATE_DIR` is not listable. Commands
+  the UI shows hold `$API_TOKEN`, never a token.
+- **The UI loads nothing from elsewhere**: everything it uses is embedded;
+  the CSP allows `'self'` only (inline styles for Radix, never inline
+  scripts). No CDN, fonts or analytics.
 - **Notifications are best effort** and never block or fail organizing; a
   pending item is notified once per change, not on every scan.
 - **Single tenant**: one media server per process.
@@ -198,16 +234,18 @@ All platform-specific data lives in `internal/integration/platforms.go`
   the table above.
 - **New API route**: handler in `internal/api/server.go`, update
   `internal/api/openapi.yaml` (`TestSpecCoversRoutes` fails otherwise), add a
-  case to `TestAPI`, update the README route table.
+  case to `TestAPI`, update the README route table, and run
+  `npm --prefix web run gen:api` (CI checks `web/src/api/schema.d.ts`).
 - **New status/reason/error code**: constant in `internal/jobs/history.go`
   or `api.fail`, plus the matching enum in `openapi.yaml`. Error codes are stable
   snake_case strings returned as `{"error": "..."}`.
 - **Tests**: table-driven, real filesystems under `t.TempDir()`, small fakes
-  for the interfaces each package consumes (`api.Organizer`, `api.Orphans`,
+  for the interfaces each package consumes (`api.Organizer`, `api.Orphans`, `api.Files`,
   `integration.LibrarySyncer`, `metadata.Provider`, `assist.Resolver`, `orphans.Server`),
   `httptest` for media server/TMDB/LLM/webhook clients. Add a regression test
   for every security fix, and a `parser/testdata/corpus.tsv` line for every
-  misread release name.
+  misread release name. Web: vitest + Testing Library next to the code
+  (`*.test.ts(x)`), `fetch` stubbed with `src/test/fetch.ts`.
 - **Logging**: `log/slog` JSON; pass `*slog.Logger` explicitly.
 - **Config**: every new variable is validated in `config.Load`, documented in
   the README table and, if relevant, in `examples/`.

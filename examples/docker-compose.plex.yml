@@ -49,6 +49,8 @@ services:
       # NOTIFY_URL: ${NOTIFY_URL}                     # e.g. https://ntfy.sh/<topic> or http://apprise:8000/notify/<key>
       # NOTIFY_FORMAT: text                          # text for ntfy, json (default) for Apprise
       # NOTIFY_ON: conflict,error,skipped,upgraded
+      # UI_ENABLED: "true"                           # read-only web UI at http://127.0.0.1:8080/ui/
+      # UI_TOKEN: ${MEDIA_MAID_UI_TOKEN}             # >= 32 characters, not the API_TOKEN (openssl rand -hex 32)
     ports:
       - "127.0.0.1:8080:8080"
     depends_on: [plex]

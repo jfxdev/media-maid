@@ -1,3 +1,6 @@
 .git
 examples
 *.md
+web/node_modules
+internal/ui/dist/index.html
+internal/ui/dist/assets
