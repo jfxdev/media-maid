@@ -22,6 +22,7 @@ type OrganizeFunc func(ctx context.Context, path string)
 
 type pending struct {
 	size      int64
+	mtime     time.Time
 	lastEvent time.Time
 	stableAt  time.Time
 }
@@ -247,7 +248,7 @@ func (w *Watcher) handle(ev fsnotify.Event) {
 }
 
 // flush organizes every release whose pending files have all been stable
-// (same size, no events) for the configured duration.
+// (same size and modification time, no events) for the configured duration.
 func (w *Watcher) flush() {
 	now := time.Now()
 	ready := map[string]bool{}
@@ -265,8 +266,12 @@ func (w *Watcher) flush() {
 			delete(w.pending, p)
 			continue
 		}
-		if fi.Size() != e.size {
-			e.size = fi.Size()
+		// The modification time counts too: a file preallocated at its full
+		// size and written through a memory map (libtorrent 2.x) raises no
+		// change events and keeps its size, but the kernel still moves its
+		// mtime as pages are written.
+		if fi.Size() != e.size || !fi.ModTime().Equal(e.mtime) {
+			e.size, e.mtime = fi.Size(), fi.ModTime()
 			e.stableAt = now
 		}
 		isReady := now.Sub(e.stableAt) >= w.stable && now.Sub(e.lastEvent) >= w.stable
