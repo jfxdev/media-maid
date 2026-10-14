@@ -1,6 +1,15 @@
 # syntax=docker/dockerfile:1
-# The build stage runs on the builder's platform and cross-compiles for the
-# target one, so multi-arch images need no emulation for the Go build.
+# The build stages run on the builder's platform: the web UI is the same for
+# every target, and the Go build cross-compiles, so multi-arch images need no
+# emulation.
+FROM --platform=$BUILDPLATFORM node:22-alpine AS web
+WORKDIR /src/web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci --ignore-scripts --no-audit --no-fund
+COPY web/ ./
+# Writes the UI into /src/internal/ui/dist, embedded by the Go build.
+RUN mkdir -p /src/internal/ui/dist && npm run build
+
 FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS build
 ARG TARGETOS
 ARG TARGETARCH
@@ -9,6 +18,7 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
+COPY --from=web /src/internal/ui/dist ./internal/ui/dist
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
     go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/media-maid ./cmd/media-maid
 

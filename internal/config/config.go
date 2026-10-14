@@ -122,6 +122,11 @@ type Config struct {
 	LinkExtras bool
 	// Notify is the optional webhook; URL is empty when it is disabled.
 	Notify NotifyConfig
+	// UIEnabled serves the embedded web UI at /ui/.
+	UIEnabled bool
+	// UIToken is the read-only bearer token of the web UI: it is accepted on
+	// GET routes only. A secret, set exactly when UIEnabled is.
+	UIToken string
 	// Warnings are non-fatal configuration notes to log at startup.
 	Warnings []string
 }
@@ -302,6 +307,7 @@ func Load(getenv func(string) string, environ []string) (*Config, error) {
 	c.AutoUpgrade = parseBool("AUTO_UPGRADE", getenv, false, fail)
 	c.LinkExtras = parseBool("LINK_EXTRAS", getenv, true, fail)
 	c.Notify = loadNotify(getenv, fail)
+	c.UIEnabled, c.UIToken = loadUI(getenv, c.APIToken, fail)
 
 	if len(errs) > 0 {
 		return nil, errors.Join(errs...)
@@ -333,6 +339,25 @@ func parseBool(name string, getenv func(string) string, def bool, fail func(stri
 		return def
 	}
 	return b
+}
+
+// loadUI reads UI_ENABLED and UI_TOKEN. The token never appears in an error.
+func loadUI(getenv func(string) string, apiToken string, fail func(string, ...any)) (bool, string) {
+	enabled := parseBool("UI_ENABLED", getenv, false, fail)
+	tok := getenv("UI_TOKEN")
+	switch {
+	case !enabled && tok != "":
+		fail("UI_TOKEN requires UI_ENABLED=true")
+		return false, ""
+	case !enabled:
+		return false, ""
+	case len(tok) < minAPITokenLen:
+		fail("UI_TOKEN is required with UI_ENABLED=true and must be at least %d characters", minAPITokenLen)
+	case tok == apiToken:
+		// The UI token is read-only; the same value would grant everything.
+		fail("UI_TOKEN must differ from API_TOKEN")
+	}
+	return true, tok
 }
 
 // loadNotify reads NOTIFY_URL, NOTIFY_FORMAT and NOTIFY_ON. The URL never

@@ -182,6 +182,11 @@ func TestLoadInvalid(t *testing.T) {
 		{"notify bad scheme", func(e map[string]string) { e["NOTIFY_URL"] = "ftp://x/secret-topic" }, nil, "NOTIFY_URL must be"},
 		{"notify bad format", func(e map[string]string) { e["NOTIFY_URL"] = "https://ntfy.sh/t"; e["NOTIFY_FORMAT"] = "xml" }, nil, "NOTIFY_FORMAT"},
 		{"notify bad status", func(e map[string]string) { e["NOTIFY_URL"] = "https://ntfy.sh/t"; e["NOTIFY_ON"] = "error,exploded" }, nil, "unknown status"},
+		{"ui not bool", func(e map[string]string) { e["UI_ENABLED"] = "yes please" }, nil, "UI_ENABLED"},
+		{"ui without token", func(e map[string]string) { e["UI_ENABLED"] = "true" }, nil, "UI_TOKEN is required"},
+		{"ui short token", func(e map[string]string) { e["UI_ENABLED"] = "true"; e["UI_TOKEN"] = "secret-topic" }, nil, "at least 32"},
+		{"ui token is api token", func(e map[string]string) { e["UI_ENABLED"] = "true"; e["UI_TOKEN"] = e["API_TOKEN"] }, nil, "must differ"},
+		{"ui token without ui", func(e map[string]string) { e["UI_TOKEN"] = "secret-topic" + strings.Repeat("y", 32) }, nil, "requires UI_ENABLED"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -214,6 +219,20 @@ func TestLoadOwnServerVarsWarn(t *testing.T) {
 	c, err = load(env)
 	if err != nil || c.StateDir != "/state" || c.ScanInterval.Minutes() != 15 || len(c.Warnings) != 0 {
 		t.Errorf("state/scan = %+v %v", c, err)
+	}
+}
+
+func TestLoadUI(t *testing.T) {
+	c, err := load(baseEnv())
+	if err != nil || c.UIEnabled || c.UIToken != "" {
+		t.Fatalf("ui must be off by default: %v %v", c.UIEnabled, err)
+	}
+	env := baseEnv()
+	env["UI_ENABLED"] = "true"
+	env["UI_TOKEN"] = strings.Repeat("r", 32)
+	c, err = load(env)
+	if err != nil || !c.UIEnabled || c.UIToken != env["UI_TOKEN"] {
+		t.Errorf("ui = %v, %v", c.UIEnabled, err)
 	}
 }
 

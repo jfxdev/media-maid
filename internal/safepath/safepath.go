@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -126,6 +127,25 @@ func CleanInput(root, input string) (string, error) {
 		return "", ErrInvalidPath
 	}
 	return p, nil
+}
+
+// CleanRel validates a user-supplied path relative to some root (an
+// os.Root) and returns it clean, with forward slashes; "" is the root itself
+// ("."). Absolute paths, ".." components and NUL bytes are rejected, as in
+// CleanInput. Symlinks are not resolved here.
+func CleanRel(input string) (string, error) {
+	if input == "" {
+		return ".", nil
+	}
+	if strings.ContainsRune(input, 0) || strings.HasPrefix(input, "/") || filepath.IsAbs(input) {
+		return "", ErrInvalidPath
+	}
+	for _, part := range strings.Split(input, "/") {
+		if part == ".." {
+			return "", ErrInvalidPath
+		}
+	}
+	return path.Clean(input), nil
 }
 
 // Resolve follows symlinks in p and requires the final target to be inside an

@@ -8,13 +8,16 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 	"unicode"
 
+	"github.com/jfxdev/media-maid/internal/browse"
 	"github.com/jfxdev/media-maid/internal/integration"
 	"github.com/jfxdev/media-maid/internal/jobs"
 	"github.com/jfxdev/media-maid/internal/organizer"
@@ -39,9 +42,29 @@ type Orphans interface {
 	Remove(ctx context.Context, ids []string) []orphans.RemoveResult
 }
 
+// Files is what the API needs from the folder lister.
+type Files interface {
+	List(ctx context.Context, root, rel string, offset, limit int) (*browse.Listing, error)
+}
+
+// Info describes the running instance to clients (the web UI). It holds no
+// secrets and no host paths.
+type Info struct {
+	Version         string   `json:"version"`
+	Mode            string   `json:"mode"`
+	DryRun          bool     `json:"dry_run"`
+	OrganizeTrigger string   `json:"organize_trigger"`
+	SyncEnabled     bool     `json:"sync_enabled"`
+	TMDBEnabled     bool     `json:"tmdb_enabled"`
+	LLMEnabled      bool     `json:"llm_enabled"`
+	Roots           []string `json:"roots"`
+}
+
 // Server wires handlers together.
 type Server struct {
-	token     []byte
+	token []byte
+	// uiToken, when set, is accepted on GET routes only (the web UI).
+	uiToken   []byte
 	organizer Organizer
 	orphans   Orphans
 	syncer    integration.LibrarySyncer
@@ -56,6 +79,11 @@ type Server struct {
 	// watcherDegraded, when set, makes /healthz say some folders are not
 	// watched (it still answers 200: periodic scans cover them).
 	watcherDegraded func() bool
+
+	files Files
+	info  Info
+	// ui, when set, serves the web UI at /ui/.
+	ui http.Handler
 }
 
 // New builds the API server. token must already be validated.
@@ -75,6 +103,21 @@ func (s *Server) SetHealth(watcherOK func() bool) { s.watcherOK = watcherOK }
 // returns true. Call it before serving.
 func (s *Server) SetDegraded(degraded func() bool) { s.watcherDegraded = degraded }
 
+// SetUIToken sets the read-only token of the web UI: it authorizes GET
+// requests only. It must be validated (and differ from the API token). Call it
+// before serving.
+func (s *Server) SetUIToken(token string) { s.uiToken = []byte(token) }
+
+// SetFiles sets the folder lister behind GET /api/v1/files. Call it before
+// serving.
+func (s *Server) SetFiles(f Files) { s.files = f }
+
+// SetInfo sets what GET /api/v1/info reports. Call it before serving.
+func (s *Server) SetInfo(info Info) { s.info = info }
+
+// SetUI serves h at /ui/ (and redirects / there). Call it before serving.
+func (s *Server) SetUI(h http.Handler) { s.ui = h }
+
 // Handler returns the HTTP handler.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
@@ -82,6 +125,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /openapi.yaml", serveSpec)
 	mux.HandleFunc("GET /docs", serveDocs)
 	mux.HandleFunc("GET /docs/init.js", serveDocsInit)
+	if s.ui != nil {
+		// The UI files hold no data: like /docs they are public, and every
+		// API call they make carries the token.
+		mux.Handle("GET /ui/", s.ui)
+		mux.Handle("GET /{$}", http.RedirectHandler("/ui/", http.StatusFound))
+	}
 
 	api := http.NewServeMux()
 	api.HandleFunc("POST /api/v1/scan", s.scan)
@@ -93,6 +142,9 @@ func (s *Server) Handler() http.Handler {
 	api.HandleFunc("POST /api/v1/orphans/scan", s.orphansScan)
 	api.HandleFunc("GET /api/v1/orphans", s.orphansGet)
 	api.HandleFunc("POST /api/v1/orphans/remove", s.orphansRemove)
+	// GET routes never change anything: the read-only UI token relies on it.
+	api.HandleFunc("GET /api/v1/info", s.infoHandler)
+	api.HandleFunc("GET /api/v1/files", s.filesHandler)
 	mux.Handle("/api/", s.auth(api))
 	return mux
 }
@@ -110,12 +162,20 @@ func NewHTTPServer(addr string, h http.Handler) *http.Server {
 	}
 }
 
+// auth accepts the API token on every route and the UI token, when set, on
+// GET (and HEAD) requests only: GET routes never change anything.
 func (s *Server) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := r.Header.Get("Authorization")
 		tok, ok := strings.CutPrefix(h, "Bearer ")
-		if !ok || subtle.ConstantTimeCompare([]byte(tok), s.token) != 1 {
+		full := subtle.ConstantTimeCompare([]byte(tok), s.token) == 1
+		read := len(s.uiToken) > 0 && subtle.ConstantTimeCompare([]byte(tok), s.uiToken) == 1
+		switch {
+		case !ok || (!full && !read):
 			writeError(w, http.StatusUnauthorized, "unauthorized")
+			return
+		case !full && r.Method != http.MethodGet && r.Method != http.MethodHead:
+			writeError(w, http.StatusForbidden, "read_only_token")
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -372,6 +432,57 @@ func (s *Server) orphansRemove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"results": s.orphans.Remove(r.Context(), req.IDs)})
+}
+
+// infoHandler describes the instance: version, mode and enabled layers.
+func (s *Server) infoHandler(w http.ResponseWriter, r *http.Request) {
+	info := s.info
+	info.Roots = nonNil(info.Roots)
+	writeJSON(w, http.StatusOK, info)
+}
+
+// filesHandler lists one folder of a root: names and metadata only. There is
+// no route that reads or serves file contents.
+func (s *Server) filesHandler(w http.ResponseWriter, r *http.Request) {
+	if s.files == nil {
+		writeError(w, http.StatusNotFound, "not_found")
+		return
+	}
+	q := r.URL.Query()
+	offset, ok1 := queryInt(q.Get("offset"), 0, 0, 1<<30)
+	limit, ok2 := queryInt(q.Get("limit"), browse.DefaultLimit, 1, browse.MaxLimit)
+	root := q.Get("root")
+	if !ok1 || !ok2 || root == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	res, err := s.files.List(r.Context(), root, q.Get("path"), offset, limit)
+	switch {
+	case err == nil:
+		writeJSON(w, http.StatusOK, res)
+	case errors.Is(err, browse.ErrUnknownRoot):
+		writeError(w, http.StatusBadRequest, "invalid_request")
+	case errors.Is(err, browse.ErrNotDir):
+		writeError(w, http.StatusBadRequest, "not_a_directory")
+	case errors.Is(err, browse.ErrNotFound):
+		writeError(w, http.StatusNotFound, "not_found")
+	case errors.Is(err, fs.ErrPermission):
+		writeError(w, http.StatusForbidden, "permission_denied")
+	default:
+		s.fail(w, err)
+	}
+}
+
+// queryInt parses an optional integer query parameter within [lo, hi].
+func queryInt(v string, def, lo, hi int) (int, bool) {
+	if v == "" {
+		return def, true
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < lo || n > hi {
+		return 0, false
+	}
+	return n, true
 }
 
 func (s *Server) fail(w http.ResponseWriter, err error) {
