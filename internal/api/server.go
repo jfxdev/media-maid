@@ -457,11 +457,20 @@ func (s *Server) filesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	res, err := s.files.List(r.Context(), root, q.Get("path"), offset, limit)
-	if err != nil {
+	switch {
+	case err == nil:
+		writeJSON(w, http.StatusOK, res)
+	case errors.Is(err, browse.ErrUnknownRoot):
+		writeError(w, http.StatusBadRequest, "invalid_request")
+	case errors.Is(err, browse.ErrNotDir):
+		writeError(w, http.StatusBadRequest, "not_a_directory")
+	case errors.Is(err, browse.ErrNotFound):
+		writeError(w, http.StatusNotFound, "not_found")
+	case errors.Is(err, fs.ErrPermission):
+		writeError(w, http.StatusForbidden, "permission_denied")
+	default:
 		s.fail(w, err)
-		return
 	}
-	writeJSON(w, http.StatusOK, res)
 }
 
 // queryInt parses an optional integer query parameter within [lo, hi].
@@ -478,14 +487,6 @@ func queryInt(v string, def, lo, hi int) (int, bool) {
 
 func (s *Server) fail(w http.ResponseWriter, err error) {
 	switch {
-	case errors.Is(err, browse.ErrUnknownRoot):
-		writeError(w, http.StatusBadRequest, "invalid_request")
-	case errors.Is(err, browse.ErrNotDir):
-		writeError(w, http.StatusBadRequest, "not_a_directory")
-	case errors.Is(err, browse.ErrNotFound):
-		writeError(w, http.StatusNotFound, "not_found")
-	case errors.Is(err, fs.ErrPermission):
-		writeError(w, http.StatusForbidden, "permission_denied")
 	case errors.Is(err, safepath.ErrInvalidPath):
 		writeError(w, http.StatusBadRequest, "invalid_path")
 	case errors.Is(err, safepath.ErrUnauthorizedVolume):
