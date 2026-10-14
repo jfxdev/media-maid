@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -92,5 +93,41 @@ func TestFullLedgerFitsInState(t *testing.T) {
 	b, _ := json.Marshal(map[string]LedgerEntry{"18446744073709551615:18446744073709551615": e})
 	if total := int64(len(b)) * maxLedgerEntries; total > state.MaxDocument {
 		t.Errorf("a full ledger takes about %d bytes, more than state.MaxDocument (%d)", total, state.MaxDocument)
+	}
+}
+
+// A full ledger drops its oldest entries in one batch, not one per Put, and
+// updating an entry already in it evicts nothing.
+func TestLedgerEvictsOldestInBatches(t *testing.T) {
+	l := NewLedger()
+	base := time.Now().Add(-time.Hour)
+	for i := 0; i < maxLedgerEntries; i++ {
+		l.setLocked("1:"+strconv.Itoa(i), LedgerEntry{Lib: "movies", Dest: "d" + strconv.Itoa(i), At: base.Add(time.Duration(i) * time.Millisecond)})
+	}
+	src := filepath.Join(t.TempDir(), "a.mkv")
+	write(t, src)
+	fi, err := os.Stat(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.Put(fi, LedgerEntry{Lib: "movies", Dest: "a.mkv"})
+	if got, want := len(l.m), maxLedgerEntries-ledgerEvictBatch+1; got != want {
+		t.Fatalf("entries = %d, want %d", got, want)
+	}
+	for _, i := range []int{0, ledgerEvictBatch - 1} {
+		if _, ok := l.m["1:"+strconv.Itoa(i)]; ok {
+			t.Errorf("entry %d (among the oldest) kept", i)
+		}
+	}
+	if _, ok := l.m["1:"+strconv.Itoa(ledgerEvictBatch)]; !ok {
+		t.Error("the oldest entry after the batch was dropped")
+	}
+	if _, ok := l.ByDest("movies", "d"+strconv.Itoa(ledgerEvictBatch-1)); ok {
+		t.Error("byDest still points at an evicted entry")
+	}
+	n := len(l.m)
+	l.Put(fi, LedgerEntry{Lib: "movies", Dest: "b.mkv"})
+	if len(l.m) != n {
+		t.Errorf("updating an entry changed the size from %d to %d", n, len(l.m))
 	}
 }
