@@ -89,7 +89,7 @@ server (say `PLEX_CLAIM` from a shared env file) are ignored with a warning.
 | `LLM_API_KEY` | no² | — | key for the LLM endpoint |
 | `LLM_MODEL` | no² | `claude-haiku-5-5` (anthropic), `gpt-6-luna` (openai) | model name; required with `LLM_BASE_URL` on `openai` |
 | `LLM_BASE_URL` | no | provider default | any OpenAI-compatible server (Ollama, LM Studio, OpenRouter, vLLM) or an Anthropic gateway |
-| `LLM_MIN_CONFIDENCE` | no | `0.7` | below this parser confidence the LLM is consulted; also the minimum confidence its answers need |
+| `LLM_MIN_CONFIDENCE` | no | `0.7` | below this parser confidence the LLM is consulted, and a reading TMDB has no match for waits as pending (also without the LLM); also the minimum confidence the LLM's answers need |
 | `LLM_TIMEOUT` | no | `20s` | per request, at most `2m` |
 | `SERVER_PATH_MAP` | no | — | `server_prefix=local_prefix` when the server sees other paths |
 | `ORPHAN_SCAN_INTERVAL` | no | — | periodic orphan report (e.g. `24h`) |
@@ -97,12 +97,12 @@ server (say `PLEX_CLAIM` from a shared env file) are ignored with a warning.
 | `VIDEO_EXTENSIONS` | no | `mkv,mp4,avi,m4v,mov,wmv,ts,webm` | video allowlist |
 | `SUBTITLE_EXTENSIONS` | no | `srt,ass,ssa,sub,idx,vtt` | subtitle allowlist |
 | `SYNC_DEBOUNCE` | no | `30s` | coalesce links into one refresh (never delayed more than 5×) |
-| `STABLE_SECONDS` | no | `30` | quiet time before a download counts as done |
+| `STABLE_SECONDS` | no | `30` | quiet time (no events, same size and modification time) before a download counts as done |
 | `LISTEN_ADDR` | no | `:8080` | HTTP address |
 | `DRY_RUN` | no | `false` | never link or remove anything |
 | `COPY_FALLBACK` | no | `false` | `true` copies a file that cannot be hardlinked (different filesystem or mount), using extra disk space; by default that is an error |
 | `ORGANIZE_TRIGGER` | no | `watch` | `watch`: the watcher (and `SCAN_INTERVAL`) organize downloads once they stop changing; `hook`: only API requests do, e.g. the torrent client's "download finished" hook (see below) |
-| `AMBIGUOUS_MATCH` | no | `pending` | when TMDB's best candidate is weak or tied and nothing settles it: `pending` leaves the file pending for a manual identification; `best` takes the best candidate anyway |
+| `AMBIGUOUS_MATCH` | no | `pending` | when TMDB's best candidate is weak or tied, or an unsure reading has no TMDB match, and nothing settles it: `pending` leaves the file pending for a manual identification; `best` takes the best candidate (or the parser's reading) anyway |
 | `AUTO_UPGRADE` | no | `false` | let the watcher and scans replace a release Media Maid placed with a better one of the same title (see [Duplicate releases](#duplicate-releases-and-upgrades)) |
 | `LINK_EXTRAS` | no | `true` | link videos from a release's extras folders (`Featurettes`, `Trailers`, …) as server extras |
 | `NOTIFY_URL` | no | — | webhook for problems and upgrades (see [Notifications](#notifications)); a secret, never logged |
@@ -137,7 +137,8 @@ Every `/api/v1/*` route requires `Authorization: Bearer $API_TOKEN`.
 | `POST` | `/api/v1/orphans/remove` | `{"ids": [...]}` remove reported orphans |
 
 By default the watcher picks up a download once its files stop changing for
-`STABLE_SECONDS`. That is not proof it finished: a paused torrent, or one
+`STABLE_SECONDS`: no filesystem events, and the same size and modification
+time. That is not proof it finished: a paused torrent, or one
 without peers, stops changing too, and its partial file would be linked (a
 hardlink then keeps showing whatever is written later). The torrent client
 knows when a download is complete, so with `ORGANIZE_TRIGGER=hook` only API
@@ -145,7 +146,9 @@ requests organize, sent by the client's completion hook; the watcher and
 periodic scans are off. **Use `hook` with clients built on libtorrent 2.x
 (qBittorrent 4.4 and later, the default build)**: they may create a file at
 its full size up front and write it through memory maps, which raise no
-change events, so a download in progress can look finished to the watcher.
+change events. The watcher also checks the modification time, which the
+kernel moves as mapped pages are written, but a download that stalls between
+pieces still looks finished to it.
 (Keeping incomplete downloads in a separate folder, qBittorrent's *Keep
 incomplete torrents in*, also helps in `watch` mode.) For qBittorrent (*Run external program on torrent finished*), use
 [`examples/qbittorrent-hook.sh`](examples/qbittorrent-hook.sh):
@@ -182,7 +185,13 @@ disabled, the previous decision stands.
    the candidates, and waits in `/api/v1/pending` for a manual
    identification, instead of getting a possibly wrong ID
    (`AMBIGUOUS_MATCH=best` takes the best candidate anyway). When TMDB finds
-   nothing, the parser's reading is used without an ID. A tie is settled by
+   nothing, the parser's reading is used without an ID if the parser is
+   confident (`LLM_MIN_CONFIDENCE`, 0.7 by default); an unsure reading, say
+   `One.Piece.E1080.1080p.mkv` read as a movie, is `skipped` as
+   `uncertain title: ...` and waits in `/api/v1/pending` instead of creating
+   a library entry under a guessed name (`AMBIGUOUS_MATCH=best` places it
+   anyway). Without TMDB, nothing can confirm a reading and the parser
+   decides. A tie is settled by
    popularity only when it is clear-cut: a candidate with at least 100 TMDB
    votes and ten times the votes of every other tied one. When TMDB cannot be
    reached, the file is `skipped` (`metadata unavailable: ...`, pending) and
@@ -324,7 +333,11 @@ different works (remakes sharing title and year); the second is reported as
 `GET /api/v1/pending` lists the downloads that are not in the library and
 need a decision: `conflict`, `duplicate`, `skipped` (title not identified) and
 `error`, oldest first. An item goes away when the file is placed (a manual
-identification, an `overwrite`) or leaves the downloads folder.
+identification, an `overwrite`) or leaves the downloads folder. Items (and
+organize results) carry a stable `reason` when one applies
+(`ambiguous_title`, `unidentified_title`, `metadata_unavailable`, `archive`,
+…; see the OpenAPI spec): act on it rather than on the `error` text, which
+is meant for people and may change.
 
 With `NOTIFY_URL`, each **new or changed** pending item is posted once (a
 conflict seen by every scan is not repeated), plus `upgraded` placements;
@@ -362,8 +375,8 @@ comes back under another device number, as btrfs, mergerfs or ZFS may after a
 reboot). A library file that is not the download's own inode counts as placed
 only when the ledger records it as that download's copy: equal size and
 modification time alone never do. Automatic runs (watcher, scans) skip
-identification for files already placed, and leave alone a file whose library
-copy you deleted (it is `skipped`, quietly). An explicit `POST /api/v1/organize`
+identification for files already placed, and leave alone a file (video,
+subtitle or extra) whose library copy you deleted (it is `skipped`, quietly). An explicit `POST /api/v1/organize`
 ignores the ledger and links it again.
 
 `STATE_DIR` keeps the ledger, the pending list, the remembered manual

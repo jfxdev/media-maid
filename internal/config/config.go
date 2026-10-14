@@ -388,11 +388,20 @@ func loadLLM(getenv func(string) string, fail func(string, ...any)) LLMConfig {
 	l.BaseURL = strings.TrimRight(strings.TrimSpace(getenv("LLM_BASE_URL")), "/")
 	l.APIKey = strings.TrimSpace(getenv("LLM_API_KEY"))
 	l.Model = strings.TrimSpace(getenv("LLM_MODEL"))
+	// The threshold also applies without the LLM: an unsure reading that
+	// TMDB has no match for waits as pending.
+	if v := strings.TrimSpace(getenv("LLM_MIN_CONFIDENCE")); v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil || f < 0 || f > 1 {
+			fail("LLM_MIN_CONFIDENCE must be a number between 0 and 1")
+		}
+		l.MinConfidence = f
+	}
 	if l.Provider == "" {
 		if l.BaseURL != "" || l.APIKey != "" || l.Model != "" {
 			fail("LLM_BASE_URL, LLM_API_KEY and LLM_MODEL require LLM_PROVIDER (%s or %s)", LLMOpenAI, LLMAnthropic)
 		}
-		return LLMConfig{}
+		return LLMConfig{MinConfidence: l.MinConfidence}
 	}
 	switch l.Provider {
 	case LLMOpenAI, LLMAnthropic:
@@ -423,13 +432,6 @@ func loadLLM(getenv func(string) string, fail func(string, ...any)) LLMConfig {
 	}
 	if hasMultiple(l.Model) {
 		fail("LLM_MODEL must be a single value")
-	}
-	if v := strings.TrimSpace(getenv("LLM_MIN_CONFIDENCE")); v != "" {
-		f, err := strconv.ParseFloat(v, 64)
-		if err != nil || f < 0 || f > 1 {
-			fail("LLM_MIN_CONFIDENCE must be a number between 0 and 1")
-		}
-		l.MinConfidence = f
 	}
 	l.Timeout = parseDuration("LLM_TIMEOUT", getenv, defaultLLMTimeout, fail)
 	if l.Timeout <= 0 || l.Timeout > maxLLMTimeout {

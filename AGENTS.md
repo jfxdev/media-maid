@@ -90,7 +90,7 @@ Other packages: `parser` (release name → `Analysis`: `Media` with part,
 edition and absolute episode, `Quality`, country, confidence and signals;
 `Parse` is the `Media`-only wrapper; `testdata/corpus.tsv` holds real-world
 names), `naming` (paths + `Sanitize`), `jobs` (ring-buffer history and **all**
-status/action strings), `state` (atomic JSON documents in `STATE_DIR`),
+status/action/reason strings), `state` (atomic JSON documents in `STATE_DIR`),
 `notify` (batched webhook for `NOTIFY_URL`; the URL is a secret).
 
 ## Platform table
@@ -133,9 +133,15 @@ All platform-specific data lives in `internal/integration/platforms.go`
   is `skipped` (`ambiguous title: ...`, pending) unless `AMBIGUOUS_MATCH=best`;
   it never gets an ID tag by default. The only automatic tie-break is
   popularity, when one tied candidate has ≥ 100 TMDB votes and ≥ 10× every
-  other's (`metadata.PickIn`). A TMDB that cannot be reached is not
-  "not found" either: the file is `skipped` (`metadata unavailable: ...`,
-  pending) and `Organizer.RetryUnavailable` organizes it again later.
+  other's (`metadata.PickIn`). An unsure reading (parser confidence below
+  `LLM_MIN_CONFIDENCE`) that TMDB has no match for is `skipped` too
+  (`uncertain title: ...`, pending) unless `AMBIGUOUS_MATCH=best`. A TMDB
+  that cannot be reached is not "not found" either: the file is `skipped`
+  (`metadata unavailable: ...`, pending) and `Organizer.RetryUnavailable`
+  organizes it again later.
+- **Reasons, not messages**: code (and clients) decide on `Result.Reason`
+  (`jobs.Reason*`), never on the `Error` text, which is for people.
+  `Pending.Import` derives the reason of items saved without one.
 - **Manual identification** (`kind`/`tmdb_id`/`title`/`year` on organize or
   preview) only comes from an explicit API request, is validated in
   `api.override`, and its title is sanitized like any other. The earlier
@@ -143,7 +149,8 @@ All platform-specific data lives in `internal/integration/platforms.go`
   A placed one is remembered (`Aliases`, keyed by the parsed kind, folded
   title, year and country) and applied to later files with the same reading;
   imported aliases are validated again, and one TMDB rejects is ignored.
-- **Respect deletions**: automatic runs never re-link a file (video or extra)
+- **Respect deletions**: automatic runs never re-link a file (video, subtitle
+  or extra)
   the ledger says was placed and whose library copy is gone or was replaced
   by another release; only an explicit organize does. An organize request
   with `"automatic": true` (the completion hook) is an automatic run.
@@ -192,8 +199,8 @@ All platform-specific data lives in `internal/integration/platforms.go`
 - **New API route**: handler in `internal/api/server.go`, update
   `internal/api/openapi.yaml` (`TestSpecCoversRoutes` fails otherwise), add a
   case to `TestAPI`, update the README route table.
-- **New status/error code**: constant in `internal/jobs/history.go` or
-  `api.fail`, plus the matching enum in `openapi.yaml`. Error codes are stable
+- **New status/reason/error code**: constant in `internal/jobs/history.go`
+  or `api.fail`, plus the matching enum in `openapi.yaml`. Error codes are stable
   snake_case strings returned as `{"error": "..."}`.
 - **Tests**: table-driven, real filesystems under `t.TempDir()`, small fakes
   for the interfaces each package consumes (`api.Organizer`, `api.Orphans`,

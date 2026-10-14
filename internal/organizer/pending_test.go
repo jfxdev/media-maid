@@ -69,3 +69,24 @@ func TestPendingIgnoresPreview(t *testing.T) {
 		t.Errorf("pending = %+v", items)
 	}
 }
+
+// Items saved before they carried a reason get it back on import, so a
+// download that was waiting for TMDB is still retried after an upgrade.
+func TestPendingLegacyReason(t *testing.T) {
+	saved := `[{"source":"a.mkv","status":"skipped","error":"` + errMetadataUnavailableMsg + `","since":"2026-01-01T00:00:00Z","updated":"2026-01-01T00:00:00Z"},
+		{"source":"b.mkv","status":"skipped","error":"ambiguous title: Dune (1984) [tmdb 841]; identify it manually","since":"2026-01-01T00:00:00Z","updated":"2026-01-01T00:00:00Z"},
+		{"source":"c.rar","status":"error","error":"` + errArchiveMsg + `","since":"2026-01-01T00:00:00Z","updated":"2026-01-01T00:00:00Z"},
+		{"source":"d.mkv","status":"conflict","error":"another release is in the library","since":"2026-01-01T00:00:00Z","updated":"2026-01-01T00:00:00Z"}]`
+	p := NewPending()
+	if err := p.Import([]byte(saved)); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{
+		"a.mkv": jobs.ReasonMetadataUnavailable, "b.mkv": jobs.ReasonAmbiguous, "c.rar": jobs.ReasonArchive, "d.mkv": "",
+	}
+	for _, it := range p.List() {
+		if it.Reason != want[it.Source] {
+			t.Errorf("%s: reason %q, want %q", it.Source, it.Reason, want[it.Source])
+		}
+	}
+}

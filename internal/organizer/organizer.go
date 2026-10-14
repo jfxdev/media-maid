@@ -44,6 +44,9 @@ var (
 // KindExtra marks a result for a file from a release's extras folder.
 const KindExtra = "extra"
 
+// KindSubtitle marks a result for a subtitle.
+const KindSubtitle = "subtitle"
+
 // errUnauthorizedMsg is what callers see; the real target is never exposed.
 const errUnauthorizedMsg = "unauthorized_volume"
 
@@ -65,8 +68,21 @@ const errArchiveMsg = "archive: extract it first (compressed releases are not su
 // leftAlone reports a quiet skip: a file automatic runs leave alone on
 // purpose. It is neither recorded in the history nor pending.
 func leftAlone(r Result) bool {
-	return r.Status == jobs.StatusSkipped && (r.Error == errRemovedMsg || r.Error == errSupersededMsg)
+	return r.Status == jobs.StatusSkipped && (r.Reason == jobs.ReasonRemoved || r.Reason == jobs.ReasonSuperseded)
 }
+
+// skip explains why a file is not placed: a stable reason (jobs.Reason*, may
+// be empty) and the message shown to the user. The zero value is no skip.
+type skip struct{ reason, msg string }
+
+func (s skip) none() bool { return s.msg == "" }
+
+var (
+	skipRemoved             = skip{jobs.ReasonRemoved, errRemovedMsg}
+	skipSuperseded          = skip{jobs.ReasonSuperseded, errSupersededMsg}
+	skipMetadataUnavailable = skip{jobs.ReasonMetadataUnavailable, errMetadataUnavailableMsg}
+	skipUnidentified        = skip{jobs.ReasonUnidentified, errUnidentifiedMsg}
+)
 
 // Library is a destination root (movies or tv).
 type Library struct {
@@ -182,6 +198,9 @@ type Result struct {
 	Kind   string `json:"kind,omitempty"`
 	Status string `json:"status"`
 	Error  string `json:"error,omitempty"`
+	// Reason is the stable cause of some skipped or error results
+	// (jobs.Reason*); Error is the message for people.
+	Reason string `json:"reason,omitempty"`
 	// Replaces is set on a planned result that would overwrite Dest.
 	Replaces bool `json:"replaces,omitempty"`
 	// Previous is a library file this result removed (or would remove, in a
@@ -329,7 +348,7 @@ func (o *Organizer) Organize(ctx context.Context, input string, opts OrganizeOpt
 func (o *Organizer) RetryUnavailable(ctx context.Context) int {
 	n := 0
 	for _, it := range o.pending.List() {
-		if it.Status != jobs.StatusSkipped || it.Error != errMetadataUnavailableMsg {
+		if it.Status != jobs.StatusSkipped || it.Reason != jobs.ReasonMetadataUnavailable {
 			continue
 		}
 		if ctx.Err() != nil {
@@ -398,7 +417,7 @@ func (o *Organizer) record(dry bool, r Result) {
 	}
 	// Repeated outcomes (a conflict seen on every scan) are told once.
 	changed := o.pending.Update(r)
-	if o.notify != nil && (changed || (placed(r.Status) && r.Status != jobs.StatusExists && r.Kind != "subtitle" && r.Kind != KindExtra)) {
+	if o.notify != nil && (changed || (placed(r.Status) && r.Status != jobs.StatusExists && r.Kind != KindSubtitle && r.Kind != KindExtra)) {
 		o.notify(r)
 	}
 	// Unchanged outcomes would flood the history on every scan.
@@ -477,7 +496,6 @@ type extraFile struct {
 var subsDirs = map[string]bool{"subs": true, "subtitles": true, "legendas": true, "sub": true}
 
 func (o *Organizer) process(ctx context.Context, files []string, dry bool, opts OrganizeOptions, man *manual) []Result {
-	overwrite := opts.Overwrite
 	type group struct {
 		videos []*videoPlan
 		subs   []string
@@ -565,7 +583,7 @@ func (o *Organizer) process(ctx context.Context, files []string, dry bool, opts 
 			results = append(results, r)
 		}
 		for _, s := range g.subs {
-			results = append(results, o.subtitle(s, g.videos, dry, overwrite))
+			results = append(results, o.subtitle(s, g.videos, dry, opts))
 		}
 	}
 	for _, x := range extras {
@@ -607,7 +625,7 @@ func (o *Organizer) archive(src string) (Result, bool) {
 			}
 		}
 	}
-	return Result{Source: rel, Status: jobs.StatusError, Error: errArchiveMsg}, true
+	return Result{Source: rel, Status: jobs.StatusError, Error: errArchiveMsg, Reason: jobs.ReasonArchive}, true
 }
 
 // stem drops the extension: releases in .mkv and .mp4 of the same title are
@@ -874,10 +892,10 @@ func (o *Organizer) fromLedger(v *videoPlan) (Result, bool) {
 		return Result{}, false
 	}
 	lib := o.lib(e.Lib)
-	if why := o.placementGone(lib, e, fi); why != "" {
+	if why := o.placementGone(lib, e, fi); !why.none() {
 		return Result{
 			Source: o.rel(v.src), Dest: lib.Name + "/" + e.Dest, Kind: e.Kind, Status: jobs.StatusSkipped,
-			Error: why,
+			Error: why.msg, Reason: why.reason,
 		}, true
 	}
 	v.lib, v.dest, v.resolvedBy, v.titleSource = lib, e.Dest, e.ResolvedBy, e.TitleSource
@@ -887,16 +905,16 @@ func (o *Organizer) fromLedger(v *videoPlan) (Result, bool) {
 }
 
 // placementGone tells why the recorded placement e of src is no longer in
-// the library ("" while it is): deleted, or replaced by another file.
-func (o *Organizer) placementGone(lib Library, e LedgerEntry, src os.FileInfo) string {
+// the library (no skip while it is): deleted, or replaced by another file.
+func (o *Organizer) placementGone(lib Library, e LedgerEntry, src os.FileInfo) skip {
 	cur, err := lib.Root.Lstat(e.Dest)
 	if err != nil {
-		return errRemovedMsg
+		return skipRemoved
 	}
 	if !os.SameFile(cur, src) && !o.copyOf(lib, e.Dest, cur, src) {
-		return errSupersededMsg
+		return skipSuperseded
 	}
-	return ""
+	return skip{}
 }
 
 // copyOf reports whether cur, the file at dest in lib, is the copy of src
@@ -931,7 +949,7 @@ func (o *Organizer) planVideo(ctx context.Context, v *videoPlan, opts OrganizeOp
 		}
 	}
 	var id identity
-	var why string
+	var why skip
 	switch {
 	case man != nil:
 		// A manual identification may move the earlier placement.
@@ -951,15 +969,15 @@ func (o *Organizer) planVideo(ctx context.Context, v *videoPlan, opts OrganizeOp
 		if remembered != nil {
 			id, why = o.manualIdentity(ctx, a, ok, remembered)
 		}
-		if why == errMetadataUnavailableMsg {
+		if why.reason == jobs.ReasonMetadataUnavailable {
 			break
 		}
-		if remembered == nil || why != "" {
+		if remembered == nil || !why.none() {
 			id, why = o.identify(ctx, rel, a, ok)
 		}
 	}
-	if why != "" {
-		return Result{Source: rel, Status: jobs.StatusSkipped, Error: why}
+	if !why.none() {
+		return Result{Source: rel, Status: jobs.StatusSkipped, Error: why.msg, Reason: why.reason}
 	}
 	m := id.media
 	var tag string
@@ -984,20 +1002,20 @@ func (o *Organizer) planVideo(ctx context.Context, v *videoPlan, opts OrganizeOp
 // alias resolves the identification remembered for key, if any. TMDB being
 // unreachable leaves the file pending (why); an identification TMDB no
 // longer accepts is ignored, and the file is identified automatically.
-func (o *Organizer) alias(ctx context.Context, key string) (*manual, string) {
+func (o *Organizer) alias(ctx context.Context, key string) (*manual, skip) {
 	ov, ok := o.aliases.Get(key)
 	if !ok {
-		return nil, ""
+		return nil, skip{}
 	}
 	man, err := o.resolveOverride(ctx, &ov)
 	if errors.Is(err, ErrMetadataUnavailable) {
-		return nil, errMetadataUnavailableMsg
+		return nil, skipMetadataUnavailable
 	}
 	if err != nil {
 		o.log.Warn("remembered identification ignored", "kind", ov.Kind, "tmdb_id", ov.TMDBID, "err", err)
-		return nil, ""
+		return nil, skip{}
 	}
-	return man, ""
+	return man, skip{}
 }
 
 var (
@@ -1073,8 +1091,8 @@ func (o *Organizer) extra(x extraFile, videos []*videoPlan, dry bool, opts Organ
 		if fi, err := os.Stat(x.src); err == nil {
 			if e, ok := o.ledger.Lookup(fi); ok {
 				lib := o.lib(e.Lib)
-				if why := o.placementGone(lib, e, fi); why != "" {
-					return Result{Source: rel, Dest: lib.Name + "/" + e.Dest, Kind: KindExtra, Status: jobs.StatusSkipped, Error: why}
+				if why := o.placementGone(lib, e, fi); !why.none() {
+					return Result{Source: rel, Dest: lib.Name + "/" + e.Dest, Kind: KindExtra, Status: jobs.StatusSkipped, Error: why.msg, Reason: why.reason}
 				}
 				// Already placed: stays where it is, even once its release's
 				// video was upgraded away.
@@ -1176,8 +1194,21 @@ func describe(err error) string {
 
 var reSubEp = regexp.MustCompile(`(?i)S(\d{1,2}) ?E(\d{1,3})`)
 
-func (o *Organizer) subtitle(sub string, videos []*videoPlan, dry, overwrite bool) Result {
+// subtitle links sub next to the video it belongs to. Like videos and extras,
+// a subtitle placed earlier whose library copy is gone (deleted, or replaced
+// by another release's) is left alone by automatic runs.
+func (o *Organizer) subtitle(sub string, videos []*videoPlan, dry bool, opts OrganizeOptions) Result {
 	rel := o.rel(sub)
+	if !opts.Explicit {
+		if fi, err := os.Stat(sub); err == nil {
+			if e, ok := o.ledger.Lookup(fi); ok {
+				lib := o.lib(e.Lib)
+				if why := o.placementGone(lib, e, fi); !why.none() {
+					return Result{Source: rel, Dest: lib.Name + "/" + e.Dest, Kind: KindSubtitle, Status: jobs.StatusSkipped, Error: why.msg, Reason: why.reason}
+				}
+			}
+		}
+	}
 	var planned []*videoPlan
 	for _, v := range videos {
 		if v.dest != "" {
@@ -1193,8 +1224,11 @@ func (o *Organizer) subtitle(sub string, videos []*videoPlan, dry, overwrite boo
 	lang, forced, sdh := detectLang(strings.TrimPrefix(stem, vstem))
 	dest := naming.SubtitlePath(target.dest, lang, forced, sdh, filepath.Ext(sub))
 	// An upgraded video's subtitles replace the old release's ones.
-	r := o.apply(sub, target.lib, dest, dry, overwrite || target.upgraded)
-	r.Kind = "subtitle"
+	r := o.apply(sub, target.lib, dest, dry, opts.Overwrite || target.upgraded)
+	r.Kind = KindSubtitle
+	if !dry {
+		o.rememberFile(sub, target.lib, dest, r.Status, LedgerEntry{Kind: KindSubtitle})
+	}
 	return r
 }
 

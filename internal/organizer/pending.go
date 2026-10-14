@@ -3,6 +3,7 @@ package organizer
 import (
 	"encoding/json"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,6 +21,8 @@ type PendingItem struct {
 	Kind   string `json:"kind,omitempty"`
 	Status string `json:"status"`
 	Error  string `json:"error,omitempty"`
+	// Reason is the stable cause (jobs.Reason*), when there is one.
+	Reason string `json:"reason,omitempty"`
 	// Since is when the item first needed attention, Updated when its
 	// status or error last changed.
 	Since   time.Time `json:"since"`
@@ -41,7 +44,7 @@ func NewPending() *Pending { return &Pending{m: map[string]PendingItem{}} }
 
 // attention reports whether a result needs a decision from the user.
 func attention(r Result) bool {
-	if r.Kind == "subtitle" || r.Kind == KindExtra || leftAlone(r) {
+	if r.Kind == KindSubtitle || r.Kind == KindExtra || leftAlone(r) {
 		return false
 	}
 	switch r.Status {
@@ -72,11 +75,11 @@ func (p *Pending) Update(r Result) bool {
 	old, had := p.m[r.Source]
 	switch {
 	case attention(r):
-		changed = !had || old.Status != r.Status || old.Error != r.Error || old.Dest != r.Dest
+		changed = !had || old.Status != r.Status || old.Error != r.Error || old.Reason != r.Reason || old.Dest != r.Dest
 		if !changed {
 			break
 		}
-		it := PendingItem{Source: r.Source, Dest: r.Dest, Kind: r.Kind, Status: r.Status, Error: r.Error, Since: now, Updated: now}
+		it := PendingItem{Source: r.Source, Dest: r.Dest, Kind: r.Kind, Status: r.Status, Error: r.Error, Reason: r.Reason, Since: now, Updated: now}
 		if had {
 			it.Since = old.Since
 		}
@@ -171,6 +174,9 @@ func (p *Pending) Import(data []byte) error {
 	m := make(map[string]PendingItem, len(items))
 	for _, it := range items {
 		if it.Source != "" {
+			if it.Reason == "" {
+				it.Reason = legacyReason(it)
+			}
 			m[it.Source] = it
 		}
 	}
@@ -178,4 +184,20 @@ func (p *Pending) Import(data []byte) error {
 	p.m = m
 	p.mu.Unlock()
 	return nil
+}
+
+// legacyReason recovers the reason of an item saved before items carried one,
+// from its message: a download waiting for TMDB must still be retried.
+func legacyReason(it PendingItem) string {
+	switch {
+	case it.Status == jobs.StatusSkipped && it.Error == errMetadataUnavailableMsg:
+		return jobs.ReasonMetadataUnavailable
+	case it.Status == jobs.StatusSkipped && it.Error == errUnidentifiedMsg:
+		return jobs.ReasonUnidentified
+	case it.Status == jobs.StatusSkipped && strings.HasPrefix(it.Error, "ambiguous title: "):
+		return jobs.ReasonAmbiguous
+	case it.Status == jobs.StatusError && it.Error == errArchiveMsg:
+		return jobs.ReasonArchive
+	}
+	return ""
 }

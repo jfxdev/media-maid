@@ -83,6 +83,16 @@ func TestLoadLLM(t *testing.T) {
 	if c == nil || c.LLM.BaseURL != "http://ollama:11434/v1" || c.LLM.MinConfidence != 0.5 || c.LLM.Timeout.Seconds() != 45 {
 		t.Errorf("llm config = %+v", c)
 	}
+	// The confidence threshold applies without the LLM too (an unsure
+	// reading TMDB does not know waits as pending): defaulted, and settable.
+	if c, err := load(baseEnv()); err != nil || c.LLM.Provider != "" || c.LLM.MinConfidence != 0.7 {
+		t.Errorf("min confidence without llm = %+v, %v", c.LLM, err)
+	}
+	env := baseEnv()
+	env["LLM_MIN_CONFIDENCE"] = "0.4"
+	if c, err := load(env); err != nil || c.LLM.Provider != "" || c.LLM.MinConfidence != 0.4 {
+		t.Errorf("LLM_MIN_CONFIDENCE without llm = %+v, %v", c.LLM, err)
+	}
 
 	invalid := []struct {
 		env  map[string]string
@@ -95,6 +105,7 @@ func TestLoadLLM(t *testing.T) {
 		{map[string]string{"LLM_MODEL": "x"}, "require LLM_PROVIDER"},
 		{map[string]string{"LLM_PROVIDER": "anthropic", "LLM_API_KEY": "k", "LLM_BASE_URL": "ftp://x"}, "LLM_BASE_URL"},
 		{map[string]string{"LLM_PROVIDER": "anthropic", "LLM_API_KEY": "k", "LLM_MIN_CONFIDENCE": "2"}, "LLM_MIN_CONFIDENCE"},
+		{map[string]string{"LLM_MIN_CONFIDENCE": "x"}, "LLM_MIN_CONFIDENCE"},
 		{map[string]string{"LLM_PROVIDER": "anthropic", "LLM_API_KEY": "k", "LLM_TIMEOUT": "1h"}, "LLM_TIMEOUT"},
 		{map[string]string{"PREFERRED_LANGUAGE": "portuguese"}, "PREFERRED_LANGUAGE"},
 		{map[string]string{"PREFERRED_LANGUAGE": "pt-BR,en"}, "PREFERRED_LANGUAGE"},
